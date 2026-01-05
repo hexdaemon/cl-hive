@@ -269,26 +269,65 @@ To ensure deterministic comparison, the State Hash is calculated as:
 
 ## Phase 4: Integration Bridge (Hardened)
 
-**Objective:** Connect cl-hive decisions to cl-revenue-ops execution safely.
+**Objective:** Connect cl-hive decisions to external plugins (`cl-revenue-ops`, `clboss`) with "Paranoid" error handling.
 
-### 4.1 The "Paranoid" Bridge
+### 4.1 The "Paranoid" Bridge (Circuit Breaker)
 **File:** `modules/bridge.py`
-**Updates from Red Team:**
-- [ ] **Circuit Breaker:** Wrap RPC calls to `cl-revenue-ops` with timeout/retry logic. If `cl-revenue-ops` hangs, `cl-hive` must not crash.
-- [ ] **Feature Detection:** On startup, call `revenue-status` to verify `cl-revenue-ops` is installed and version >= 1.4.0.
+
+**Circuit Breaker Logic:**
+To prevent cascading failures if a dependency hangs or crashes.
+*   **States:** `CLOSED` (Normal), `OPEN` (Fail Fast), `HALF_OPEN` (Probe).
+*   **Thresholds:**
+    *   `MAX_FAILURES`: 3 consecutive RPC errors.
+    *   `RESET_TIMEOUT`: 60 seconds (time to wait before probing).
+    *   `RPC_TIMEOUT`: 5 seconds (strict timeout for calls).
+
+**Tasks:**
+- [ ] Implement `CircuitBreaker` class.
+- [ ] Implement `feature_detection()` on startup:
+    *   Call `plugin.rpc.plugin("list")`.
+    *   Verify `cl-revenue-ops` is `active`.
+    *   Verify version >= 1.4.0 via `revenue-status`.
+    *   If failed: Set status to `DISABLED`, log warning, skip all future calls.
+- [ ] Implement generic `safe_call(method, payload)` wrapper:
+    *   Checks Circuit Breaker state.
+    *   Wraps RPC in try/except.
+    *   Updates failure counters on `RpcError` or `Timeout`.
 
 ### 4.2 Revenue-Ops Integration
-**Tasks:**
-- [ ] `set_hive_policy`: Calls `revenue-policy set <id> strategy=hive`.
-- [ ] `trigger_rebalance`: Calls `revenue-rebalance` (relying on Strategic Exemption).
+**File:** `modules/bridge.py`
+
+**Methods:**
+- [ ] `set_hive_policy(peer_id, is_member: bool)`:
+    *   **Member:** `revenue-policy set <id> strategy=hive rebalance=enabled`.
+    *   **Non-Member:** `revenue-policy set <id> strategy=dynamic` (Revert to default).
+    *   *Validation:* Check result `{"status": "success"}`.
+- [ ] `trigger_rebalance(target_peer, amount_sats)`:
+    *   Call: `revenue-rebalance from=auto to=<target> amount=<sats>`.
+    *   *Note:* Relies on `cl-revenue-ops` v1.4 "Strategic Exemption" to bypass profitability checks for Hive peers.
 
 ### 4.3 CLBoss Conflict Prevention (The Gateway Pattern)
 **File:** `modules/clboss_bridge.py`
-**Objective:** Prevent race conditions between plugins.
-**Rules to Implement:**
-1.  **Fees:** `cl-hive` NEVER calls `clboss-unmanage` for fees. It uses `revenue-policy`.
-2.  **Topology:** `cl-hive` has exclusive rights to `clboss-ignore` (for blocking new channels).
-3.  **Cleanup:** When releasing a peer, set `strategy=passive` rather than deleting policy.
+
+**Constraint:** `cl-hive` manages **Topology** (New Channels). `cl-revenue-ops` manages **Fees/Balancing** (Existing Channels).
+
+**Tasks:**
+- [ ] `detect_clboss()`: Check if `clboss` plugin is registered.
+- [ ] `ignore_peer(peer_id)`:
+    *   Call `clboss-ignore <peer_id>`.
+    *   *Purpose:* Prevent CLBoss from opening redundant channels to saturated targets.
+- [ ] `unignore_peer(peer_id)`:
+    *   Call `clboss-unignore <peer_id>` (if command exists/supported).
+    *   *Note:* Do **NOT** call `clboss-manage` or `clboss-unmanage` (fee tags). Leave that to `cl-revenue-ops`.
+
+### 4.4 Phase 4 Testing
+**File:** `tests/test_bridge.py`
+
+**Tasks:**
+- [ ] **Circuit Breaker Test:** Simulate 3 RPC failures -> Verify 4th call raises immediate "Circuit Open" exception without network IO.
+- [ ] **Recovery Test:** Simulate time passing -> Verify Circuit moves to HALF_OPEN -> Success closes it.
+- [ ] **Version Mismatch:** Mock `revenue-status` returning v1.3.0 -> Verify Bridge disables itself.
+- [ ] **Method Signature:** Verify `set_hive_policy` constructs the exact JSON expected by `revenue-policy`.
 
 ---
 
