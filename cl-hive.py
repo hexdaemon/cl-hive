@@ -47,6 +47,8 @@ from modules.protocol import (
     create_challenge, create_welcome
 )
 from modules.handshake import HandshakeManager, Ticket
+from modules.state_manager import StateManager
+from modules.gossip import GossipManager
 
 # Initialize the plugin
 plugin = Plugin()
@@ -131,6 +133,8 @@ database: Optional[HiveDatabase] = None
 config: Optional[HiveConfig] = None
 safe_plugin: Optional[ThreadSafePluginProxy] = None
 handshake_mgr: Optional[HandshakeManager] = None
+state_manager: Optional[StateManager] = None
+gossip_mgr: Optional[GossipManager] = None
 
 
 # =============================================================================
@@ -259,6 +263,19 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     handshake_mgr = HandshakeManager(safe_plugin.rpc, database, safe_plugin)
     plugin.log("cl-hive: Handshake manager initialized")
     
+    # Initialize state manager (Phase 2)
+    state_manager = StateManager(database, safe_plugin)
+    state_manager.load_from_database()
+    plugin.log(f"cl-hive: State manager initialized ({len(state_manager.get_all_peer_states())} peers cached)")
+    
+    # Initialize gossip manager (Phase 2)
+    gossip_mgr = GossipManager(
+        state_manager, 
+        safe_plugin, 
+        heartbeat_interval=config.heartbeat_interval
+    )
+    plugin.log("cl-hive: Gossip manager initialized")
+    
     # Verify cl-revenue-ops dependency (Circuit Breaker pattern)
     try:
         status = safe_plugin.rpc.call("revenue-status")
@@ -345,8 +362,15 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_attest(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.WELCOME:
             return handle_welcome(peer_id, msg_payload, plugin)
+        # Phase 2: State Management
+        elif msg_type == HiveMessageType.GOSSIP:
+            return handle_gossip(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.STATE_HASH:
+            return handle_state_hash(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.FULL_SYNC:
+            return handle_full_sync(peer_id, msg_payload, plugin)
         else:
-            # Known but unimplemented message type (Phase 2+)
+            # Known but unimplemented message type (Phase 3+)
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
             
@@ -499,8 +523,11 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             hive_id = metadata.get('hive_id', 'hive')
             break
     
-    # TODO: Calculate real state hash
-    state_hash = "0" * 64
+    # Calculate real state hash via StateManager
+    if state_manager:
+        state_hash = state_manager.calculate_fleet_hash()
+    else:
+        state_hash = "0" * 64
     
     # Send WELCOME
     welcome_msg = create_welcome(hive_id, 'neophyte', len(members), state_hash)
@@ -535,6 +562,110 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # TODO: Store Hive membership info, initiate state sync
     
     return {"result": "continue"}
+
+
+# =============================================================================
+# PHASE 2: STATE MANAGEMENT HANDLERS
+# =============================================================================
+
+def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HIVE_GOSSIP message (state update from peer).
+    
+    Process incoming gossip and update our local state cache.
+    The GossipManager handles version validation and StateManager updates.
+    """
+    if not gossip_mgr:
+        return {"result": "continue"}
+    
+    accepted = gossip_mgr.process_gossip(peer_id, payload)
+    
+    if accepted:
+        plugin.log(f"cl-hive: GOSSIP accepted from {peer_id[:16]}... "
+                   f"(v{payload.get('version', '?')})", level='debug')
+    
+    return {"result": "continue"}
+
+
+def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HIVE_STATE_HASH message (anti-entropy check).
+    
+    Compare remote hash against our local state. If mismatch,
+    send a FULL_SYNC with our complete state.
+    """
+    if not gossip_mgr or not state_manager:
+        return {"result": "continue"}
+    
+    hashes_match = gossip_mgr.process_state_hash(peer_id, payload)
+    
+    if not hashes_match:
+        # State divergence detected - send FULL_SYNC
+        plugin.log(f"cl-hive: State divergence with {peer_id[:16]}..., sending FULL_SYNC")
+        
+        full_sync_payload = gossip_mgr.create_full_sync_payload()
+        full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+        
+        try:
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": peer_id,
+                "msg": full_sync_msg.hex()
+            })
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to send FULL_SYNC: {e}", level='warn')
+    
+    return {"result": "continue"}
+
+
+def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HIVE_FULL_SYNC message (complete state transfer).
+    
+    Merge the received state with our local state, preferring
+    higher version numbers for each peer.
+    """
+    if not gossip_mgr:
+        return {"result": "continue"}
+    
+    updated = gossip_mgr.process_full_sync(peer_id, payload)
+    plugin.log(f"cl-hive: FULL_SYNC from {peer_id[:16]}...: {updated} states updated")
+    
+    return {"result": "continue"}
+
+
+# =============================================================================
+# PEER CONNECTION HOOK (State Hash Exchange)
+# =============================================================================
+
+@plugin.subscribe("peer_connected")
+def on_peer_connected(peer_id: str, plugin: Plugin, **kwargs):
+    """
+    Hook called when a peer connects.
+    
+    If the peer is a Hive member, send a STATE_HASH message to
+    initiate anti-entropy check and detect state divergence.
+    """
+    if not database or not gossip_mgr:
+        return
+    
+    # Check if this peer is a Hive member
+    member = database.get_member(peer_id)
+    if not member:
+        return  # Not a Hive member, ignore
+    
+    plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
+    
+    # Send STATE_HASH for anti-entropy check
+    state_hash_payload = gossip_mgr.create_state_hash_payload()
+    state_hash_msg = serialize(HiveMessageType.STATE_HASH, state_hash_payload)
+    
+    try:
+        safe_plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": state_hash_msg.hex()
+        })
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
 
 
 # =============================================================================

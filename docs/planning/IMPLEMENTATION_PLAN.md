@@ -144,9 +144,11 @@ This document outlines the phased implementation plan for `cl-hive`, a distribut
 
 ---
 
-## Phase 2: State Management (Anti-Entropy)
+## Phase 2: State Management (Anti-Entropy) ✅ IMPLEMENTED
 
 **Objective:** Build the HiveMap and ensure consistency after network partitions using Gossip and Anti-Entropy.
+
+**Implementation Status:** ✅ **COMPLETE** (Awaiting Red Team Audit)
 
 ### 2.1 HiveMap & State Hashing
 **File:** `modules/state_manager.py`
@@ -158,11 +160,11 @@ To ensure deterministic comparison, the State Hash is calculated as:
 *   List must be sorted by `peer_id`.
 
 **Tasks:**
-- [ ] Implement `HivePeerState` dataclass.
-- [ ] Implement `update_peer_state(peer_id, gossip_data)`: Updates local DB if gossip version > local version.
-- [ ] Implement `calculate_fleet_hash()`: Computes the global checksum of the local Hive view.
-- [ ] Implement `get_missing_peers(remote_hash)`: Identifies divergence (naive full sync for MVP).
-- [ ] Database Integration: Persist state to `hive_state` table.
+- [x] Implement `HivePeerState` dataclass.
+- [x] Implement `update_peer_state(peer_id, gossip_data)`: Updates local DB if gossip version > local version.
+- [x] Implement `calculate_fleet_hash()`: Computes the global checksum of the local Hive view.
+- [x] Implement `get_missing_peers(remote_hash)`: Identifies divergence (naive full sync for MVP).
+- [x] Database Integration: Persist state to `hive_state` table.
 
 ### 2.2 Gossip Protocol (Thresholds)
 **File:** `modules/gossip.py`
@@ -174,9 +176,9 @@ To ensure deterministic comparison, the State Hash is calculated as:
 4.  **Heartbeat:** Force broadcast every `heartbeat_interval` (300s) if no other updates.
 
 **Tasks:**
-- [ ] Implement `should_broadcast(old_state, new_state)` logic.
-- [ ] Implement `create_gossip_payload()`: Bundles local state for transmission.
-- [ ] Implement `process_gossip(payload)`: Validates and passes to StateManager.
+- [x] Implement `should_broadcast(old_state, new_state)` logic.
+- [x] Implement `create_gossip_payload()`: Bundles local state for transmission.
+- [x] Implement `process_gossip(payload)`: Validates and passes to StateManager.
 
 ### 2.3 Protocol Integration (cl-hive.py)
 **Context:** Wire up the message types defined in Phase 1 to the logic in Phase 2.
@@ -187,20 +189,20 @@ To ensure deterministic comparison, the State Hash is calculated as:
 3.  `HIVE_FULL_SYNC` (32781): Response to hash mismatch.
 
 **Tasks:**
-- [ ] Register new message handlers in `on_custommsg`.
-- [ ] Implement `handle_gossip`: Update StateManager.
-- [ ] Implement `handle_state_hash`: Compare local vs remote hash. If mismatch -> Send `FULL_SYNC`.
-- [ ] Implement `handle_full_sync`: Bulk update StateManager.
-- [ ] Hook `peer_connected` event: Trigger `send_state_hash` on connection.
+- [x] Register new message handlers in `on_custommsg`.
+- [x] Implement `handle_gossip`: Update StateManager.
+- [x] Implement `handle_state_hash`: Compare local vs remote hash. If mismatch -> Send `FULL_SYNC`.
+- [x] Implement `handle_full_sync`: Bulk update StateManager.
+- [x] Hook `peer_connected` event: Trigger `send_state_hash` on connection.
 
 ### 2.4 Phase 2 Testing
 **File:** `tests/test_state.py`
 
 **Tasks:**
-- [ ] **Determinism Test:** Verify `calculate_fleet_hash` produces identical hashes for identical (but scrambled) inputs.
-- [ ] **Threshold Test:** Verify 9% capacity change returns `False` for broadcast, 11% returns `True`.
-- [ ] **Anti-Entropy Test:** Simulate two nodes with divergent state; verify `FULL_SYNC` restores consistency.
-- [ ] **Persistence Test:** Verify state survives plugin restart via SQLite.
+- [x] **Determinism Test:** Verify `calculate_fleet_hash` produces identical hashes for identical (but scrambled) inputs.
+- [x] **Threshold Test:** Verify 9% capacity change returns `False` for broadcast, 11% returns `True`.
+- [x] **Anti-Entropy Test:** Simulate two nodes with divergent state; verify `FULL_SYNC` restores consistency.
+- [x] **Persistence Test:** Verify state survives plugin restart via SQLite.
 
 ---
 
