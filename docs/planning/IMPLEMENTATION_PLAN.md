@@ -82,9 +82,11 @@ This document outlines the phased implementation plan for `cl-hive`, a distribut
 ### 1.1 Message Types
 **File:** `modules/protocol.py`
 **Range:** 32769 (Odd) to avoid conflicts.
+**Magic Prefix:** `0x48495645` (ASCII "HIVE") - 4 bytes prepended to all messages.
 **Tasks:**
 - [ ] Define IntEnum for message types (HELLO, CHALLENGE, ATTEST, GOSSIP, INTENT, BAN).
 - [ ] Implement serialization/deserialization.
+- [ ] Implement Magic Byte Wrapping: All outgoing messages MUST be prefixed with `0x48495645`.
 
 ### 1.2 Handshake Protocol & Genesis
 **File:** `modules/handshake.py`
@@ -96,7 +98,8 @@ This document outlines the phased implementation plan for `cl-hive`, a distribut
 ### 1.3 Custom Message Hook
 **Tasks:**
 - [ ] Register `custommsg` hook in `cl-hive.py`.
-- [ ] Dispatch to protocol handler.
+- [ ] Implement Magic Byte Verification (Peek & Check): Read first 4 bytes, verify `0x48495645`. If mismatch, return `{"result": "continue"}` to pass message to other plugins.
+- [ ] Dispatch to protocol handler (only after magic verification passes).
 
 ---
 
