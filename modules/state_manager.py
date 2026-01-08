@@ -29,6 +29,12 @@ STATE_CHECK_INTERVAL = 60
 # Maximum age for stale state entries (seconds) - 1 hour
 STALE_STATE_THRESHOLD = 3600
 
+# Bounds to prevent unbounded state growth
+MAX_TOPOLOGY_ENTRIES = 200
+MAX_FEE_POLICY_KEYS = 20
+MAX_STATE_HASH_LEN = 128
+MAX_PEER_ID_LEN = 128
+
 
 # =============================================================================
 # DATA CLASSES
@@ -121,6 +127,42 @@ class StateManager:
         """Log a message if plugin is available."""
         if self.plugin:
             self.plugin.log(f"[StateManager] {msg}", level=level)
+
+    def _validate_state_entry(self, data: Dict[str, Any]) -> bool:
+        """Validate a state entry before using it or writing to DB."""
+        peer_id = data.get("peer_id")
+        if not isinstance(peer_id, str) or not peer_id or len(peer_id) > MAX_PEER_ID_LEN:
+            return False
+
+        capacity_sats = data.get("capacity_sats", 0)
+        available_sats = data.get("available_sats", 0)
+        version = data.get("version", 0)
+        timestamp = data.get("timestamp", data.get("last_update", 0))
+        state_hash = data.get("state_hash", "")
+
+        if not isinstance(capacity_sats, int) or capacity_sats < 0:
+            return False
+        if not isinstance(available_sats, int) or available_sats < 0:
+            return False
+        if not isinstance(version, int) or version < 0:
+            return False
+        if not isinstance(timestamp, int) or timestamp < 0:
+            return False
+        if not isinstance(state_hash, str) or len(state_hash) > MAX_STATE_HASH_LEN:
+            return False
+
+        fee_policy = data.get("fee_policy", {})
+        if not isinstance(fee_policy, dict) or len(fee_policy) > MAX_FEE_POLICY_KEYS:
+            return False
+
+        topology = data.get("topology", [])
+        if not isinstance(topology, list) or len(topology) > MAX_TOPOLOGY_ENTRIES:
+            return False
+        for entry in topology:
+            if not isinstance(entry, str) or not entry or len(entry) > MAX_PEER_ID_LEN:
+                return False
+
+        return True
     
     # =========================================================================
     # STATE UPDATES
@@ -140,6 +182,12 @@ class StateManager:
         Returns:
             True if state was updated, False if rejected (stale)
         """
+        data = dict(gossip_data)
+        data["peer_id"] = peer_id
+        if not self._validate_state_entry(data):
+            self._log(f"Rejected invalid gossip state from {peer_id[:16]}...", level="warn")
+            return False
+
         remote_version = gossip_data.get('version', 0)
         
         # Check if we have existing state
@@ -322,6 +370,9 @@ class StateManager:
         for state_dict in remote_states:
             peer_id = state_dict.get('peer_id')
             if not peer_id:
+                continue
+            if not self._validate_state_entry(state_dict):
+                self._log(f"Rejected invalid FULL_SYNC entry for {peer_id[:16]}...", level="warn")
                 continue
             
             remote_version = state_dict.get('version', 0)

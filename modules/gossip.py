@@ -30,6 +30,11 @@ DEFAULT_HEARTBEAT_INTERVAL = 300
 # Minimum interval between gossip broadcasts to same peer (seconds)
 MIN_GOSSIP_INTERVAL = 10
 
+# Bounds to prevent unbounded payload growth
+MAX_TOPOLOGY_ENTRIES = 200
+MAX_FULL_SYNC_STATES = 2000
+MAX_FEE_POLICY_KEYS = 20
+
 
 # =============================================================================
 # DATA CLASSES
@@ -268,6 +273,15 @@ class GossipManager:
                      f"({sender_id[:16]}... != {payload['peer_id'][:16]}...)")
             return False
         
+        fee_policy = payload.get("fee_policy", {})
+        topology = payload.get("topology", [])
+        if not isinstance(fee_policy, dict) or len(fee_policy) > MAX_FEE_POLICY_KEYS:
+            self._log(f"Rejected gossip from {sender_id[:16]}...: invalid fee_policy")
+            return False
+        if not isinstance(topology, list) or len(topology) > MAX_TOPOLOGY_ENTRIES:
+            self._log(f"Rejected gossip from {sender_id[:16]}...: invalid topology")
+            return False
+
         # Track active peer
         self._active_peers.add(sender_id)
         
@@ -361,9 +375,12 @@ class GossipManager:
             Number of states that were updated
         """
         states = payload.get('states', [])
-        
+
         if not states:
             self._log(f"Empty FULL_SYNC from {sender_id[:16]}...")
+            return 0
+        if not isinstance(states, list) or len(states) > MAX_FULL_SYNC_STATES:
+            self._log(f"Rejected FULL_SYNC from {sender_id[:16]}...: too many states")
             return 0
         
         updated = self.state_manager.apply_full_sync(states)

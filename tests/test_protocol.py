@@ -203,12 +203,20 @@ class TestMessageHelpers:
     
     def test_create_attest(self):
         """create_attest should produce valid ATTEST message."""
+        manifest = {
+            "pubkey": "02" + "a" * 64,
+            "version": "v1.0",
+            "features": ["splice"],
+            "timestamp": 1234567890,
+            "nonce": "deadbeef" * 8
+        }
         data = create_attest(
             pubkey="02" + "a" * 64,
             version="v1.0",
             features=["splice"],
             nonce_signature="nsig",
-            manifest_signature="msig"
+            manifest_signature="msig",
+            manifest=manifest
         )
         
         msg_type, payload = deserialize(data)

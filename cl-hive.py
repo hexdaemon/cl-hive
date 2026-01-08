@@ -34,6 +34,7 @@ License: MIT
 import os
 import signal
 import threading
+import time
 from typing import Dict, Optional, Any
 
 from pyln.client import Plugin, RpcError
@@ -43,13 +44,14 @@ from modules.config import HiveConfig
 from modules.database import HiveDatabase
 from modules.protocol import (
     HIVE_MAGIC, HiveMessageType, 
-    is_hive_message, deserialize, serialize,
+    MAX_MESSAGE_BYTES, is_hive_message, deserialize, serialize,
     create_challenge, create_welcome
 )
-from modules.handshake import HandshakeManager, Ticket
+from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager
 from modules.gossip import GossipManager
 from modules.intent_manager import IntentManager, Intent, IntentType
+from modules.bridge import Bridge, BridgeStatus, CircuitOpenError
 
 # Initialize the plugin
 plugin = Plugin()
@@ -103,6 +105,10 @@ class ThreadSafeRpcProxy:
                 return self._rpc.call(method_name, payload)
             return self._rpc.call(method_name)
 
+    def get_socket_path(self) -> Optional[str]:
+        """Expose the underlying Lightning RPC socket path if available."""
+        return getattr(self._rpc, "socket_path", None)
+
 
 class ThreadSafePluginProxy:
     """
@@ -137,6 +143,7 @@ handshake_mgr: Optional[HandshakeManager] = None
 state_manager: Optional[StateManager] = None
 gossip_mgr: Optional[GossipManager] = None
 intent_mgr: Optional[IntentManager] = None
+bridge: Optional[Bridge] = None
 
 
 # =============================================================================
@@ -298,28 +305,24 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     intent_thread.start()
     plugin.log("cl-hive: Intent monitor thread started")
     
-    # Verify cl-revenue-ops dependency (Circuit Breaker pattern)
-    try:
-        status = safe_plugin.rpc.call("revenue-status")
-        version = status.get("version", "unknown")
-        plugin.log(f"cl-hive: Found cl-revenue-ops {version}")
-        
-        # Check minimum version (v1.4.0+ required for Strategic Exemption)
-        # For now, just log - full version parsing can be added later
-        if "1.4" not in version and "1.5" not in version and "2." not in version:
-            plugin.log(
-                f"cl-hive: WARNING - cl-revenue-ops {version} may not support HIVE strategy. "
-                "Recommended: v1.4.0+",
-                level='warn'
-            )
-    except RpcError as e:
+    # Initialize Integration Bridge (Phase 4)
+    # Uses Circuit Breaker pattern for resilient cl-revenue-ops integration
+    global bridge
+    bridge = Bridge(safe_plugin.rpc, safe_plugin)
+    bridge_status = bridge.initialize()
+    
+    if bridge_status == BridgeStatus.ENABLED:
+        plugin.log(f"cl-hive: Bridge ENABLED - cl-revenue-ops {bridge._revenue_ops_version}")
+        if bridge._clboss_available:
+            plugin.log("cl-hive: CLBoss integration available (Gateway Pattern)")
+    elif bridge_status == BridgeStatus.DEGRADED:
+        plugin.log("cl-hive: Bridge DEGRADED - some features unavailable", level='warn')
+    else:
         plugin.log(
-            f"cl-hive: WARNING - cl-revenue-ops not detected ({e}). "
-            "Hive policy integration will be unavailable.",
+            "cl-hive: Bridge DISABLED - cl-revenue-ops not detected or incompatible. "
+            "Hive policy integration will be unavailable. Recommended: v1.4.0+",
             level='warn'
         )
-    except Exception as e:
-        plugin.log(f"cl-hive: Error checking cl-revenue-ops: {e}", level='warn')
     
     # Set up graceful shutdown handler
     def handle_shutdown_signal(signum, frame):
@@ -355,6 +358,10 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
     if not database or not handshake_mgr:
         return {"result": "continue"}
     
+    # Reject oversized payloads before hex decode
+    if len(payload) > MAX_MESSAGE_BYTES * 2:
+        return {"result": "continue"}
+
     # Decode hex payload to bytes
     try:
         data = bytes.fromhex(payload)
@@ -426,7 +433,7 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
     
     # Generate challenge nonce
-    nonce = handshake_mgr.generate_challenge(peer_id)
+    nonce = handshake_mgr.generate_challenge(peer_id, ticket.requirements)
     
     # Get Hive ID from an existing admin
     members = database.get_all_members()
@@ -477,7 +484,8 @@ def handle_challenge(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             version=attest_data['manifest']['version'],
             features=attest_data['manifest']['features'],
             nonce_signature=attest_data['nonce_signature'],
-            manifest_signature=attest_data['manifest_signature']
+            manifest_signature=attest_data['manifest_signature'],
+            manifest=attest_data['manifest']
         )
         
         safe_plugin.rpc.call("sendcustommsg", {
@@ -499,19 +507,54 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     Verify the candidate's attestation and send WELCOME if valid.
     """
     # Get the challenge we sent
-    expected_nonce = handshake_mgr.get_pending_challenge(peer_id)
-    if not expected_nonce:
+    pending = handshake_mgr.get_pending_challenge(peer_id)
+    if not pending:
         plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... but no pending challenge", level='warn')
         return {"result": "continue"}
+
+    now = int(time.time())
+    if now - pending["issued_at"] > CHALLENGE_TTL_SECONDS:
+        handshake_mgr.clear_challenge(peer_id)
+        plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... challenge expired", level='warn')
+        return {"result": "continue"}
+
+    expected_nonce = pending["nonce"]
     
-    # Reconstruct manifest for verification
-    manifest_data = {
-        "pubkey": payload.get('pubkey'),
-        "version": payload.get('version'),
-        "features": payload.get('features', []),
-        "timestamp": payload.get('timestamp', 0),
-        "nonce": expected_nonce  # Use our expected nonce
-    }
+    manifest_data = payload.get('manifest')
+    if not isinstance(manifest_data, dict):
+        plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... missing manifest", level='warn')
+        handshake_mgr.clear_challenge(peer_id)
+        return {"result": "continue"}
+
+    required_fields = ["pubkey", "version", "features", "timestamp", "nonce"]
+    for field in required_fields:
+        if field not in manifest_data:
+            plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... missing {field}", level='warn')
+            handshake_mgr.clear_challenge(peer_id)
+            return {"result": "continue"}
+
+    if payload.get('pubkey') and payload.get('pubkey') != manifest_data.get('pubkey'):
+        plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... pubkey mismatch", level='warn')
+        handshake_mgr.clear_challenge(peer_id)
+        return {"result": "continue"}
+    if payload.get('version') and payload.get('version') != manifest_data.get('version'):
+        plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... version mismatch", level='warn')
+        handshake_mgr.clear_challenge(peer_id)
+        return {"result": "continue"}
+    if payload.get('features') and payload.get('features') != manifest_data.get('features'):
+        plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... features mismatch", level='warn')
+        handshake_mgr.clear_challenge(peer_id)
+        return {"result": "continue"}
+
+    if manifest_data.get('pubkey') != peer_id:
+        plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... pubkey not bound to peer", level='warn')
+        handshake_mgr.clear_challenge(peer_id)
+        return {"result": "continue"}
+
+    if not isinstance(manifest_data.get('features'), list):
+        plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... invalid features", level='warn')
+        handshake_mgr.clear_challenge(peer_id)
+        return {"result": "continue"}
     
     nonce_sig = payload.get('nonce_signature')
     manifest_sig = payload.get('manifest_signature')
@@ -530,8 +573,18 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         handshake_mgr.clear_challenge(peer_id)
         return {"result": "continue"}
     
+    satisfied, missing = handshake_mgr.check_requirements(
+        pending["requirements"], manifest_data.get("features", [])
+    )
+    if not satisfied:
+        plugin.log(
+            f"cl-hive: ATTEST from {peer_id[:16]}... missing requirements: {missing}",
+            level='warn'
+        )
+        handshake_mgr.clear_challenge(peer_id)
+        return {"result": "continue"}
+
     # Verification passed! Add as Neophyte member
-    import time
     database.add_member(
         peer_id=peer_id,
         tier='neophyte',
@@ -585,6 +638,13 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         f"cl-hive: WELCOME received! Joined '{hive_id}' as {tier} "
         f"(Hive has {member_count} members)"
     )
+    
+    # Phase 4: Apply Hive fee policy to this peer
+    if bridge and bridge.status == BridgeStatus.ENABLED:
+        bridge.set_hive_policy(peer_id, is_member=True)
+        # Also tell CLBoss about this peer (Gateway Pattern)
+        if bridge._clboss_available:
+            bridge.ignore_peer(peer_id)
     
     # TODO: Store Hive membership info, initiate state sync
     
@@ -712,6 +772,24 @@ def handle_intent(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not intent_mgr:
         return {"result": "continue"}
     
+    required_fields = ["intent_type", "target", "initiator", "timestamp"]
+    for field in required_fields:
+        if field not in payload:
+            plugin.log(f"cl-hive: INTENT from {peer_id[:16]}... missing {field}", level='warn')
+            return {"result": "continue"}
+
+    if payload.get("initiator") != peer_id:
+        plugin.log(f"cl-hive: INTENT from {peer_id[:16]}... initiator mismatch", level='warn')
+        return {"result": "continue"}
+
+    if payload.get("intent_type") not in {t.value for t in IntentType}:
+        plugin.log(f"cl-hive: INTENT from {peer_id[:16]}... invalid intent_type", level='warn')
+        return {"result": "continue"}
+
+    if not isinstance(payload.get("target"), str) or not payload.get("target"):
+        plugin.log(f"cl-hive: INTENT from {peer_id[:16]}... invalid target", level='warn')
+        return {"result": "continue"}
+
     # Parse the remote intent
     remote_intent = Intent.from_dict(payload)
     
@@ -751,6 +829,10 @@ def handle_intent_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     intent_type = payload.get('intent_type')
     target = payload.get('target')
     initiator = payload.get('initiator')
+
+    if not intent_type or not target or not initiator:
+        plugin.log(f"cl-hive: INTENT_ABORT from {peer_id[:16]}... missing fields", level='warn')
+        return {"result": "continue"}
     
     intent_mgr.record_remote_abort(intent_type, target, initiator)
     plugin.log(f"cl-hive: INTENT_ABORT from {peer_id[:16]}... for {target[:16]}...")
@@ -841,7 +923,15 @@ def process_ready_intents():
             if safe_plugin:
                 safe_plugin.log(f"cl-hive: Committed intent {intent_id}: {intent_type} -> {target[:16]}...")
             
-            # Execute the action (callback registry)
+            # Execute the action (callback registry) only when governance allows
+            if config.governance_mode != "autonomous":
+                if safe_plugin:
+                    safe_plugin.log(
+                        f"cl-hive: Skipping execution for intent {intent_id} "
+                        f"(mode={config.governance_mode})",
+                        level='warn'
+                    )
+                continue
             intent_mgr.execute_committed_intent(intent_row)
 
 

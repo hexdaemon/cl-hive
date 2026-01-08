@@ -37,6 +37,12 @@ DEFAULT_TICKET_HOURS = 24
 # Nonce size in bytes (32 bytes = 64 hex chars)
 NONCE_SIZE = 32
 
+# Challenge time-to-live in seconds
+CHALLENGE_TTL_SECONDS = 300
+
+# Cap to prevent unbounded pending challenge growth
+MAX_PENDING_CHALLENGES = 1000
+
 # Plugin version for manifest
 PLUGIN_VERSION = "cl-hive v0.1.0"
 
@@ -141,7 +147,7 @@ class HandshakeManager:
         self.db = db
         self.plugin = plugin
         self._our_pubkey: Optional[str] = None
-        self._pending_challenges: Dict[str, str] = {}  # peer_id -> nonce
+        self._pending_challenges: Dict[str, Dict[str, Any]] = {}
     
     # =========================================================================
     # IDENTITY
@@ -413,21 +419,34 @@ class HandshakeManager:
     # CHALLENGE-RESPONSE
     # =========================================================================
     
-    def generate_challenge(self, peer_id: str) -> str:
+    def generate_challenge(self, peer_id: str, requirements: int) -> str:
         """
         Generate a challenge nonce for a peer.
         
         Args:
             peer_id: Peer's public key
+            requirements: Bitmask requirements from the invite ticket
             
         Returns:
             Hex-encoded random nonce
         """
         nonce = secrets.token_hex(NONCE_SIZE)
-        self._pending_challenges[peer_id] = nonce
+        now = int(time.time())
+        self._pending_challenges[peer_id] = {
+            "nonce": nonce,
+            "issued_at": now,
+            "requirements": requirements
+        }
+        if len(self._pending_challenges) > MAX_PENDING_CHALLENGES:
+            oldest = sorted(
+                self._pending_challenges.items(),
+                key=lambda item: item[1]["issued_at"]
+            )
+            for key, _ in oldest[: len(self._pending_challenges) - MAX_PENDING_CHALLENGES]:
+                self._pending_challenges.pop(key, None)
         return nonce
     
-    def get_pending_challenge(self, peer_id: str) -> Optional[str]:
+    def get_pending_challenge(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """Get the pending challenge nonce for a peer."""
         return self._pending_challenges.get(peer_id)
     

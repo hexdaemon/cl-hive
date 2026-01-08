@@ -34,6 +34,8 @@ HIVE_MAGIC_HEX = 0x48495645
 # Protocol version for compatibility checks
 PROTOCOL_VERSION = 1
 
+# Maximum message size in bytes (post-hex decode)
+MAX_MESSAGE_BYTES = 65535
 
 # =============================================================================
 # MESSAGE TYPES
@@ -166,7 +168,7 @@ def deserialize(data: bytes) -> Tuple[Optional[HiveMessageType], Optional[Dict[s
         ...     return {"result": "continue"}  # Not our message
     """
     # Peek & Check: Verify magic prefix
-    if len(data) < 4:
+    if len(data) < 4 or len(data) > MAX_MESSAGE_BYTES:
         return (None, None)
     
     if data[:4] != HIVE_MAGIC:
@@ -177,8 +179,13 @@ def deserialize(data: bytes) -> Tuple[Optional[HiveMessageType], Optional[Dict[s
         json_data = data[4:].decode('utf-8')
         envelope = json.loads(json_data)
         
+        if envelope.get('version') != PROTOCOL_VERSION:
+            return (None, None)
+
         msg_type = HiveMessageType(envelope['type'])
         payload = envelope.get('payload', {})
+        if not isinstance(payload, dict):
+            return (None, None)
         
         return (msg_type, payload)
         
@@ -223,14 +230,16 @@ def create_challenge(nonce: str, hive_id: str) -> bytes:
 
 
 def create_attest(pubkey: str, version: str, features: list,
-                  nonce_signature: str, manifest_signature: str) -> bytes:
+                  nonce_signature: str, manifest_signature: str,
+                  manifest: Dict[str, Any]) -> bytes:
     """Create a HIVE_ATTEST message."""
     return serialize(HiveMessageType.ATTEST, {
         "pubkey": pubkey,
         "version": version,
         "features": features,
         "nonce_signature": nonce_signature,
-        "manifest_signature": manifest_signature
+        "manifest_signature": manifest_signature,
+        "manifest": manifest
     })
 
 
