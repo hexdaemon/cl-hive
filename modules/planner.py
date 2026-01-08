@@ -22,7 +22,13 @@ import secrets
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from pyln.client import RpcError
+try:
+    from pyln.client import RpcError
+except ImportError:
+    # For testing without pyln installed
+    class RpcError(Exception):
+        """Stub RpcError for testing."""
+        pass
 
 
 # =============================================================================

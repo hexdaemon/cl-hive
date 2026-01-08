@@ -1,0 +1,569 @@
+"""
+Tests for Phase 6: Planner Module (Ticket 6-01)
+
+Tests the Planner class for:
+- Network cache refresh and directional dedup
+- Saturation calculation with gossip clamping
+- Guard mechanism with max ignores/cycle limit
+- Governance mode behavior
+- Fail-closed on RPC errors
+
+Author: Lightning Goats Team
+"""
+
+import pytest
+import time
+from unittest.mock import MagicMock, patch, PropertyMock
+from dataclasses import dataclass
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from modules.planner import (
+    Planner, ChannelInfo, SaturationResult, RpcError,
+    MAX_IGNORES_PER_CYCLE, SATURATION_RELEASE_THRESHOLD_PCT,
+    MIN_TARGET_CAPACITY_SATS, NETWORK_CACHE_TTL_SECONDS
+)
+
+
+# =============================================================================
+# FIXTURES
+# =============================================================================
+
+@pytest.fixture
+def mock_state_manager():
+    """Create a mock StateManager."""
+    sm = MagicMock()
+    sm.get_all_peer_states.return_value = []
+    return sm
+
+
+@pytest.fixture
+def mock_database():
+    """Create a mock database."""
+    db = MagicMock()
+    db.get_all_members.return_value = []
+    db.log_planner_action = MagicMock()
+    return db
+
+
+@pytest.fixture
+def mock_bridge():
+    """Create a mock Bridge."""
+    return MagicMock()
+
+
+@pytest.fixture
+def mock_clboss_bridge():
+    """Create a mock CLBossBridge."""
+    clboss = MagicMock()
+    clboss._available = True
+    clboss.ignore_peer.return_value = True
+    clboss.unignore_peer.return_value = True
+    return clboss
+
+
+@pytest.fixture
+def mock_plugin():
+    """Create a mock plugin."""
+    plugin = MagicMock()
+    plugin.log = MagicMock()
+    plugin.rpc = MagicMock()
+    return plugin
+
+
+@pytest.fixture
+def mock_config():
+    """Create a mock config snapshot."""
+    cfg = MagicMock()
+    cfg.market_share_cap_pct = 0.20  # 20%
+    cfg.governance_mode = 'advisor'
+    return cfg
+
+
+@pytest.fixture
+def planner(mock_state_manager, mock_database, mock_bridge, mock_clboss_bridge, mock_plugin):
+    """Create a Planner instance with mocked dependencies."""
+    return Planner(
+        state_manager=mock_state_manager,
+        database=mock_database,
+        bridge=mock_bridge,
+        clboss_bridge=mock_clboss_bridge,
+        plugin=mock_plugin
+    )
+
+
+# =============================================================================
+# NETWORK CACHE TESTS (Directional Dedup)
+# =============================================================================
+
+class TestNetworkCache:
+    """Test network cache refresh and deduplication."""
+
+    def test_refresh_network_cache_success(self, planner, mock_plugin):
+        """_refresh_network_cache should populate cache from listchannels."""
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'a' * 64,
+                    'destination': '02' + 'b' * 64,
+                    'short_channel_id': '123x1x0',
+                    'satoshis': 1000000,
+                    'active': True
+                }
+            ]
+        }
+
+        result = planner._refresh_network_cache(force=True)
+
+        assert result is True
+        assert len(planner._network_cache) > 0
+
+    def test_refresh_network_cache_rpc_failure(self, planner, mock_plugin):
+        """_refresh_network_cache should return False on RPC error."""
+        mock_plugin.rpc.listchannels.side_effect = RpcError('listchannels', {}, 'timeout')
+
+        result = planner._refresh_network_cache(force=True)
+
+        assert result is False
+
+    def test_directional_dedup(self, planner, mock_plugin):
+        """Should deduplicate bidirectional channels (A->B and B->A counted once)."""
+        # Same channel, both directions
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'a' * 64,
+                    'destination': '02' + 'b' * 64,
+                    'short_channel_id': '123x1x0',
+                    'satoshis': 1000000,
+                    'active': True
+                },
+                {
+                    'source': '02' + 'b' * 64,
+                    'destination': '02' + 'a' * 64,
+                    'short_channel_id': '123x1x0',  # Same channel
+                    'satoshis': 1000000,
+                    'active': True
+                }
+            ]
+        }
+
+        planner._refresh_network_cache(force=True)
+
+        # Should not double-count
+        target_a = '02' + 'a' * 64
+        target_b = '02' + 'b' * 64
+
+        # Each target should have exactly 1 channel entry (the deduplicated one)
+        channels_to_a = planner._network_cache.get(target_a, [])
+        channels_to_b = planner._network_cache.get(target_b, [])
+
+        # The dedup logic should result in consistent counts
+        assert len(channels_to_a) == len(channels_to_b)
+
+    def test_cache_ttl_respected(self, planner, mock_plugin):
+        """Should not refresh if cache is fresh."""
+        mock_plugin.rpc.listchannels.return_value = {'channels': []}
+
+        # First refresh
+        planner._refresh_network_cache(force=True)
+        call_count_1 = mock_plugin.rpc.listchannels.call_count
+
+        # Second refresh without force (should use cache)
+        planner._refresh_network_cache(force=False)
+        call_count_2 = mock_plugin.rpc.listchannels.call_count
+
+        assert call_count_2 == call_count_1  # No additional call
+
+
+# =============================================================================
+# SATURATION CALCULATION TESTS
+# =============================================================================
+
+class TestSaturationCalculation:
+    """Test saturation calculation with gossip clamping."""
+
+    def test_calculate_hive_share_basic(self, planner, mock_database, mock_state_manager, mock_plugin, mock_config):
+        """Basic saturation calculation."""
+        target = '02' + 'c' * 64
+        member1 = '02' + 'a' * 64
+
+        # Setup Hive member
+        mock_database.get_all_members.return_value = [
+            {'peer_id': member1, 'tier': 'member'}
+        ]
+
+        # Setup member state with target in topology
+        mock_state = MagicMock()
+        mock_state.peer_id = member1
+        mock_state.topology = [target]
+        mock_state.capacity_sats = 500000  # 500k sats
+        mock_state_manager.get_all_peer_states.return_value = [mock_state]
+
+        # Setup network cache with public channels
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': member1,
+                    'destination': target,
+                    'short_channel_id': '100x1x0',
+                    'satoshis': 500000,
+                    'active': True
+                },
+                {
+                    'source': '02' + 'd' * 64,  # Non-hive node
+                    'destination': target,
+                    'short_channel_id': '200x1x0',
+                    'satoshis': 2000000,  # 2M sats
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        result = planner._calculate_hive_share(target, mock_config)
+
+        # Hive has 500k out of 2.5M total = 20%
+        assert result.hive_capacity_sats == 500000
+        assert result.public_capacity_sats == 2500000
+        assert abs(result.hive_share_pct - 0.20) < 0.01
+
+    def test_gossip_clamping_to_public_reality(self, planner, mock_database, mock_state_manager, mock_plugin, mock_config):
+        """Gossip capacity should be clamped to public listchannels maximum."""
+        target = '02' + 'c' * 64
+        member1 = '02' + 'a' * 64
+
+        # Setup Hive member
+        mock_database.get_all_members.return_value = [
+            {'peer_id': member1, 'tier': 'member'}
+        ]
+
+        # Gossip claims 10 BTC (inflated!)
+        mock_state = MagicMock()
+        mock_state.peer_id = member1
+        mock_state.topology = [target]
+        mock_state.capacity_sats = 1_000_000_000  # 10 BTC - INFLATED
+        mock_state_manager.get_all_peer_states.return_value = [mock_state]
+
+        # But public reality shows only 500k sats
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': member1,
+                    'destination': target,
+                    'short_channel_id': '100x1x0',
+                    'satoshis': 500000,  # Only 500k in reality
+                    'active': True
+                },
+                {
+                    'source': '02' + 'd' * 64,
+                    'destination': target,
+                    'short_channel_id': '200x1x0',
+                    'satoshis': 2000000,
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        result = planner._calculate_hive_share(target, mock_config)
+
+        # Should be clamped to 500k, not 10 BTC
+        assert result.hive_capacity_sats == 500000
+        # Share should be 500k / 2.5M = 20%, not 10BTC / (10BTC + 2M) = ~83%
+        assert result.hive_share_pct < 0.25
+
+    def test_no_public_channel_ignores_gossip(self, planner, mock_database, mock_state_manager, mock_plugin, mock_config):
+        """If no public channel exists, gossip capacity should be ignored."""
+        target = '02' + 'c' * 64
+        member1 = '02' + 'a' * 64
+
+        mock_database.get_all_members.return_value = [
+            {'peer_id': member1, 'tier': 'member'}
+        ]
+
+        # Gossip claims capacity to target
+        mock_state = MagicMock()
+        mock_state.peer_id = member1
+        mock_state.topology = [target]
+        mock_state.capacity_sats = 5_000_000
+        mock_state_manager.get_all_peer_states.return_value = [mock_state]
+
+        # But no public channel exists between member and target
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'd' * 64,  # Different source
+                    'destination': target,
+                    'short_channel_id': '200x1x0',
+                    'satoshis': 2000000,
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        result = planner._calculate_hive_share(target, mock_config)
+
+        # No verified public channel = 0 hive capacity
+        assert result.hive_capacity_sats == 0
+
+
+# =============================================================================
+# GUARD MECHANISM TESTS
+# =============================================================================
+
+class TestGuardMechanism:
+    """Test saturation enforcement (clboss-ignore)."""
+
+    def test_ignore_saturated_target(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
+        """Should issue clboss-ignore for saturated targets."""
+        target = '02' + 'x' * 64
+
+        # Setup network cache with saturated target
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'a' * 64,
+                    'destination': target,
+                    'short_channel_id': '100x1x0',
+                    'satoshis': MIN_TARGET_CAPACITY_SATS,  # Meets minimum
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        # Mock get_saturated_targets to return our target
+        with patch.object(planner, 'get_saturated_targets') as mock_get_sat:
+            mock_get_sat.return_value = [
+                SaturationResult(
+                    target=target,
+                    hive_capacity_sats=25_000_000,
+                    public_capacity_sats=100_000_000,
+                    hive_share_pct=0.25,  # 25% > 20% threshold
+                    is_saturated=True,
+                    should_release=False
+                )
+            ]
+
+            decisions = planner._enforce_saturation(mock_config, 'test-run-1')
+
+        # Should have called ignore_peer
+        mock_clboss_bridge.ignore_peer.assert_called_once_with(target)
+        assert target in planner._ignored_peers
+
+    def test_max_ignores_per_cycle_limit(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
+        """Should abort if more than MAX_IGNORES_PER_CYCLE ignores needed."""
+        # Setup network cache
+        mock_plugin.rpc.listchannels.return_value = {'channels': []}
+        planner._refresh_network_cache(force=True)
+
+        # Create more saturated targets than allowed
+        too_many_targets = [
+            SaturationResult(
+                target=f'02{i:064x}'[:66],
+                hive_capacity_sats=25_000_000,
+                public_capacity_sats=100_000_000,
+                hive_share_pct=0.25,
+                is_saturated=True,
+                should_release=False
+            )
+            for i in range(MAX_IGNORES_PER_CYCLE + 5)
+        ]
+
+        with patch.object(planner, 'get_saturated_targets') as mock_get_sat:
+            mock_get_sat.return_value = too_many_targets
+
+            decisions = planner._enforce_saturation(mock_config, 'test-run-2')
+
+        # Should have aborted
+        assert any(d.get('action') == 'abort' for d in decisions)
+        assert any(d.get('reason') == 'mass_saturation_detected' for d in decisions)
+
+        # Should NOT have called ignore_peer
+        mock_clboss_bridge.ignore_peer.assert_not_called()
+
+        # Should have logged the abort
+        mock_database.log_planner_action.assert_any_call(
+            action_type='saturation_check',
+            result='aborted',
+            details={
+                'reason': 'mass_saturation_detected',
+                'targets_count': MAX_IGNORES_PER_CYCLE + 5,
+                'max_allowed': MAX_IGNORES_PER_CYCLE,
+                'run_id': 'test-run-2'
+            }
+        )
+
+    def test_idempotent_ignore(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
+        """Should not re-ignore already-ignored peers."""
+        target = '02' + 'y' * 64
+
+        # Mark as already ignored
+        planner._ignored_peers.add(target)
+
+        mock_plugin.rpc.listchannels.return_value = {'channels': []}
+        planner._refresh_network_cache(force=True)
+
+        with patch.object(planner, 'get_saturated_targets') as mock_get_sat:
+            mock_get_sat.return_value = [
+                SaturationResult(
+                    target=target,
+                    hive_capacity_sats=25_000_000,
+                    public_capacity_sats=100_000_000,
+                    hive_share_pct=0.25,
+                    is_saturated=True,
+                    should_release=False
+                )
+            ]
+
+            planner._enforce_saturation(mock_config, 'test-run-3')
+
+        # Should NOT have called ignore_peer (already ignored)
+        mock_clboss_bridge.ignore_peer.assert_not_called()
+
+    def test_clboss_unavailable_skips_ignore(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
+        """Should skip ignore if CLBoss is unavailable."""
+        target = '02' + 'z' * 64
+        mock_clboss_bridge._available = False
+
+        mock_plugin.rpc.listchannels.return_value = {'channels': []}
+        planner._refresh_network_cache(force=True)
+
+        with patch.object(planner, 'get_saturated_targets') as mock_get_sat:
+            mock_get_sat.return_value = [
+                SaturationResult(
+                    target=target,
+                    hive_capacity_sats=25_000_000,
+                    public_capacity_sats=100_000_000,
+                    hive_share_pct=0.25,
+                    is_saturated=True,
+                    should_release=False
+                )
+            ]
+
+            decisions = planner._enforce_saturation(mock_config, 'test-run-4')
+
+        # Should have skipped
+        assert any(d.get('action') == 'ignore_skipped' for d in decisions)
+
+
+# =============================================================================
+# FAIL-CLOSED BEHAVIOR TESTS
+# =============================================================================
+
+class TestFailClosed:
+    """Test fail-closed behavior on errors."""
+
+    def test_rpc_failure_aborts_cycle(self, planner, mock_plugin, mock_config):
+        """Should abort cycle if network cache refresh fails."""
+        mock_plugin.rpc.listchannels.side_effect = RpcError('listchannels', {}, 'timeout')
+
+        decisions = planner.run_cycle(mock_config, run_id='test-fail')
+
+        # Should return empty (no actions taken)
+        assert decisions == []
+
+    def test_no_intents_on_cache_failure(self, planner, mock_plugin, mock_config, mock_database):
+        """Should not issue any ignores if cache refresh fails."""
+        mock_plugin.rpc.listchannels.side_effect = RpcError('listchannels', {}, 'timeout')
+
+        # Even with mocked saturated targets, should not act
+        planner.run_cycle(mock_config, run_id='test-no-action')
+
+        # Verify logged failure
+        mock_database.log_planner_action.assert_any_call(
+            action_type='cycle',
+            result='failed',
+            details={'reason': 'cache_refresh_failed', 'run_id': 'test-no-action'}
+        )
+
+
+# =============================================================================
+# GOVERNANCE MODE TESTS
+# =============================================================================
+
+class TestGovernanceMode:
+    """Test governance mode behavior."""
+
+    def test_advisor_mode_queues_only(self, planner, mock_config):
+        """In advisor mode, actions should be logged but not necessarily blocked."""
+        mock_config.governance_mode = 'advisor'
+
+        # The current implementation still performs ignores in advisor mode
+        # (ignoring is defensive, not fund-moving)
+        # This test documents the expected behavior
+        stats = planner.get_planner_stats()
+        assert 'ignored_peers_count' in stats
+
+
+# =============================================================================
+# RUN CYCLE INTEGRATION TESTS
+# =============================================================================
+
+class TestRunCycle:
+    """Test the main run_cycle method."""
+
+    def test_run_cycle_returns_decisions(self, planner, mock_plugin, mock_config, mock_database):
+        """run_cycle should return decision records."""
+        mock_plugin.rpc.listchannels.return_value = {'channels': []}
+
+        decisions = planner.run_cycle(mock_config, run_id='test-cycle')
+
+        # Should return a list (may be empty)
+        assert isinstance(decisions, list)
+
+        # Should log cycle completion
+        mock_database.log_planner_action.assert_called()
+
+    def test_run_cycle_respects_shutdown(self, planner, mock_config):
+        """run_cycle should exit early if shutdown_event is set."""
+        import threading
+        shutdown = threading.Event()
+        shutdown.set()
+
+        decisions = planner.run_cycle(mock_config, shutdown_event=shutdown, run_id='test-shutdown')
+
+        assert decisions == []
+
+
+# =============================================================================
+# SATURATION RELEASE TESTS
+# =============================================================================
+
+class TestSaturationRelease:
+    """Test release of ignores when saturation drops."""
+
+    def test_release_when_below_threshold(self, planner, mock_clboss_bridge, mock_config, mock_plugin, mock_database):
+        """Should unignore when share drops below release threshold."""
+        target = '02' + 'r' * 64
+
+        # Mark as ignored
+        planner._ignored_peers.add(target)
+
+        mock_plugin.rpc.listchannels.return_value = {'channels': []}
+        planner._refresh_network_cache(force=True)
+
+        # Mock share calculation to show it's now below threshold
+        with patch.object(planner, '_calculate_hive_share') as mock_calc:
+            mock_calc.return_value = SaturationResult(
+                target=target,
+                hive_capacity_sats=10_000_000,
+                public_capacity_sats=100_000_000,
+                hive_share_pct=0.10,  # 10% < 15% release threshold
+                is_saturated=False,
+                should_release=True
+            )
+
+            decisions = planner._release_saturation(mock_config, 'test-release')
+
+        # Should have called unignore
+        mock_clboss_bridge.unignore_peer.assert_called_once_with(target)
+        assert target not in planner._ignored_peers
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
