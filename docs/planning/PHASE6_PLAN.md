@@ -70,7 +70,7 @@ Phase 6 introduces the "Planner" (Gardner) algorithm to optimize the fleet's top
     *   *Mitigation:* One expansion per cycle (1 hour). Intent Lock prevents simultaneous opens.
 
 ## Gate Checklist
-*   [ ] `hive_planner_log` table exists.
-*   [ ] Planner loop running with `shutdown_event`.
-*   [ ] Rate limit: Max 1 intent/hour.
-*   [ ] Tests pass.
+*   [x] `hive_planner_log` table exists.
+*   [x] Planner loop running with `shutdown_event`.
+*   [x] Rate limit: Max 1 intent/hour.
+*   [x] Tests pass.

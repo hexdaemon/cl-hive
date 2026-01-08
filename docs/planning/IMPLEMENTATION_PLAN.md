@@ -449,7 +449,7 @@ CREATE TABLE contribution_ledger (
 
 ---
 
-## Phase 6: Hive Planner (Topology Optimization)
+## Phase 6: Hive Planner (Topology Optimization) ✅ IMPLEMENTED
 
 **Objective:** Implement the "Gardner" algorithm for fleet-wide graph optimization.
 
@@ -466,9 +466,9 @@ CREATE TABLE contribution_ledger (
 *   Network capacity: Estimate from `listchannels` (cached, updated hourly).
 
 **Tasks:**
-- [ ] Implement `calculate_hive_share(target_pubkey)` -> float (0.0 to 1.0).
-- [ ] Implement `get_saturated_targets()` -> list of pubkeys where share > 0.20.
-- [ ] Implement `get_underserved_targets()` -> list of high-value peers with share < 0.05.
+- [x] Implement `calculate_hive_share(target_pubkey)` -> float (0.0 to 1.0).
+- [x] Implement `get_saturated_targets()` -> list of pubkeys where share > 0.20.
+- [x] Implement `get_underserved_targets()` -> list of high-value peers with share < 0.05.
 
 ### 6.2 Anti-Overlap (The Guard)
 **File:** `modules/planner.py`
@@ -478,11 +478,11 @@ CREATE TABLE contribution_ledger (
 *   Prevents capital duplication on already-covered targets.
 
 **Tasks:**
-- [ ] Implement `enforce_saturation_limits()`:
+- [x] Implement `enforce_saturation_limits()`:
     *   Get saturated targets.
     *   For each: Broadcast `HIVE_IGNORE_TARGET` (internal, not a wire message).
     *   Call `clboss_bridge.ignore_peer()` for each.
-- [ ] Implement `release_saturation_limits()`:
+- [x] Implement `release_saturation_limits()`:
     *   If share drops below 15%, call `clboss_bridge.unignore_peer()`.
 
 ### 6.3 Expansion (Capital Allocation)
@@ -499,9 +499,9 @@ CREATE TABLE contribution_ledger (
 3.  `uptime > 99%` (reliable).
 
 **Tasks:**
-- [ ] Implement `get_idle_capital()` -> dict `{peer_id: onchain_sats}`.
-- [ ] Implement `select_opener(target_pubkey)` -> peer_id or None.
-- [ ] Implement `propose_expansion(target_pubkey)`:
+- [x] Implement `get_idle_capital()` -> dict `{peer_id: onchain_sats}`.
+- [x] Implement `select_opener(target_pubkey)` -> peer_id or None.
+- [x] Implement `propose_expansion(target_pubkey)`:
     *   Select opener.
     *   Call `intent_manager.announce_intent('channel_open', target)`.
 
@@ -517,18 +517,18 @@ CREATE TABLE contribution_ledger (
     4.  Propose up to 1 expansion per cycle (rate limit).
 
 **Tasks:**
-- [ ] Add `planner_loop` to background threads.
-- [ ] Implement rate limiting: max 1 `channel_open` intent per hour.
-- [ ] Log all planner decisions to `hive_planner_log` table.
+- [x] Add `planner_loop` to background threads.
+- [x] Implement rate limiting: max 1 `channel_open` intent per hour.
+- [x] Log all planner decisions to `hive_planner_log` table.
 
 ### 6.5 Phase 6 Testing
 **File:** `tests/test_planner.py`
 
 **Tasks:**
-- [ ] **Saturation Test:** Mock Hive with 25% share to target X -> verify `clboss-ignore` called.
-- [ ] **Release Test:** Share drops to 14% -> verify `clboss-unignore` called.
-- [ ] **Expansion Test:** Underserved target + idle node -> verify Intent announced.
-- [ ] **Rate Limit Test:** 2 expansions in 1 hour -> verify second is queued, not executed.
+- [x] **Saturation Test:** Mock Hive with 25% share to target X -> verify `clboss-ignore` called.
+- [x] **Release Test:** Share drops to 14% -> verify `clboss-unignore` called.
+- [x] **Expansion Test:** Underserved target + idle node -> verify Intent announced.
+- [x] **Rate Limit Test:** 2 expansions in 1 hour -> verify second is queued, not executed.
 
 ---
 
