@@ -1253,12 +1253,12 @@ def process_ready_intents():
             
             # Execute the action (callback registry) only when governance allows
             if config.governance_mode != "autonomous":
-            if safe_plugin:
-                safe_plugin.log(
-                    f"cl-hive: Skipping execution for intent {intent_id} "
-                    f"(mode={config.governance_mode})",
-                    level='warn'
-                )
+                if safe_plugin:
+                    safe_plugin.log(
+                        f"cl-hive: Skipping execution for intent {intent_id} "
+                        f"(mode={config.governance_mode})",
+                        level='warn'
+                    )
                 continue
             intent_mgr.execute_committed_intent(intent_row)
 

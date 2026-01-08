@@ -104,7 +104,7 @@ This document outlines the phased implementation plan for `cl-hive`, a distribut
     - `WELCOME` (32775)
     - *Deferred to Phase 2:* `GOSSIP`
     - *Deferred to Phase 3:* `INTENT`
-    - *Deferred to Phase 5:* `VOUCH`, `BAN`, `PROMOTION`
+    - *Deferred to Phase 5:* `VOUCH`, `BAN`, `PROMOTION`, `PROMOTION_REQUEST`
 - [x] Implement `serialize(msg_type, payload) -> bytes` (JSON + Magic Prefix)
 - [x] Implement `deserialize(bytes) -> (msg_type, payload)` with Magic check
 
@@ -290,13 +290,13 @@ To prevent cascading failures if a dependency hangs or crashes.
     *   `RPC_TIMEOUT`: 5 seconds (strict timeout for calls).
 
 **Tasks:**
-- [ ] Implement `CircuitBreaker` class.
-- [ ] Implement `feature_detection()` on startup:
+- [x] Implement `CircuitBreaker` class.
+- [x] Implement `feature_detection()` on startup:
     *   Call `plugin.rpc.plugin("list")`.
     *   Verify `cl-revenue-ops` is `active`.
     *   Verify version >= 1.4.0 via `revenue-status`.
     *   If failed: Set status to `DISABLED`, log warning, skip all future calls.
-- [ ] Implement generic `safe_call(method, payload)` wrapper:
+- [x] Implement generic `safe_call(method, payload)` wrapper:
     *   Checks Circuit Breaker state.
     *   Wraps RPC in try/except.
     *   Updates failure counters on `RpcError` or `Timeout`.
@@ -305,11 +305,11 @@ To prevent cascading failures if a dependency hangs or crashes.
 **File:** `modules/bridge.py`
 
 **Methods:**
-- [ ] `set_hive_policy(peer_id, is_member: bool)`:
+- [x] `set_hive_policy(peer_id, is_member: bool)`:
     *   **Member:** `revenue-policy set <id> strategy=hive rebalance=enabled`.
     *   **Non-Member:** `revenue-policy set <id> strategy=dynamic` (Revert to default).
     *   *Validation:* Check result `{"status": "success"}`.
-- [ ] `trigger_rebalance(target_peer, amount_sats)`:
+- [x] `trigger_rebalance(target_peer, amount_sats)`:
     *   Call: `revenue-rebalance from=auto to=<target> amount=<sats>`.
     *   *Note:* Relies on `cl-revenue-ops` v1.4 "Strategic Exemption" to bypass profitability checks for Hive peers.
 
@@ -319,11 +319,11 @@ To prevent cascading failures if a dependency hangs or crashes.
 **Constraint:** `cl-hive` manages **Topology** (New Channels). `cl-revenue-ops` manages **Fees/Balancing** (Existing Channels).
 
 **Tasks:**
-- [ ] `detect_clboss()`: Check if `clboss` plugin is registered.
-- [ ] `ignore_peer(peer_id)`:
+- [x] `detect_clboss()`: Check if `clboss` plugin is registered.
+- [x] `ignore_peer(peer_id)`:
     *   Call `clboss-ignore <peer_id>`.
     *   *Purpose:* Prevent CLBoss from opening redundant channels to saturated targets.
-- [ ] `unignore_peer(peer_id)`:
+- [x] `unignore_peer(peer_id)`:
     *   Call `clboss-unignore <peer_id>` (if command exists/supported).
     *   *Note:* Do **NOT** call `clboss-manage` or `clboss-unmanage` (fee tags). Leave that to `cl-revenue-ops`.
 
@@ -331,16 +331,22 @@ To prevent cascading failures if a dependency hangs or crashes.
 **File:** `tests/test_bridge.py`
 
 **Tasks:**
-- [ ] **Circuit Breaker Test:** Simulate 3 RPC failures -> Verify 4th call raises immediate "Circuit Open" exception without network IO.
-- [ ] **Recovery Test:** Simulate time passing -> Verify Circuit moves to HALF_OPEN -> Success closes it.
-- [ ] **Version Mismatch:** Mock `revenue-status` returning v1.3.0 -> Verify Bridge disables itself.
-- [ ] **Method Signature:** Verify `set_hive_policy` constructs the exact JSON expected by `revenue-policy`.
+- [x] **Circuit Breaker Test:** Simulate 3 RPC failures -> Verify 4th call raises immediate "Circuit Open" exception without network IO.
+- [x] **Recovery Test:** Simulate time passing -> Verify Circuit moves to HALF_OPEN -> Success closes it.
+- [x] **Version Mismatch:** Mock `revenue-status` returning v1.3.0 -> Verify Bridge disables itself.
+- [x] **Method Signature:** Verify `set_hive_policy` constructs the exact JSON expected by `revenue-policy`.
 
 ---
 
 ## Phase 5: Governance & Membership
 
 **Objective:** Implement the two-tier membership system (Neophyte/Member) and the algorithmic promotion protocol.
+
+**Implemented artifacts:**
+*   New modules: `modules/membership.py`, `modules/contribution.py`
+*   New DB tables: `promotion_vouches`, `promotion_requests`, `peer_presence`, `leech_flags`
+*   New config flags: `membership_enabled`, `auto_vouch_enabled`, `auto_promote_enabled`, `ban_autotrigger_enabled`
+*   New background job: membership maintenance (prune vouches/contributions/presence)
 
 ### 5.1 Membership Tiers
 **File:** `modules/membership.py`
@@ -356,10 +362,10 @@ To prevent cascading failures if a dependency hangs or crashes.
 *   Add `joined_at` timestamp for probation tracking.
 
 **Tasks:**
-- [ ] Implement `MembershipTier` enum.
-- [ ] Implement `get_tier(peer_id)` -> Returns current tier.
-- [ ] Implement `set_tier(peer_id, tier)` -> Updates DB + triggers Bridge policy update.
-- [ ] Implement `is_probation_complete(peer_id)` -> `joined_at + 30 days < now`.
+- [x] Implement `MembershipTier` enum.
+- [x] Implement `get_tier(peer_id)` -> Returns current tier.
+- [x] Implement `set_tier(peer_id, tier)` -> Updates DB + triggers Bridge policy update.
+- [x] Implement `is_probation_complete(peer_id)` -> `joined_at + 30 days < now`.
 
 ### 5.2 The Value-Add Equation (Promotion Criteria)
 **File:** `modules/membership.py`
@@ -375,10 +381,10 @@ To prevent cascading failures if a dependency hangs or crashes.
     *   *Check:* `neophyte_peers - union(all_member_peers) != empty`.
 
 **Tasks:**
-- [ ] Implement `calculate_uptime(peer_id)` -> float (0.0 to 100.0).
-- [ ] Implement `calculate_contribution_ratio(peer_id)` -> float.
-- [ ] Implement `get_unique_peers(peer_id)` -> list of pubkeys.
-- [ ] Implement `evaluate_promotion(peer_id)` -> `{eligible: bool, reasons: []}`.
+- [x] Implement `calculate_uptime(peer_id)` -> float (0.0 to 100.0).
+- [x] Implement `calculate_contribution_ratio(peer_id)` -> float.
+- [x] Implement `get_unique_peers(peer_id)` -> list of pubkeys.
+- [x] Implement `evaluate_promotion(peer_id)` -> `{eligible: bool, reasons: []}`.
 
 ### 5.3 Promotion Protocol (Consensus Vouching)
 **File:** `modules/membership.py`
@@ -396,11 +402,11 @@ To prevent cascading failures if a dependency hangs or crashes.
 *   *Example:* 5 members → need 3 vouches. 10 members → need 6 vouches.
 
 **Tasks:**
-- [ ] Implement `request_promotion()` -> Broadcasts request.
-- [ ] Implement `handle_promotion_request(peer_id)` -> Auto-evaluate and vouch if passed.
-- [ ] Implement `handle_vouch(vouch)` -> Collect and count.
-- [ ] Implement `handle_promotion(proof)` -> Validate vouches, update tier.
-- [ ] Implement `calculate_quorum()` -> int.
+- [x] Implement `request_promotion()` -> Broadcasts request.
+- [x] Implement `handle_promotion_request(peer_id)` -> Auto-evaluate and vouch if passed.
+- [x] Implement `handle_vouch(vouch)` -> Collect and count.
+- [x] Implement `handle_promotion(proof)` -> Validate vouches, update tier.
+- [x] Implement `calculate_quorum()` -> int.
 
 ### 5.4 Contribution Tracking
 **File:** `modules/contribution.py`
@@ -416,30 +422,30 @@ CREATE TABLE contribution_ledger (
     id INTEGER PRIMARY KEY,
     peer_id TEXT NOT NULL,
     direction TEXT NOT NULL,  -- 'forwarded' or 'received'
-    amount_msat INTEGER NOT NULL,
+    amount_sats INTEGER NOT NULL,
     timestamp INTEGER NOT NULL
 );
 ```
 
 **Anti-Leech Throttling:**
 *   If `Ratio < 0.5` for a Member: Signal Bridge to reduce push rebalancing priority.
-*   If `Ratio < 0.3` for 7 consecutive days: Auto-trigger `HIVE_BAN` proposal.
+*   If `Ratio < 0.4` for 7 consecutive days: Auto-trigger `HIVE_BAN` proposal (guarded by config).
 
 **Tasks:**
-- [ ] Register `forward_event` subscription.
-- [ ] Implement `record_forward(in_peer, out_peer, amount)`.
-- [ ] Implement `get_contribution_stats(peer_id)` -> `{forwarded, received, ratio}`.
-- [ ] Implement `check_leech_status(peer_id)` -> `{is_leech: bool, ratio: float}`.
+- [x] Register `forward_event` subscription.
+- [x] Implement `record_forward(in_peer, out_peer, amount)`.
+- [x] Implement `get_contribution_stats(peer_id)` -> `{forwarded, received, ratio}`.
+- [x] Implement `check_leech_status(peer_id)` -> `{is_leech: bool, ratio: float}`.
 
 ### 5.5 Phase 5 Testing
 **File:** `tests/test_membership.py`
 
 **Tasks:**
-- [ ] **Uptime Test:** Simulate 30 days with 99.6% uptime -> eligible. 99.4% -> rejected.
-- [ ] **Ratio Test:** Forward 100k, receive 90k -> ratio 1.11 -> eligible. Forward 80k, receive 100k -> ratio 0.8 -> rejected.
-- [ ] **Uniqueness Test:** Neophyte with peer not in Hive -> unique. All peers overlap -> not unique.
-- [ ] **Quorum Test:** 5 members, 3 vouches -> promoted. 2 vouches -> not promoted.
-- [ ] **Leech Test:** Ratio 0.4 for 7 days -> ban proposal triggered.
+- [x] **Uptime Test:** Simulate 30 days with 99.6% uptime -> eligible. 99.4% -> rejected.
+- [x] **Ratio Test:** Forward 100k, receive 90k -> ratio 1.11 -> eligible. Forward 80k, receive 100k -> ratio 0.8 -> rejected.
+- [x] **Uniqueness Test:** Neophyte with peer not in Hive -> unique. All peers overlap -> not unique.
+- [x] **Quorum Test:** 5 members, 3 vouches -> promoted. 2 vouches -> not promoted.
+- [x] **Leech Test:** Ratio 0.4 for 7 days -> ban proposal triggered.
 
 ---
 
