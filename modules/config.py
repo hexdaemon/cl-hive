@@ -40,6 +40,11 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'heartbeat_interval': int,
     'planner_interval': int,
     'planner_enable_expansions': bool,
+    # Governance (Phase 7)
+    'autonomous_budget_per_day': int,
+    'autonomous_actions_per_hour': int,
+    'oracle_url': str,
+    'oracle_timeout_seconds': int,
 }
 
 # Range constraints for numeric fields
@@ -56,6 +61,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'gossip_threshold_pct': (0.01, 0.5),
     'heartbeat_interval': (60, 3600),
     'planner_interval': (300, 86400),  # Min 5 minutes, max 24 hours
+    # Governance (Phase 7)
+    'autonomous_budget_per_day': (100_000, 100_000_000),  # 100k to 100M sats
+    'autonomous_actions_per_hour': (1, 10),  # 1 to 10 actions per hour
+    'oracle_timeout_seconds': (1, 30),  # 1 to 30 seconds
 }
 
 # Valid governance modes
@@ -106,6 +115,12 @@ class HiveConfig:
     # Planner (Phase 6)
     planner_interval: int = 3600               # 1 hour between planner cycles
     planner_enable_expansions: bool = False    # Disabled by default (safety)
+
+    # Governance (Phase 7)
+    autonomous_budget_per_day: int = 10_000_000  # 10M sats daily budget
+    autonomous_actions_per_hour: int = 2         # Max 2 actions per hour
+    oracle_url: Optional[str] = None             # External oracle API URL
+    oracle_timeout_seconds: int = 5              # Oracle API timeout
 
     # Internal version tracking
     _version: int = field(default=0, repr=False, compare=False)
@@ -167,6 +182,11 @@ class HiveConfigSnapshot:
     heartbeat_interval: int
     planner_interval: int
     planner_enable_expansions: bool
+    # Governance (Phase 7)
+    autonomous_budget_per_day: int
+    autonomous_actions_per_hour: int
+    oracle_url: Optional[str]
+    oracle_timeout_seconds: int
     version: int
     
     @classmethod
@@ -192,5 +212,9 @@ class HiveConfigSnapshot:
             heartbeat_interval=config.heartbeat_interval,
             planner_interval=config.planner_interval,
             planner_enable_expansions=config.planner_enable_expansions,
+            autonomous_budget_per_day=config.autonomous_budget_per_day,
+            autonomous_actions_per_hour=config.autonomous_actions_per_hour,
+            oracle_url=config.oracle_url,
+            oracle_timeout_seconds=config.oracle_timeout_seconds,
             version=config._version,
         )
