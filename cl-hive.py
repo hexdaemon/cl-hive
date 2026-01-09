@@ -1587,6 +1587,167 @@ def hive_planner_log(plugin: Plugin, limit: int = 50):
     }
 
 
+@plugin.method("hive-pending-actions")
+def hive_pending_actions(plugin: Plugin):
+    """
+    Get all pending actions awaiting operator approval.
+
+    Returns:
+        Dict with list of pending actions.
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    actions = database.get_pending_actions()
+    return {
+        "count": len(actions),
+        "actions": actions,
+    }
+
+
+@plugin.method("hive-approve-action")
+def hive_approve_action(plugin: Plugin, action_id: int):
+    """
+    Approve and execute a pending action.
+
+    Args:
+        action_id: ID of the action to approve
+
+    Returns:
+        Dict with approval result.
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Get the action
+    action = database.get_pending_action_by_id(action_id)
+    if not action:
+        return {"error": "Action not found", "action_id": action_id}
+
+    if action['status'] != 'pending':
+        return {"error": f"Action already {action['status']}", "action_id": action_id}
+
+    # Check if expired
+    now = int(time.time())
+    if action.get('expires_at') and now > action['expires_at']:
+        database.update_action_status(action_id, 'expired')
+        return {"error": "Action has expired", "action_id": action_id}
+
+    action_type = action['action_type']
+    payload = action['payload']
+
+    # Execute based on action type
+    if action_type == 'channel_open':
+        # Get the intent and broadcast it
+        intent_id = payload.get('intent_id')
+        if not intent_id:
+            return {"error": "Missing intent_id in action payload", "action_id": action_id}
+
+        # Get intent from database
+        intent_record = database.get_intent_by_id(intent_id)
+        if not intent_record:
+            return {"error": "Intent not found", "intent_id": intent_id}
+
+        # Broadcast the intent to all members
+        if intent_mgr:
+            try:
+                # Create an intent object for broadcasting
+                from modules.intent_manager import Intent
+                intent = Intent(
+                    intent_id=intent_record['id'],
+                    intent_type=intent_record['intent_type'],
+                    target=intent_record['target'],
+                    initiator=intent_record['initiator'],
+                    timestamp=intent_record['timestamp'],
+                    expires_at=intent_record['expires_at'],
+                    status=intent_record['status']
+                )
+
+                # Broadcast to all members
+                intent_payload = intent_mgr.create_intent_message(intent)
+                msg = serialize(HiveMessageType.INTENT, intent_payload)
+                members = database.get_all_members()
+
+                broadcast_count = 0
+                for member in members:
+                    member_id = member.get('peer_id')
+                    if not member_id or member_id == our_pubkey:
+                        continue
+                    try:
+                        safe_plugin.rpc.call("sendcustommsg", {
+                            "node_id": member_id,
+                            "msg": msg.hex()
+                        })
+                        broadcast_count += 1
+                    except Exception:
+                        pass
+
+                plugin.log(f"cl-hive: Approved action {action_id}, broadcast intent to {broadcast_count} peers")
+
+            except Exception as e:
+                return {"error": f"Failed to broadcast intent: {e}", "action_id": action_id}
+
+        # Update action status
+        database.update_action_status(action_id, 'approved')
+
+        return {
+            "status": "approved",
+            "action_id": action_id,
+            "action_type": action_type,
+            "target": payload.get('target'),
+        }
+
+    else:
+        # Unknown action type - just mark as approved
+        database.update_action_status(action_id, 'approved')
+        return {
+            "status": "approved",
+            "action_id": action_id,
+            "action_type": action_type,
+            "note": "Unknown action type, marked as approved only"
+        }
+
+
+@plugin.method("hive-reject-action")
+def hive_reject_action(plugin: Plugin, action_id: int):
+    """
+    Reject a pending action.
+
+    Args:
+        action_id: ID of the action to reject
+
+    Returns:
+        Dict with rejection result.
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Get the action
+    action = database.get_pending_action_by_id(action_id)
+    if not action:
+        return {"error": "Action not found", "action_id": action_id}
+
+    if action['status'] != 'pending':
+        return {"error": f"Action already {action['status']}", "action_id": action_id}
+
+    # Also abort the associated intent if it exists
+    payload = action['payload']
+    intent_id = payload.get('intent_id')
+    if intent_id:
+        database.update_intent_status(intent_id, 'aborted')
+
+    # Update action status
+    database.update_action_status(action_id, 'rejected')
+
+    plugin.log(f"cl-hive: Rejected action {action_id}")
+
+    return {
+        "status": "rejected",
+        "action_id": action_id,
+        "action_type": action['action_type'],
+    }
+
+
 @plugin.method("hive-request-promotion")
 def hive_request_promotion(plugin: Plugin):
     """

@@ -837,12 +837,24 @@ class Planner:
                 self._broadcast_intent(intent)
                 decisions[-1]['broadcast'] = True
             else:
-                # In advisor mode, just queue the intent (already in DB)
+                # In advisor mode, queue to pending_actions for manual approval
+                action_id = self.db.add_pending_action(
+                    action_type='channel_open',
+                    payload={
+                        'intent_id': intent.intent_id,
+                        'target': selected_target.target,
+                        'public_capacity_sats': selected_target.public_capacity_sats,
+                        'hive_share_pct': round(selected_target.hive_share_pct, 4),
+                        'onchain_balance': onchain_balance,
+                    },
+                    expires_hours=24
+                )
                 self._log(
-                    f"Intent queued (mode={cfg.governance_mode}), not broadcasting",
-                    level='debug'
+                    f"Action queued for approval (id={action_id}, mode={cfg.governance_mode})",
+                    level='info'
                 )
                 decisions[-1]['broadcast'] = False
+                decisions[-1]['pending_action_id'] = action_id
 
         except Exception as e:
             self._log(f"Failed to create expansion intent: {e}", level='warn')

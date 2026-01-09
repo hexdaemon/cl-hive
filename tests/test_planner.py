@@ -712,7 +712,7 @@ class TestExpansionLogic:
         mock_intent_mgr.create_intent.assert_not_called()
 
     def test_expansion_advisor_mode_no_broadcast(self, planner, mock_config, mock_plugin, mock_database):
-        """In advisor mode, intent should be queued but not broadcast."""
+        """In advisor mode, intent should be queued to pending_actions but not broadcast."""
         mock_config.planner_enable_expansions = True
         mock_config.governance_mode = 'advisor'
 
@@ -729,6 +729,9 @@ class TestExpansionLogic:
         mock_plugin.rpc.listfunds.return_value = {
             'outputs': [{'status': 'confirmed', 'amount_msat': 500000000}]
         }
+
+        # Mock add_pending_action to return an action ID
+        mock_database.add_pending_action.return_value = 99
 
         from modules.planner import UnderservedResult
         with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
@@ -747,6 +750,14 @@ class TestExpansionLogic:
 
         assert len(decisions) == 1
         assert decisions[0]['broadcast'] is False
+        assert decisions[0]['pending_action_id'] == 99
+
+        # Verify add_pending_action was called with correct args
+        mock_database.add_pending_action.assert_called_once()
+        call_args = mock_database.add_pending_action.call_args
+        assert call_args[1]['action_type'] == 'channel_open'
+        assert call_args[1]['payload']['intent_id'] == 456
+        assert call_args[1]['payload']['target'] == target
 
 
 class TestUnderservedTargets:

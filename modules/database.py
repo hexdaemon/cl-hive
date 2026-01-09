@@ -419,25 +419,43 @@ class HiveDatabase:
     def get_pending_intents_ready(self, hold_seconds: int) -> List[Dict]:
         """
         Get pending intents where hold period has elapsed.
-        
+
         Args:
             hold_seconds: The hold period that must have passed
-            
+
         Returns:
             List of intent rows ready to commit
         """
         conn = self._get_connection()
         now = int(time.time())
         cutoff = now - hold_seconds
-        
+
         rows = conn.execute("""
-            SELECT * FROM intent_locks 
+            SELECT * FROM intent_locks
             WHERE status = 'pending' AND timestamp <= ? AND expires_at > ?
             ORDER BY timestamp
         """, (cutoff, now)).fetchall()
-        
+
         return [dict(row) for row in rows]
-    
+
+    def get_pending_intents(self) -> List[Dict]:
+        """
+        Get all active pending intents.
+
+        Returns:
+            List of pending intent rows that haven't expired
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        rows = conn.execute("""
+            SELECT * FROM intent_locks
+            WHERE status = 'pending' AND expires_at > ?
+            ORDER BY timestamp
+        """, (now,)).fetchall()
+
+        return [dict(row) for row in rows]
+
     def get_intent_by_id(self, intent_id: int) -> Optional[Dict]:
         """Get a specific intent by ID."""
         conn = self._get_connection()
@@ -904,6 +922,21 @@ class HiveDatabase:
             results.append(result)
         return results
     
+    def get_pending_action_by_id(self, action_id: int) -> Optional[Dict]:
+        """Get a specific pending action by ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM pending_actions WHERE id = ?",
+            (action_id,)
+        ).fetchone()
+
+        if not row:
+            return None
+
+        result = dict(row)
+        result['payload'] = json.loads(result['payload'])
+        return result
+
     def update_action_status(self, action_id: int, status: str) -> bool:
         """Update action status: 'pending', 'approved', 'rejected', 'expired'."""
         conn = self._get_connection()
