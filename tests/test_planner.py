@@ -760,6 +760,124 @@ class TestExpansionLogic:
         assert call_args[1]['payload']['target'] == target
 
 
+class TestPlannerGovernanceIntegration:
+    """Test Planner-Governance integration (Issue #14)."""
+
+    def test_expansion_with_decision_engine_autonomous(self, mock_config, mock_plugin, mock_database, mock_state_manager, mock_clboss_bridge):
+        """Planner should use DecisionEngine for governance in autonomous mode."""
+        from modules.governance import DecisionEngine, DecisionResult
+
+        mock_config.planner_enable_expansions = True
+        mock_config.governance_mode = 'autonomous'
+
+        # Create mock decision engine
+        mock_decision_engine = MagicMock(spec=DecisionEngine)
+        mock_response = MagicMock()
+        mock_response.result = DecisionResult.APPROVED
+        mock_response.action_id = None
+        mock_response.reason = "Within limits"
+        mock_decision_engine.propose_action.return_value = mock_response
+
+        # Create planner with decision engine
+        planner = Planner(
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=MagicMock(),
+            clboss_bridge=mock_clboss_bridge,
+            plugin=mock_plugin,
+            intent_manager=MagicMock(),
+            decision_engine=mock_decision_engine
+        )
+
+        target = '02' + 'g' * 64
+
+        # Setup mocks
+        mock_intent = MagicMock()
+        mock_intent.intent_id = 789
+        planner.intent_manager.create_intent.return_value = mock_intent
+
+        mock_plugin.rpc.listfunds.return_value = {
+            'outputs': [{'status': 'confirmed', 'amount_msat': 500000000}]
+        }
+
+        from modules.planner import UnderservedResult
+        with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
+            mock_get_underserved.return_value = [
+                UnderservedResult(
+                    target=target,
+                    public_capacity_sats=200_000_000,
+                    hive_share_pct=0.02,
+                    score=2.0
+                )
+            ]
+            mock_database.get_pending_intents.return_value = []
+
+            decisions = planner._propose_expansion(mock_config, 'test-gov-integration')
+
+        assert len(decisions) == 1
+        assert decisions[0]['broadcast'] is True
+        assert decisions[0]['governance_result'] == 'approved'
+
+        # Verify DecisionEngine was called
+        mock_decision_engine.propose_action.assert_called_once()
+
+    def test_expansion_with_decision_engine_queued(self, mock_config, mock_plugin, mock_database, mock_state_manager, mock_clboss_bridge):
+        """Planner should handle QUEUED result from DecisionEngine."""
+        from modules.governance import DecisionEngine, DecisionResult
+
+        mock_config.planner_enable_expansions = True
+        mock_config.governance_mode = 'advisor'
+
+        # Create mock decision engine that returns QUEUED
+        mock_decision_engine = MagicMock(spec=DecisionEngine)
+        mock_response = MagicMock()
+        mock_response.result = DecisionResult.QUEUED
+        mock_response.action_id = 42
+        mock_response.reason = "Queued for approval"
+        mock_decision_engine.propose_action.return_value = mock_response
+
+        # Create planner with decision engine
+        planner = Planner(
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=MagicMock(),
+            clboss_bridge=mock_clboss_bridge,
+            plugin=mock_plugin,
+            intent_manager=MagicMock(),
+            decision_engine=mock_decision_engine
+        )
+
+        target = '02' + 'h' * 64
+
+        # Setup mocks
+        mock_intent = MagicMock()
+        mock_intent.intent_id = 999
+        planner.intent_manager.create_intent.return_value = mock_intent
+
+        mock_plugin.rpc.listfunds.return_value = {
+            'outputs': [{'status': 'confirmed', 'amount_msat': 500000000}]
+        }
+
+        from modules.planner import UnderservedResult
+        with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
+            mock_get_underserved.return_value = [
+                UnderservedResult(
+                    target=target,
+                    public_capacity_sats=200_000_000,
+                    hive_share_pct=0.03,
+                    score=1.9
+                )
+            ]
+            mock_database.get_pending_intents.return_value = []
+
+            decisions = planner._propose_expansion(mock_config, 'test-gov-queued')
+
+        assert len(decisions) == 1
+        assert decisions[0]['broadcast'] is False
+        assert decisions[0]['governance_result'] == 'queued'
+        assert decisions[0]['pending_action_id'] == 42
+
+
 class TestUnderservedTargets:
     """Test underserved target identification."""
 

@@ -123,7 +123,7 @@ class Planner:
     """
 
     def __init__(self, state_manager, database, bridge, clboss_bridge, plugin=None,
-                 intent_manager=None):
+                 intent_manager=None, decision_engine=None):
         """
         Initialize the Planner.
 
@@ -134,6 +134,7 @@ class Planner:
             clboss_bridge: CLBossBridge for ignore/unignore operations
             plugin: Plugin reference for RPC and logging
             intent_manager: IntentManager for coordinated channel opens
+            decision_engine: DecisionEngine for governance decisions (Phase 7)
         """
         self.state_manager = state_manager
         self.db = database
@@ -141,6 +142,7 @@ class Planner:
         self.clboss = clboss_bridge
         self.plugin = plugin
         self.intent_manager = intent_manager
+        self.decision_engine = decision_engine
 
         # Network cache (refreshed each cycle)
         self._network_cache: Dict[str, List[ChannelInfo]] = {}
@@ -832,29 +834,71 @@ class Planner:
                 'hive_share_pct': selected_target.hive_share_pct
             })
 
-            # Broadcast intent only in autonomous mode
-            if cfg.governance_mode == 'autonomous':
-                self._broadcast_intent(intent)
-                decisions[-1]['broadcast'] = True
-            else:
-                # In advisor mode, queue to pending_actions for manual approval
-                action_id = self.db.add_pending_action(
+            # Use DecisionEngine for governance decision if available
+            if self.decision_engine:
+                # Build context for governance decision
+                context = {
+                    'intent_id': intent.intent_id,
+                    'public_capacity_sats': selected_target.public_capacity_sats,
+                    'hive_share_pct': round(selected_target.hive_share_pct, 4),
+                    'onchain_balance': onchain_balance,
+                    'amount_sats': MIN_CHANNEL_SIZE_SATS,  # For budget tracking
+                }
+
+                # Define executor for channel_open (broadcasts intent)
+                def channel_open_executor(target, ctx):
+                    self._broadcast_intent(intent)
+
+                self.decision_engine.register_executor('channel_open', channel_open_executor)
+
+                # Propose action through governance
+                gov_response = self.decision_engine.propose_action(
                     action_type='channel_open',
-                    payload={
-                        'intent_id': intent.intent_id,
-                        'target': selected_target.target,
-                        'public_capacity_sats': selected_target.public_capacity_sats,
-                        'hive_share_pct': round(selected_target.hive_share_pct, 4),
-                        'onchain_balance': onchain_balance,
-                    },
-                    expires_hours=24
+                    target=selected_target.target,
+                    context=context,
+                    cfg=cfg
                 )
-                self._log(
-                    f"Action queued for approval (id={action_id}, mode={cfg.governance_mode})",
-                    level='info'
-                )
-                decisions[-1]['broadcast'] = False
-                decisions[-1]['pending_action_id'] = action_id
+
+                # Record governance decision in decisions list
+                from modules.governance import DecisionResult
+                if gov_response.result == DecisionResult.APPROVED:
+                    decisions[-1]['broadcast'] = True
+                    decisions[-1]['governance_result'] = 'approved'
+                elif gov_response.result == DecisionResult.QUEUED:
+                    decisions[-1]['broadcast'] = False
+                    decisions[-1]['pending_action_id'] = gov_response.action_id
+                    decisions[-1]['governance_result'] = 'queued'
+                elif gov_response.result == DecisionResult.DENIED:
+                    decisions[-1]['broadcast'] = False
+                    decisions[-1]['governance_result'] = 'denied'
+                    decisions[-1]['governance_reason'] = gov_response.reason
+                else:
+                    decisions[-1]['broadcast'] = False
+                    decisions[-1]['governance_result'] = 'error'
+            else:
+                # Fallback: Manual governance handling (backwards compatibility)
+                if cfg.governance_mode == 'autonomous':
+                    self._broadcast_intent(intent)
+                    decisions[-1]['broadcast'] = True
+                else:
+                    # In advisor/oracle mode, queue to pending_actions for manual approval
+                    action_id = self.db.add_pending_action(
+                        action_type='channel_open',
+                        payload={
+                            'intent_id': intent.intent_id,
+                            'target': selected_target.target,
+                            'public_capacity_sats': selected_target.public_capacity_sats,
+                            'hive_share_pct': round(selected_target.hive_share_pct, 4),
+                            'onchain_balance': onchain_balance,
+                        },
+                        expires_hours=24
+                    )
+                    self._log(
+                        f"Action queued for approval (id={action_id}, mode={cfg.governance_mode})",
+                        level='info'
+                    )
+                    decisions[-1]['broadcast'] = False
+                    decisions[-1]['pending_action_id'] = action_id
 
         except Exception as e:
             self._log(f"Failed to create expansion intent: {e}", level='warn')

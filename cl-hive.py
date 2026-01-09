@@ -59,6 +59,7 @@ from modules.contribution import ContributionManager
 from modules.membership import MembershipManager, MembershipTier
 from modules.planner import Planner
 from modules.clboss_bridge import CLBossBridge
+from modules.governance import DecisionEngine
 
 # Initialize the plugin
 plugin = Plugin()
@@ -181,6 +182,7 @@ membership_mgr: Optional[MembershipManager] = None
 contribution_mgr: Optional[ContributionManager] = None
 planner: Optional[Planner] = None
 clboss_bridge: Optional[CLBossBridge] = None
+decision_engine: Optional[DecisionEngine] = None
 our_pubkey: Optional[str] = None
 
 
@@ -436,6 +438,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     membership_thread.start()
     plugin.log("cl-hive: Membership maintenance thread started")
 
+    # Initialize DecisionEngine (Phase 7)
+    global decision_engine
+    decision_engine = DecisionEngine(database=database, plugin=safe_plugin)
+    plugin.log("cl-hive: DecisionEngine initialized")
+
     # Initialize Planner (Phase 6)
     global planner, clboss_bridge
     clboss_bridge = CLBossBridge(safe_plugin.rpc, safe_plugin)
@@ -445,7 +452,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         bridge=bridge,
         clboss_bridge=clboss_bridge,
         plugin=safe_plugin,
-        intent_manager=intent_mgr
+        intent_manager=intent_mgr,
+        decision_engine=decision_engine
     )
     plugin.log("cl-hive: Planner initialized")
 
