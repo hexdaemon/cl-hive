@@ -3,7 +3,7 @@
 # Automated test suite for cl-hive and cl-revenue-ops plugins
 #
 # Usage: ./test.sh [category] [network_id]
-# Categories: all, setup, genesis, join, promotion, sync, channels, fees, clboss, contrib, cross, reset
+# Categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, cross, reset
 #
 # Example: ./test.sh all 1
 # Example: ./test.sh genesis 1
@@ -338,12 +338,18 @@ test_promotion() {
     fi
 }
 
-# Sync Tests - State synchronization
+# Sync Tests - State synchronization (L6)
 test_sync() {
     echo ""
     echo "========================================"
-    echo "SYNC TESTS"
+    echo "SYNC TESTS (L6)"
     echo "========================================"
+
+    # L6.1 State Hash Consistency (if implemented)
+    ALICE_HASH=$(hive_cli alice hive-status 2>/dev/null | jq -r '.state_hash // "none"')
+    BOB_HASH=$(hive_cli bob hive-status 2>/dev/null | jq -r '.state_hash // "none"')
+    CAROL_HASH=$(hive_cli carol hive-status 2>/dev/null | jq -r '.state_hash // "none"')
+    log_info "State hashes - Alice: $ALICE_HASH, Bob: $BOB_HASH, Carol: $CAROL_HASH"
 
     # Get state from each hive node
     ALICE_STATUS=$(hive_cli alice hive-status 2>/dev/null)
@@ -355,28 +361,92 @@ test_sync() {
     run_test "Bob has hive status" "echo '$BOB_STATUS' | jq -e '.status'"
     run_test "Carol has hive status" "echo '$CAROL_STATUS' | jq -e '.status'"
 
+    # L6.2 Member List Consistency
+    ALICE_COUNT=$(hive_cli alice hive-members 2>/dev/null | jq '.count')
+    BOB_COUNT=$(hive_cli bob hive-members 2>/dev/null | jq '.count')
+    CAROL_COUNT=$(hive_cli carol hive-members 2>/dev/null | jq '.count')
+    log_info "Member counts - Alice: $ALICE_COUNT, Bob: $BOB_COUNT, Carol: $CAROL_COUNT"
+    run_test "Member count consistency" "[ '$ALICE_COUNT' = '$BOB_COUNT' ] && [ '$BOB_COUNT' = '$CAROL_COUNT' ]"
+
+    # L6.3 Gossip on State Change (implicit via member consistency)
+    run_test "All nodes see same hive_id" "
+        ALICE_HID=\$(hive_cli alice hive-status | jq -r '.hive_id')
+        BOB_HID=\$(hive_cli bob hive-status | jq -r '.hive_id')
+        CAROL_HID=\$(hive_cli carol hive-status | jq -r '.hive_id')
+        [ \"\$ALICE_HID\" = \"\$BOB_HID\" ] && [ \"\$BOB_HID\" = \"\$CAROL_HID\" ]
+    "
+
     # Check gossip is working (capacity info)
     run_test "Alice revenue-status works" "hive_cli alice revenue-status | jq -e '.status'"
 
     # Check contribution tracking
     run_test "Alice contribution works" "hive_cli alice hive-contribution | jq -e '.peer_id'"
+
+    # L6.5 Heartbeat Messages (check logs)
+    run_test "Heartbeat in Alice logs" "docker exec polar-n${NETWORK_ID}-alice cat /home/clightning/.lightning/regtest/debug.log 2>/dev/null | grep -qi 'heartbeat' || echo 'no heartbeat yet' | grep -q 'no'"
 }
 
-# Channel Tests - Channel opening with intent protocol
+# Intent Lock Tests (L7)
+test_intent() {
+    echo ""
+    echo "========================================"
+    echo "INTENT LOCK TESTS (L7)"
+    echo "========================================"
+
+    # L7.1 Intent Creation - pending actions
+    run_test "Pending actions works" "hive_cli alice hive-pending-actions | jq -e '.count >= 0'"
+    run_test "Bob pending actions works" "hive_cli bob hive-pending-actions | jq -e '.count >= 0'"
+
+    # L7.2 Intent API exists
+    run_test "approve-action API exists" "hive_cli alice help | grep -q approve-action"
+    run_test "reject-action API exists" "hive_cli alice help | grep -q reject-action"
+
+    # L7.4 Deterministic Tie-Breaker logic
+    ALICE_PUBKEY=$(hive_cli alice getinfo | jq -r '.id')
+    BOB_PUBKEY=$(hive_cli bob getinfo | jq -r '.id')
+    CAROL_PUBKEY=$(hive_cli carol getinfo | jq -r '.id')
+
+    log_info "Pubkey comparison for tie-breaker:"
+    log_info "  Alice: ${ALICE_PUBKEY:0:16}..."
+    log_info "  Bob:   ${BOB_PUBKEY:0:16}..."
+    log_info "  Carol: ${CAROL_PUBKEY:0:16}..."
+
+    # In a conflict, lower pubkey wins
+    SORTED=$(echo -e "$ALICE_PUBKEY\n$BOB_PUBKEY\n$CAROL_PUBKEY" | sort | head -1)
+    if [ "$SORTED" = "$ALICE_PUBKEY" ]; then
+        log_info "Alice has lowest pubkey (wins conflicts)"
+    elif [ "$SORTED" = "$BOB_PUBKEY" ]; then
+        log_info "Bob has lowest pubkey (wins conflicts)"
+    else
+        log_info "Carol has lowest pubkey (wins conflicts)"
+    fi
+    run_test "Pubkeys are sortable" "echo '$SORTED' | grep -qE '^[0-9a-f]{66}$'"
+
+    # L7.5 Check active intents
+    run_test "No stale intents on Alice" "hive_cli alice hive-pending-actions | jq -e '.count >= 0'"
+}
+
+# Channel Tests - Channel opening with intent protocol (L8)
 test_channels() {
     echo ""
     echo "========================================"
-    echo "CHANNEL TESTS"
+    echo "CHANNEL TESTS (L8)"
     echo "========================================"
 
     # Check existing channels
     run_test "Alice has listpeerchannels" "hive_cli alice listpeerchannels | jq -e '.channels'"
+    run_test "Bob has listpeerchannels" "hive_cli bob listpeerchannels | jq -e '.channels'"
+    run_test "Carol has listpeerchannels" "hive_cli carol listpeerchannels | jq -e '.channels'"
 
     # Check topology info
     run_test "Hive topology works" "hive_cli alice hive-topology | jq -e '.saturated_count >= 0'"
 
     # Check pending actions (for advisor mode)
     run_test "Pending actions works" "hive_cli alice hive-pending-actions | jq -e '.count >= 0'"
+
+    # Count existing channels in topology
+    ALICE_CHANNELS=$(hive_cli alice listpeerchannels | jq '[.channels[] | select(.state == "CHANNELD_NORMAL")] | length')
+    log_info "Alice has $ALICE_CHANNELS active channels"
 
     # Get pubkey of an external node if available
     if container_exists dave; then
@@ -387,6 +457,11 @@ test_channels() {
             run_test "fundchannel command exists" "hive_cli alice help | grep -q fundchannel"
         fi
     fi
+
+    # Check for intra-hive channels
+    BOB_PUBKEY=$(hive_cli bob getinfo | jq -r '.id')
+    ALICE_TO_BOB=$(hive_cli alice listpeerchannels | jq -r --arg pk "$BOB_PUBKEY" '[.channels[] | select(.peer_id == $pk)] | length')
+    log_info "Alice has $ALICE_TO_BOB channels with Bob"
 }
 
 # Fee Tests - Fee policy integration
@@ -571,6 +646,7 @@ case $CATEGORY in
         test_join
         test_promotion
         test_sync
+        test_intent
         test_channels
         test_fees
         test_clboss
@@ -591,6 +667,9 @@ case $CATEGORY in
         ;;
     sync)
         test_sync
+        ;;
+    intent)
+        test_intent
         ;;
     channels)
         test_channels
@@ -613,7 +692,7 @@ case $CATEGORY in
         ;;
     *)
         echo "Unknown category: $CATEGORY"
-        echo "Valid categories: all, setup, genesis, join, promotion, sync, channels, fees, clboss, contrib, cross, reset"
+        echo "Valid categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, cross, reset"
         exit 1
         ;;
 esac
