@@ -787,15 +787,15 @@ hive_cli alice plugin start /home/clightning/.lightning/plugins/clboss
 | L3 | Tested | `join` |
 | L4 | Tested | `fees` |
 | L5 | Tested | `promotion` |
-| L6 | Partial | `sync` |
-| L7 | Not Tested | - |
-| L8 | Not Tested | `channels` |
-| L9 | Partial | `contrib` |
-| L10 | Not Tested | - |
-| L11 | Partial | - |
-| L12 | Not Tested | - |
-| L13 | Not Tested | `cross` |
-| L14 | Not Tested | - |
+| L6 | Tested | `sync` |
+| L7 | Tested | `intent` |
+| L8 | Tested | `channels` |
+| L9 | Tested | `contrib` |
+| L10 | Tested | `governance` |
+| L11 | Tested | `planner` |
+| L12 | Tested | `security` |
+| L13 | Partial | `cross` (LND TLS config issue) |
+| L14 | Tested | `recovery` |
 
 ---
 
@@ -805,17 +805,24 @@ hive_cli alice plugin start /home/clightning/.lightning/plugins/clboss
 ```bash
 cd /home/sat/cl-hive/docs/testing
 
-# Run all implemented tests
+# Run all implemented tests (115 tests)
 ./test.sh all 1
 
 # Run specific category
-./test.sh setup 1
-./test.sh genesis 1
-./test.sh join 1
-./test.sh promotion 1
-./test.sh fees 1
-./test.sh sync 1
-./test.sh contrib 1
+./test.sh setup 1       # L0-L1: Environment setup
+./test.sh genesis 1     # L2: Genesis creation
+./test.sh join 1        # L3: Join protocol
+./test.sh promotion 1   # L5: Member promotion
+./test.sh fees 1        # L4: Fee policy integration
+./test.sh sync 1        # L6: State synchronization
+./test.sh intent 1      # L7: Intent lock protocol
+./test.sh channels 1    # L8: Channel operations
+./test.sh contrib 1     # L9: Contribution tracking
+./test.sh governance 1  # L10: Governance modes
+./test.sh planner 1     # L11: Planner & topology
+./test.sh security 1    # L12: Security & bans
+./test.sh cross 1       # L13: Cross-implementation
+./test.sh recovery 1    # L14: Failure recovery
 
 # Reset and start fresh
 ./test.sh reset 1
