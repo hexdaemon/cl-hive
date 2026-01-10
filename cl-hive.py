@@ -378,7 +378,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     5. Verify cl-revenue-ops dependency
     6. Set up signal handlers for graceful shutdown
     """
-    global database, config, safe_plugin, handshake_mgr
+    global database, config, safe_plugin, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge
     
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
     
@@ -431,7 +431,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize intent manager (Phase 3)
     # Get our pubkey for tie-breaker logic
-    global our_pubkey
     our_pubkey = safe_plugin.rpc.getinfo()['id']
     intent_mgr = IntentManager(
         database,
@@ -452,7 +451,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize Integration Bridge (Phase 4)
     # Uses Circuit Breaker pattern for resilient cl-revenue-ops integration
-    global bridge
     bridge = Bridge(safe_plugin.rpc, safe_plugin)
     bridge_status = bridge.initialize()
     
@@ -522,6 +520,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Sync fee policies for existing members (Phase 4 integration)
     if bridge and bridge.status == BridgeStatus.ENABLED:
         _sync_member_policies(plugin)
+
+    # Broadcast membership to peers for consistency (Phase 5 enhancement)
+    _sync_membership_on_startup(plugin)
 
     # Set up graceful shutdown handler
     def handle_shutdown_signal(signum, frame):
@@ -817,7 +818,7 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     
     # Send WELCOME
     welcome_msg = create_welcome(hive_id, 'neophyte', len(members), state_hash)
-    
+
     try:
         safe_plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
@@ -826,7 +827,10 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new neophyte)")
     except Exception as e:
         plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
-    
+
+    # Broadcast membership update to all existing members
+    _broadcast_full_sync_to_members(plugin)
+
     return {"result": "continue"}
 
 
@@ -915,22 +919,23 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle HIVE_STATE_HASH message (anti-entropy check).
-    
+
     Compare remote hash against our local state. If mismatch,
-    send a FULL_SYNC with our complete state.
+    send a FULL_SYNC with our complete state including membership.
     """
     if not gossip_mgr or not state_manager:
         return {"result": "continue"}
-    
+
     hashes_match = gossip_mgr.process_state_hash(peer_id, payload)
-    
+
     if not hashes_match:
-        # State divergence detected - send FULL_SYNC
+        # State divergence detected - send FULL_SYNC with membership
         plugin.log(f"cl-hive: State divergence with {peer_id[:16]}..., sending FULL_SYNC")
-        
+
         full_sync_payload = gossip_mgr.create_full_sync_payload()
+        full_sync_payload["members"] = _create_membership_payload()
         full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
-        
+
         try:
             safe_plugin.rpc.call("sendcustommsg", {
                 "node_id": peer_id,
@@ -938,7 +943,7 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             })
         except Exception as e:
             plugin.log(f"cl-hive: Failed to send FULL_SYNC: {e}", level='warn')
-    
+
     return {"result": "continue"}
 
 
@@ -966,9 +971,127 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             return {"result": "continue"}
 
     updated = gossip_mgr.process_full_sync(peer_id, payload)
-    plugin.log(f"cl-hive: FULL_SYNC from {peer_id[:16]}...: {updated} states updated")
+
+    # Process membership list if included (Phase 5 enhancement)
+    members_synced = 0
+    if database and "members" in payload:
+        members_synced = _apply_membership_sync(payload["members"], peer_id, plugin)
+
+    plugin.log(f"cl-hive: FULL_SYNC from {peer_id[:16]}...: {updated} states, {members_synced} members synced")
 
     return {"result": "continue"}
+
+
+def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -> int:
+    """
+    Apply membership list from FULL_SYNC payload.
+
+    Only adds members we don't already know about. Does not demote
+    or remove members (membership changes require proper protocol).
+
+    Args:
+        members_list: List of member dicts with peer_id, tier, joined_at
+        sender_id: ID of the peer who sent this sync
+        plugin: Plugin for logging
+
+    Returns:
+        Number of new members added
+    """
+    if not database or not isinstance(members_list, list):
+        return 0
+
+    added = 0
+    for member_info in members_list:
+        if not isinstance(member_info, dict):
+            continue
+
+        member_peer_id = member_info.get("peer_id")
+        if not member_peer_id or not isinstance(member_peer_id, str):
+            continue
+
+        # Check if we already know this member
+        existing = database.get_member(member_peer_id)
+        if existing:
+            continue  # Already have this member
+
+        tier = member_info.get("tier", "neophyte")
+        joined_at = member_info.get("joined_at", int(time.time()))
+
+        # Validate tier value
+        if tier not in ("admin", "member", "neophyte"):
+            tier = "neophyte"
+
+        try:
+            database.add_member(
+                peer_id=member_peer_id,
+                tier=tier,
+                joined_at=joined_at
+            )
+            added += 1
+            plugin.log(f"cl-hive: Added member {member_peer_id[:16]}... ({tier}) from sync")
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to add synced member: {e}", level='warn')
+
+    return added
+
+
+def _create_membership_payload() -> list:
+    """
+    Create membership list for inclusion in FULL_SYNC.
+
+    Returns:
+        List of member dicts with peer_id, tier, joined_at
+    """
+    if not database:
+        return []
+
+    members = database.get_all_members()
+    return [
+        {
+            "peer_id": m["peer_id"],
+            "tier": m.get("tier", "neophyte"),
+            "joined_at": m.get("joined_at", 0)
+        }
+        for m in members
+    ]
+
+
+def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
+    """
+    Broadcast FULL_SYNC with membership to all existing members.
+
+    Called after adding a new member to ensure all nodes sync.
+    """
+    if not database or not gossip_mgr or not safe_plugin:
+        plugin.log(f"cl-hive: _broadcast_full_sync_to_members: missing deps - db={database is not None}, gossip={gossip_mgr is not None}, plugin={safe_plugin is not None}", level='debug')
+        return
+
+    members = database.get_all_members()
+    plugin.log(f"cl-hive: Broadcasting membership to {len(members)} known members")
+
+    # Create FULL_SYNC payload with membership
+    full_sync_payload = gossip_mgr.create_full_sync_payload()
+    full_sync_payload["members"] = _create_membership_payload()
+
+    full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+
+    sent_count = 0
+    for member in members:
+        member_id = member["peer_id"]
+        if member_id == our_pubkey:
+            continue
+
+        try:
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": member_id,
+                "msg": full_sync_msg.hex()
+            })
+            sent_count += 1
+            plugin.log(f"cl-hive: Sent FULL_SYNC to {member_id[:16]}...", level='debug')
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to send FULL_SYNC to {member_id[:16]}...: {e}", level='info')
+
+    plugin.log(f"cl-hive: Membership broadcast complete: {sent_count} messages sent")
 
 
 # =============================================================================
@@ -1233,6 +1356,44 @@ def _sync_member_policies(plugin: Plugin) -> None:
 
     if synced > 0:
         plugin.log(f"cl-hive: Synced fee policies for {synced} member(s)")
+
+
+def _sync_membership_on_startup(plugin: Plugin) -> None:
+    """
+    Broadcast membership list to all known peers on startup.
+
+    This ensures all nodes converge to the same membership state
+    when the plugin restarts.
+    """
+    if not database or not gossip_mgr or not safe_plugin:
+        return
+
+    members = database.get_all_members()
+    if len(members) <= 1:
+        return  # Just us, nothing to sync
+
+    # Create FULL_SYNC with membership
+    full_sync_payload = gossip_mgr.create_full_sync_payload()
+    full_sync_payload["members"] = _create_membership_payload()
+    full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+
+    sent_count = 0
+    for member in members:
+        member_id = member["peer_id"]
+        if member_id == our_pubkey:
+            continue
+
+        try:
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": member_id,
+                "msg": full_sync_msg.hex()
+            })
+            sent_count += 1
+        except Exception as e:
+            plugin.log(f"cl-hive: Startup sync to {member_id[:16]}...: {e}", level='debug')
+
+    if sent_count > 0:
+        plugin.log(f"cl-hive: Broadcast membership to {sent_count} peer(s) on startup")
 
 
 def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
