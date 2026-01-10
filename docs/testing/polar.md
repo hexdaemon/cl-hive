@@ -4,21 +4,85 @@ This guide covers installing and testing cl-revenue-ops, cl-hive, and their depe
 
 ## Prerequisites
 
-- Polar installed with 3 CLN nodes (v25.12 recommended)
+- Polar installed ([lightningpolar.com](https://lightningpolar.com))
 - Docker running
 - Plugin repositories cloned locally
+
+---
+
+## Network Setup
+
+Create the following 9 nodes in Polar before running the install script:
+
+### Required Nodes
+
+| Node Name | Implementation | Version | Purpose | Plugins |
+|-----------|---------------|---------|---------|---------|
+| alice | Core Lightning | v25.12 | Hive Admin | clboss, cl-revenue-ops, cl-hive |
+| bob | Core Lightning | v25.12 | Hive Member | clboss, cl-revenue-ops, cl-hive |
+| carol | Core Lightning | v25.12 | Hive Member | clboss, cl-revenue-ops, cl-hive |
+| dave | Core Lightning | v25.12 | External CLN | none (vanilla) |
+| erin | Core Lightning | v25.12 | External CLN | none (vanilla) |
+| lnd1 | LND | latest | External LND | none |
+| lnd2 | LND | latest | External LND | none |
+| eclair1 | Eclair | latest | External Eclair | none |
+| eclair2 | Eclair | latest | External Eclair | none |
+
+### Channel Topology
+
+Create channels in Polar to match this topology:
+
+```
+                    HIVE FLEET                          EXTERNAL NODES
+┌─────────────────────────────────────────┐    ┌─────────────────────────────┐
+│                                         │    │                             │
+│   alice ──────── bob ──────── carol     │    │   dave ──────── erin        │
+│     │             │             │       │    │     │                       │
+└─────┼─────────────┼─────────────┼───────┘    └─────┼───────────────────────┘
+      │             │             │                  │
+      │             │             │                  │
+      ▼             ▼             ▼                  ▼
+   ┌──────┐     ┌──────┐     ┌──────┐          ┌──────────┐
+   │ lnd1 │     │ lnd2 │     │ dave │          │ eclair1  │
+   └──┬───┘     └──┬───┘     └──────┘          └────┬─────┘
+      │            │                                │
+      ▼            ▼                                ▼
+   ┌──────────┐ ┌──────────┐                  ┌──────────┐
+   │ eclair1  │ │ eclair2  │                  │ eclair2  │
+   └──────────┘ └──────────┘                  └──────────┘
+```
+
+**Channel Purposes:**
+- alice↔bob↔carol: Internal hive communication and state sync
+- alice→lnd1, bob→lnd2, carol→dave: Hive to external channels (tests intent protocol)
+- lnd1→eclair1, lnd2→eclair2: Cross-implementation routing paths
+- dave→erin→eclair1→eclair2: External routing network
+
+---
 
 ## Architecture
 
 ```
-Node 1 (Alice)          Node 2 (Bob)           Node 3 (Carol)
-├── clboss              ├── clboss             ├── clboss
-├── sling               ├── sling              ├── sling
-├── cl-revenue-ops      ├── cl-revenue-ops     ├── cl-revenue-ops
-└── cl-hive             └── cl-hive            └── cl-hive
+HIVE FLEET (with plugins)              EXTERNAL NODES (no hive plugins)
+┌─────────────────────────────┐       ┌─────────────────────────────┐
+│  alice (CLN v25.12)         │       │  lnd1 (LND)                 │
+│  ├── clboss                 │       │  lnd2 (LND)                 │
+│  ├── cl-revenue-ops         │◄─────►│  eclair1 (Eclair)           │
+│  └── cl-hive                │       │  eclair2 (Eclair)           │
+│                             │       │  dave (CLN - vanilla)       │
+│  bob (CLN v25.12)           │       │  erin (CLN - vanilla)       │
+│  ├── clboss                 │       └─────────────────────────────┘
+│  ├── cl-revenue-ops         │
+│  └── cl-hive                │
+│                             │
+│  carol (CLN v25.12)         │
+│  ├── clboss                 │
+│  ├── cl-revenue-ops         │
+│  └── cl-hive                │
+└─────────────────────────────┘
 ```
 
-**Plugin Load Order:** clboss → sling → cl-revenue-ops → cl-hive
+**Plugin Load Order:** clboss → cl-revenue-ops → cl-hive
 
 ---
 
@@ -89,9 +153,11 @@ docker exec $CONTAINER chmod +x /home/clightning/.lightning/plugins/cl-hive/cl-h
 #### Step 5: Load Plugins (in order)
 
 ```bash
-docker exec $CONTAINER lightning-cli plugin start /home/clightning/.lightning/plugins/clboss
-docker exec $CONTAINER lightning-cli plugin start /home/clightning/.lightning/plugins/cl-revenue-ops/cl-revenue-ops.py
-docker exec $CONTAINER lightning-cli plugin start /home/clightning/.lightning/plugins/cl-hive/cl-hive.py
+# Polar containers require explicit lightning-cli path
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+docker exec $CONTAINER $CLI plugin start /home/clightning/.lightning/plugins/clboss
+docker exec $CONTAINER $CLI plugin start /home/clightning/.lightning/plugins/cl-revenue-ops/cl-revenue-ops.py
+docker exec $CONTAINER $CLI plugin start /home/clightning/.lightning/plugins/cl-hive/cl-hive.py
 ```
 
 ### Option C: Docker Volume Mount (Persistent)
@@ -151,55 +217,66 @@ hive-heartbeat-interval=60
 ### Test 1: Verify Plugin Loading
 
 ```bash
+# Set up CLI alias for Polar
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+
 for node in alice bob carol; do
     echo "=== $node ==="
-    docker exec polar-n1-$node lightning-cli plugin list | grep -E "(clboss|revenue|hive)"
+    docker exec polar-n1-$node $CLI plugin list | grep -E "(clboss|revenue|hive)"
 done
 ```
 
 ### Test 2: CLBOSS Status
 
 ```bash
-docker exec polar-n1-alice lightning-cli clboss-status
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+docker exec polar-n1-alice $CLI clboss-status
 ```
 
 ### Test 3: cl-revenue-ops Status
 
 ```bash
-docker exec polar-n1-alice lightning-cli revenue-status
-docker exec polar-n1-alice lightning-cli revenue-channels
-docker exec polar-n1-alice lightning-cli revenue-dashboard
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+docker exec polar-n1-alice $CLI revenue-status
+docker exec polar-n1-alice $CLI revenue-channels
+docker exec polar-n1-alice $CLI revenue-dashboard
 ```
 
 ### Test 4: Hive Genesis
 
 ```bash
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+
 # Alice creates a Hive
-docker exec polar-n1-alice lightning-cli hive-genesis
+docker exec polar-n1-alice $CLI hive-genesis
 
 # Verify
-docker exec polar-n1-alice lightning-cli hive-status
+docker exec polar-n1-alice $CLI hive-status
 ```
 
 ### Test 5: Hive Join
 
 ```bash
-# Alice generates invite
-TICKET=$(docker exec polar-n1-alice lightning-cli hive-invite | jq -r '.ticket')
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
 
-# Bob joins
-docker exec polar-n1-bob lightning-cli hive-join "$TICKET"
+# Alice generates invite
+TICKET=$(docker exec polar-n1-alice $CLI hive-invite | jq -r '.ticket')
+
+# Bob joins (use named parameter)
+docker exec polar-n1-bob $CLI hive-join ticket="$TICKET"
 
 # Verify
-docker exec polar-n1-bob lightning-cli hive-status
-docker exec polar-n1-alice lightning-cli hive-members
+docker exec polar-n1-bob $CLI hive-status
+docker exec polar-n1-alice $CLI hive-members
 ```
 
 ### Test 6: State Sync
 
 ```bash
-ALICE_HASH=$(docker exec polar-n1-alice lightning-cli hive-status | jq -r '.state_hash')
-BOB_HASH=$(docker exec polar-n1-bob lightning-cli hive-status | jq -r '.state_hash')
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+
+ALICE_HASH=$(docker exec polar-n1-alice $CLI hive-status | jq -r '.state_hash')
+BOB_HASH=$(docker exec polar-n1-bob $CLI hive-status | jq -r '.state_hash')
 echo "Alice: $ALICE_HASH"
 echo "Bob: $BOB_HASH"
 # Hashes should match
@@ -208,27 +285,33 @@ echo "Bob: $BOB_HASH"
 ### Test 7: Fee Policy Integration
 
 ```bash
-BOB_PUBKEY=$(docker exec polar-n1-bob lightning-cli getinfo | jq -r '.id')
-docker exec polar-n1-alice lightning-cli revenue-policy get $BOB_PUBKEY
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+
+BOB_PUBKEY=$(docker exec polar-n1-bob $CLI getinfo | jq -r '.id')
+docker exec polar-n1-alice $CLI revenue-policy get $BOB_PUBKEY
 # Should show strategy: hive
 ```
 
 ### Test 8: Three-Node Hive
 
 ```bash
-TICKET=$(docker exec polar-n1-alice lightning-cli hive-invite | jq -r '.ticket')
-docker exec polar-n1-carol lightning-cli hive-join "$TICKET"
-docker exec polar-n1-alice lightning-cli hive-members
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+
+TICKET=$(docker exec polar-n1-alice $CLI hive-invite | jq -r '.ticket')
+docker exec polar-n1-carol $CLI hive-join ticket="$TICKET"
+docker exec polar-n1-alice $CLI hive-members
 # Should show 3 members
 ```
 
 ### Test 9: CLBOSS Integration
 
 ```bash
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+
 # Verify cl-revenue-ops can unmanage peers from clboss
-BOB_PUBKEY=$(docker exec polar-n1-bob lightning-cli getinfo | jq -r '.id')
-docker exec polar-n1-alice lightning-cli clboss-unmanage $BOB_PUBKEY
-docker exec polar-n1-alice lightning-cli clboss-unmanaged
+BOB_PUBKEY=$(docker exec polar-n1-bob $CLI getinfo | jq -r '.id')
+docker exec polar-n1-alice $CLI clboss-unmanage $BOB_PUBKEY
+docker exec polar-n1-alice $CLI clboss-unmanaged
 # Should show Bob as unmanaged
 ```
 
@@ -262,7 +345,7 @@ docker exec polar-n1-alice bash -c "cd /tmp/clboss && make clean && make -j$(npr
 ### View Plugin Logs
 
 ```bash
-docker exec polar-n1-alice tail -100 /home/clightning/.lightning/regtest/log | grep -E "(clboss|revenue|hive)"
+docker exec polar-n1-alice tail -100 /home/clightning/.lightning/debug.log | grep -E "(clboss|revenue|hive)"
 ```
 
 ### Permission Issues
@@ -278,10 +361,12 @@ docker exec -u root polar-n1-alice chown -R clightning:clightning /home/clightni
 ### Stop Plugins
 
 ```bash
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+
 for node in alice bob carol; do
-    docker exec polar-n1-$node lightning-cli plugin stop cl-hive || true
-    docker exec polar-n1-$node lightning-cli plugin stop cl-revenue-ops || true
-    docker exec polar-n1-$node lightning-cli plugin stop clboss || true
+    docker exec polar-n1-$node $CLI plugin stop cl-hive || true
+    docker exec polar-n1-$node $CLI plugin stop cl-revenue-ops || true
+    docker exec polar-n1-$node $CLI plugin stop clboss || true
 done
 ```
 
@@ -293,4 +378,94 @@ for node in alice bob carol; do
     docker exec polar-n1-$node rm -f /home/clightning/.lightning/regtest/cl_hive.db
     docker exec polar-n1-$node rm -f /home/clightning/.lightning/regtest/clboss.sqlite3
 done
+```
+
+---
+
+## Automated Testing
+
+Use the `test.sh` script for comprehensive automated testing:
+
+```bash
+# Run all tests
+./test.sh all 1
+
+# Run specific test category
+./test.sh genesis 1
+./test.sh join 1
+./test.sh sync 1
+./test.sh channels 1
+./test.sh fees 1
+./test.sh clboss 1
+./test.sh contrib 1
+./test.sh cross 1
+
+# Reset and run fresh
+./test.sh reset 1
+./test.sh all 1
+```
+
+### Test Categories
+
+| Category | Description |
+|----------|-------------|
+| setup | Verify containers and plugin loading |
+| genesis | Hive creation and admin ticket |
+| join | Member invitation and join workflow |
+| sync | State synchronization between members |
+| channels | Channel opening with intent protocol |
+| fees | Fee policy and HIVE strategy |
+| clboss | CLBOSS integration (unmanage/ignore) |
+| contrib | Contribution tracking and ratios |
+| cross | Cross-implementation (LND/Eclair) tests |
+
+---
+
+## Cross-Implementation CLI Reference
+
+### LND Nodes
+
+```bash
+# Get node info
+docker exec polar-n1-lnd1 lncli --network=regtest getinfo
+
+# Get pubkey
+docker exec polar-n1-lnd1 lncli --network=regtest getinfo | jq -r '.identity_pubkey'
+
+# List channels
+docker exec polar-n1-lnd1 lncli --network=regtest listchannels
+
+# Create invoice
+docker exec polar-n1-lnd1 lncli --network=regtest addinvoice --amt=1000
+```
+
+### Eclair Nodes
+
+```bash
+# Get node info
+docker exec polar-n1-eclair1 eclair-cli getinfo
+
+# Get pubkey
+docker exec polar-n1-eclair1 eclair-cli getinfo | jq -r '.nodeId'
+
+# List channels
+docker exec polar-n1-eclair1 eclair-cli channels
+
+# Create invoice
+docker exec polar-n1-eclair1 eclair-cli createinvoice --amountMsat=1000000 --description="test"
+```
+
+### Vanilla CLN Nodes (dave, erin)
+
+```bash
+CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
+
+# Get node info
+docker exec polar-n1-dave $CLI getinfo
+
+# List channels
+docker exec polar-n1-dave $CLI listpeerchannels
+
+# Create invoice
+docker exec polar-n1-dave $CLI invoice 1000sat "test" "test invoice"
 ```
