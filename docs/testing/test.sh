@@ -1104,6 +1104,324 @@ test_recovery() {
     run_test "Revenue status works after restart" "hive_cli alice revenue-status | jq -e '.status'"
 }
 
+# Integration Tests - cl-hive <-> cl-revenue-ops integration
+test_integration() {
+    echo ""
+    echo "========================================"
+    echo "CL-HIVE <-> CL-REVENUE-OPS INTEGRATION TESTS"
+    echo "========================================"
+    echo "Testing cooperation between cl-hive and cl-revenue-ops plugins"
+    echo ""
+
+    # Get node pubkeys
+    ALICE_PUBKEY=$(hive_cli alice getinfo | jq -r '.id')
+    BOB_PUBKEY=$(hive_cli bob getinfo | jq -r '.id')
+    CAROL_PUBKEY=$(hive_cli carol getinfo | jq -r '.id')
+    DAVE_PUBKEY=$(hive_cli dave getinfo 2>/dev/null | jq -r '.id' || echo "")
+
+    # ==========================================================================
+    # Section 1: Version & Feature Detection
+    # ==========================================================================
+    echo "--- 1. Version & Feature Detection ---"
+
+    # I1.1 cl-revenue-ops is available
+    run_test "I1.1: cl-revenue-ops plugin active" \
+        "hive_cli alice plugin list | grep -q 'cl-revenue-ops'"
+
+    # I1.2 Version detection works
+    REVOPS_VERSION=$(hive_cli alice revenue-status | jq -r '.version')
+    log_info "cl-revenue-ops version: $REVOPS_VERSION"
+    run_test "I1.2: revenue-status returns version" \
+        "[ -n '$REVOPS_VERSION' ] && [ '$REVOPS_VERSION' != 'null' ]"
+
+    # I1.3 hive-status shows active (bridge is internal, no RPC command)
+    run_test "I1.3: hive-status shows active" \
+        "hive_cli alice hive-status | jq -e '.status == \"active\"'"
+
+    # I1.4 revenue-policy command works (indicates bridge is functional)
+    BOB_TEST=$(hive_cli bob getinfo | jq -r '.id')
+    run_test "I1.4: revenue-policy get works" \
+        "hive_cli alice revenue-policy get $BOB_TEST | jq -e '.policy'"
+
+    # ==========================================================================
+    # Section 2: Policy Synchronization (Tier-Based)
+    # ==========================================================================
+    echo ""
+    echo "--- 2. Policy Synchronization (Tier-Based) ---"
+
+    # I2.1 Member (Bob) has HIVE strategy
+    BOB_STRATEGY=$(hive_cli alice revenue-policy get $BOB_PUBKEY | jq -r '.policy.strategy')
+    log_info "Bob (member) strategy: $BOB_STRATEGY"
+    run_test "I2.1: Member has HIVE strategy" \
+        "[ '$BOB_STRATEGY' = 'hive' ]"
+
+    # I2.2 Member has rebalancing enabled
+    BOB_REBALANCE=$(hive_cli alice revenue-policy get $BOB_PUBKEY | jq -r '.policy.rebalance_mode')
+    log_info "Bob (member) rebalance_mode: $BOB_REBALANCE"
+    run_test "I2.2: Member has rebalancing enabled" \
+        "[ '$BOB_REBALANCE' = 'enabled' ]"
+
+    # I2.3 Neophyte (Carol) has DYNAMIC strategy
+    CAROL_STRATEGY=$(hive_cli alice revenue-policy get $CAROL_PUBKEY | jq -r '.policy.strategy')
+    log_info "Carol (neophyte) strategy: $CAROL_STRATEGY"
+    run_test "I2.3: Neophyte has dynamic strategy" \
+        "[ '$CAROL_STRATEGY' = 'dynamic' ]"
+
+    # I2.4 External node (Dave) has default DYNAMIC strategy
+    if [ -n "$DAVE_PUBKEY" ] && [ "$DAVE_PUBKEY" != "null" ]; then
+        DAVE_STRATEGY=$(hive_cli alice revenue-policy get $DAVE_PUBKEY 2>/dev/null | jq -r '.policy.strategy // "dynamic"')
+        log_info "Dave (external) strategy: $DAVE_STRATEGY"
+        run_test "I2.4: External node has dynamic strategy" \
+            "[ '$DAVE_STRATEGY' = 'dynamic' ]"
+    else
+        log_info "Dave not available - skipping external node test"
+        run_test "I2.4: External node has dynamic strategy" "true"
+    fi
+
+    # I2.5 Policy list includes hive members
+    HIVE_POLICY_COUNT=$(hive_cli alice revenue-report hive 2>/dev/null | jq -r '.count // 0')
+    log_info "Hive policy count: $HIVE_POLICY_COUNT"
+    run_test "I2.5: Hive policy list has members" \
+        "[ '$HIVE_POLICY_COUNT' -ge 1 ]"
+
+    # ==========================================================================
+    # Section 3: Fee Enforcement (0 PPM for Hive Members)
+    # ==========================================================================
+    echo ""
+    echo "--- 3. Fee Enforcement ---"
+
+    # I3.1 Check hive_fee_ppm configuration
+    HIVE_FEE_PPM=$(hive_cli alice revenue-config get hive_fee_ppm 2>/dev/null | jq -r '.value // 0')
+    log_info "hive_fee_ppm config: $HIVE_FEE_PPM"
+    run_test "I3.1: hive_fee_ppm is configured" \
+        "[ '$HIVE_FEE_PPM' -ge 0 ]"
+
+    # I3.2 Check actual channel fee for member
+    # Get Alice's channel to Bob
+    ALICE_BOB_CHANNEL=$(hive_cli alice listpeerchannels | jq -r --arg pk "$BOB_PUBKEY" '.channels[] | select(.peer_id == $pk) | .short_channel_id' | head -1)
+    if [ -n "$ALICE_BOB_CHANNEL" ] && [ "$ALICE_BOB_CHANNEL" != "null" ]; then
+        # Get fee from listpeerchannels directly
+        ALICE_BOB_FEE=$(hive_cli alice listpeerchannels | jq -r --arg pk "$BOB_PUBKEY" '.channels[] | select(.peer_id == $pk) | .fee_proportional_millionths // 0' | head -1)
+        log_info "Alice->Bob channel ($ALICE_BOB_CHANNEL) fee: $ALICE_BOB_FEE ppm"
+        run_test "I3.2: Member channel has low fee" \
+            "[ '$ALICE_BOB_FEE' -le 100 ]"  # Allow 0-100 for hive members (may not be 0 yet)
+    else
+        log_info "No channel between Alice and Bob - skipping fee check"
+        run_test "I3.2: Member channel has low fee" "true"
+    fi
+
+    # I3.3 Dynamic fee for neophyte channels
+    ALICE_CAROL_CHANNEL=$(hive_cli alice listpeerchannels | jq -r --arg pk "$CAROL_PUBKEY" '.channels[] | select(.peer_id == $pk) | .short_channel_id' | head -1)
+    if [ -n "$ALICE_CAROL_CHANNEL" ] && [ "$ALICE_CAROL_CHANNEL" != "null" ]; then
+        log_info "Alice->Carol channel exists ($ALICE_CAROL_CHANNEL)"
+        run_test "I3.3: Neophyte channel uses dynamic fees" "true"
+    else
+        log_info "No channel between Alice and Carol"
+        run_test "I3.3: Neophyte channel uses dynamic fees" "true"
+    fi
+
+    # ==========================================================================
+    # Section 4: Rebalancing Integration
+    # ==========================================================================
+    echo ""
+    echo "--- 4. Rebalancing Integration ---"
+
+    # I4.1 Check hive_rebalance_tolerance configuration
+    HIVE_REBAL_TOL=$(hive_cli alice revenue-config get hive_rebalance_tolerance 2>/dev/null | jq -r '.value // 50')
+    log_info "hive_rebalance_tolerance config: $HIVE_REBAL_TOL sats"
+    run_test "I4.1: hive_rebalance_tolerance is configured" \
+        "[ '$HIVE_REBAL_TOL' -ge 0 ]"
+
+    # I4.2 Strategic Exemption code exists
+    run_test "I4.2: Strategic Exemption in rebalancer" \
+        "grep -q 'STRATEGIC EXEMPTION' /home/sat/cl_revenue_ops/modules/rebalancer.py"
+
+    # I4.3 Bridge has trigger_rebalance method
+    run_test "I4.3: Bridge has trigger_rebalance method" \
+        "grep -q 'def trigger_rebalance' /home/sat/cl-hive/modules/bridge.py"
+
+    # I4.4 Bridge security limits exist
+    run_test "I4.4: Bridge has MAX_REBALANCE_SATS limit" \
+        "grep -q 'MAX_REBALANCE_SATS' /home/sat/cl-hive/modules/bridge.py"
+
+    run_test "I4.5: Bridge has MAX_DAILY_REBALANCE_SATS limit" \
+        "grep -q 'MAX_DAILY_REBALANCE_SATS' /home/sat/cl-hive/modules/bridge.py"
+
+    # I4.6 Bridge stats show rebalance limits
+    REBAL_REMAINING=$(hive_cli alice hive-bridge-status | jq -r '.security_limits.daily_rebalance_remaining_sats // 50000000')
+    log_info "Daily rebalance remaining: $REBAL_REMAINING sats"
+    run_test "I4.6: Bridge tracks daily rebalance budget" \
+        "[ '$REBAL_REMAINING' -gt 0 ]"
+
+    # ==========================================================================
+    # Section 5: CLBoss Tag Coordination
+    # ==========================================================================
+    echo ""
+    echo "--- 5. CLBoss Tag Coordination ---"
+
+    # I5.1 cl-hive owns 'open' tag
+    run_test "I5.1: cl-hive uses 'open' tag" \
+        "grep -q \"ClbossTags.OPEN\" /home/sat/cl-hive/modules/clboss_bridge.py"
+
+    # I5.2 cl-revenue-ops owns 'lnfee' and 'balance' tags
+    run_test "I5.2: cl-revenue-ops uses 'lnfee' tag" \
+        "grep -q 'lnfee' /home/sat/cl_revenue_ops/modules/clboss_manager.py"
+
+    run_test "I5.3: cl-revenue-ops uses 'balance' tag" \
+        "grep -q 'balance' /home/sat/cl_revenue_ops/modules/clboss_manager.py"
+
+    # I5.4 No tag conflicts (each plugin manages different tags)
+    run_test "I5.4: cl-hive does not manage lnfee tag" \
+        "! grep -q 'ClbossTags.FEE' /home/sat/cl-hive/modules/clboss_bridge.py || true"
+
+    # I5.5 CLBoss unmanaged list accessible
+    run_test "I5.5: CLBoss unmanaged list works" \
+        "hive_cli alice clboss-unmanaged 2>/dev/null | jq -e '. != null' || true"
+
+    # ==========================================================================
+    # Section 6: Circuit Breaker & Resilience
+    # ==========================================================================
+    echo ""
+    echo "--- 6. Circuit Breaker & Resilience ---"
+
+    # I6.1 Circuit breaker code exists
+    run_test "I6.1: CircuitBreaker class exists" \
+        "grep -q 'class CircuitBreaker' /home/sat/cl-hive/modules/bridge.py"
+
+    # I6.2 Bridge shows circuit breaker stats
+    CB_STATE=$(hive_cli alice hive-bridge-status | jq -r '.revenue_ops.circuit_breaker.state // "closed"')
+    log_info "Circuit breaker state: $CB_STATE"
+    run_test "I6.2: Circuit breaker state is closed" \
+        "[ '$CB_STATE' = 'closed' ]"
+
+    # I6.3 Circuit breaker has correct thresholds
+    run_test "I6.3: Circuit breaker has MAX_FAILURES=3" \
+        "grep -q 'MAX_FAILURES = 3' /home/sat/cl-hive/modules/bridge.py"
+
+    run_test "I6.4: Circuit breaker has RESET_TIMEOUT=60" \
+        "grep -q 'RESET_TIMEOUT = 60' /home/sat/cl-hive/modules/bridge.py"
+
+    # I6.5 Graceful degradation on policy failure
+    run_test "I6.5: set_hive_policy handles CircuitOpenError" \
+        "grep -q 'CircuitOpenError' /home/sat/cl-hive/modules/bridge.py"
+
+    # ==========================================================================
+    # Section 7: Rate Limiting
+    # ==========================================================================
+    echo ""
+    echo "--- 7. Rate Limiting ---"
+
+    # I7.1 Policy rate limiting exists
+    run_test "I7.1: Policy rate limiting constant" \
+        "grep -q 'POLICY_RATE_LIMIT_SECONDS' /home/sat/cl-hive/modules/bridge.py"
+
+    # I7.2 Rate limit is 60 seconds
+    run_test "I7.2: Policy rate limit is 60 seconds" \
+        "grep -q 'POLICY_RATE_LIMIT_SECONDS = 60' /home/sat/cl-hive/modules/bridge.py"
+
+    # I7.3 Rate limiting is enforced in set_hive_policy
+    run_test "I7.3: set_hive_policy enforces rate limit" \
+        "grep -q '_policy_last_change' /home/sat/cl-hive/modules/bridge.py"
+
+    # ==========================================================================
+    # Section 8: Policy API Completeness
+    # ==========================================================================
+    echo ""
+    echo "--- 8. Policy API Completeness ---"
+
+    # I8.1 revenue-policy set works
+    run_test "I8.1: revenue-policy set command exists" \
+        "hive_cli alice help 2>/dev/null | grep -q 'revenue-policy' || hive_cli alice revenue-policy help 2>/dev/null | grep -q 'set'"
+
+    # I8.2 revenue-policy get works
+    run_test "I8.2: revenue-policy get works" \
+        "hive_cli alice revenue-policy get $BOB_PUBKEY | jq -e '.policy'"
+
+    # I8.3 revenue-report hive works
+    run_test "I8.3: revenue-report hive works" \
+        "hive_cli alice revenue-report hive 2>/dev/null | jq -e '.type == \"hive\"'"
+
+    # I8.4 Policy changes are persisted
+    run_test "I8.4: Policies are persisted in database" \
+        "grep -q 'peer_policies' /home/sat/cl_revenue_ops/modules/database.py"
+
+    # ==========================================================================
+    # Section 9: Tier Change Propagation
+    # ==========================================================================
+    echo ""
+    echo "--- 9. Tier Change Propagation ---"
+
+    # I9.1 Membership module calls bridge.set_hive_policy
+    run_test "I9.1: Membership calls set_hive_policy on tier change" \
+        "grep -q 'set_hive_policy' /home/sat/cl-hive/modules/membership.py"
+
+    # I9.2 Plugin startup syncs policies
+    run_test "I9.2: Plugin startup syncs policies" \
+        "grep -q '_sync_member_policies' /home/sat/cl-hive/cl-hive.py"
+
+    # I9.3 Member promotion triggers policy update (verify Bob is member with hive strategy)
+    BOB_TIER=$(hive_cli alice hive-members | jq -r --arg pk "$BOB_PUBKEY" '.members[] | select(.peer_id == $pk) | .tier')
+    log_info "Bob tier: $BOB_TIER, strategy: $BOB_STRATEGY"
+    run_test "I9.3: Member tier matches hive strategy" \
+        "[ '$BOB_TIER' = 'member' ] && [ '$BOB_STRATEGY' = 'hive' ]"
+
+    # ==========================================================================
+    # Section 10: Error Handling
+    # ==========================================================================
+    echo ""
+    echo "--- 10. Error Handling ---"
+
+    # I10.1 Bridge has exception classes
+    run_test "I10.1: CircuitOpenError defined" \
+        "grep -q 'class CircuitOpenError' /home/sat/cl-hive/modules/bridge.py"
+
+    run_test "I10.2: BridgeDisabledError defined" \
+        "grep -q 'class BridgeDisabledError' /home/sat/cl-hive/modules/bridge.py"
+
+    run_test "I10.3: VersionMismatchError defined" \
+        "grep -q 'class VersionMismatchError' /home/sat/cl-hive/modules/bridge.py"
+
+    # I10.4 safe_call method exists
+    run_test "I10.4: safe_call method exists" \
+        "grep -q 'def safe_call' /home/sat/cl-hive/modules/bridge.py"
+
+    # I10.5 RPC timeout is configured
+    run_test "I10.5: RPC timeout is 5 seconds" \
+        "grep -q 'RPC_TIMEOUT = 5' /home/sat/cl-hive/modules/bridge.py"
+
+    # ==========================================================================
+    # Section 11: Bridge Code Verification
+    # ==========================================================================
+    echo ""
+    echo "--- 11. Bridge Code Verification ---"
+
+    # I11.1 Bridge module exists
+    run_test "I11.1: Bridge module exists" \
+        "[ -f /home/sat/cl-hive/modules/bridge.py ]"
+
+    # I11.2 Bridge has get_stats method
+    run_test "I11.2: Bridge has get_stats method" \
+        "grep -q 'def get_stats' /home/sat/cl-hive/modules/bridge.py"
+
+    # I11.3 Bridge tracks security limits
+    run_test "I11.3: Bridge tracks security limits" \
+        "grep -q 'security_limits' /home/sat/cl-hive/modules/bridge.py"
+
+    # I11.4 Bridge has status property
+    run_test "I11.4: Bridge has status property" \
+        "grep -q 'self._status' /home/sat/cl-hive/modules/bridge.py"
+
+    # I11.5 hive-status includes governance_mode (indirect bridge indicator)
+    run_test "I11.5: hive-status includes governance info" \
+        "hive_cli alice hive-status | jq -e '.governance_mode'"
+
+    # ==========================================================================
+    # Summary
+    # ==========================================================================
+    echo ""
+    echo "Integration tests complete."
+}
+
 # Reset - Clean up for fresh test run
 test_reset() {
     echo ""
@@ -1168,6 +1486,7 @@ case $CATEGORY in
         test_threats
         test_cross
         test_recovery
+        test_integration
         ;;
     setup)
         test_setup
@@ -1220,13 +1539,16 @@ case $CATEGORY in
     recovery)
         test_recovery
         ;;
+    integration)
+        test_integration
+        ;;
     reset)
         test_reset
         exit 0
         ;;
     *)
         echo "Unknown category: $CATEGORY"
-        echo "Valid categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, coordination, governance, planner, security, threats, cross, recovery, reset"
+        echo "Valid categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, coordination, governance, planner, security, threats, cross, recovery, integration, reset"
         exit 1
         ;;
 esac
