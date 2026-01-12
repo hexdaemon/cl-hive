@@ -1119,17 +1119,18 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
 # PEER CONNECTION HOOK (State Hash Exchange)
 # =============================================================================
 
-@plugin.subscribe("peer_connected")
-def on_peer_connected(peer_id: str, plugin: Plugin, **kwargs):
+@plugin.subscribe("connect")
+def on_peer_connected(plugin: Plugin, id: str, **kwargs):
     """
     Hook called when a peer connects.
-    
+
     If the peer is a Hive member, send a STATE_HASH message to
     initiate anti-entropy check and detect state divergence.
     """
+    peer_id = id  # CLN v25+ uses 'id' instead of 'peer_id'
     if not database or not gossip_mgr:
         return
-    
+
     # Check if this peer is a Hive member
     member = database.get_member(peer_id)
     if not member:
@@ -1154,9 +1155,10 @@ def on_peer_connected(peer_id: str, plugin: Plugin, **kwargs):
         plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
 
 
-@plugin.subscribe("peer_disconnected")
-def on_peer_disconnected(peer_id: str, plugin: Plugin, **kwargs):
+@plugin.subscribe("disconnect")
+def on_peer_disconnected(plugin: Plugin, id: str, **kwargs):
     """Update presence for disconnected peers."""
+    peer_id = id  # CLN v25+ uses 'id' instead of 'peer_id'
     if not database:
         return
     member = database.get_member(peer_id)
