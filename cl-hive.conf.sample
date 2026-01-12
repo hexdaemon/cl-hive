@@ -1,0 +1,89 @@
+# cl-hive v0.1 Production Config
+# Copy to ~/.lightning/config or include via: include /path/to/cl-hive.conf
+
+# ============================================================================
+# GOVERNANCE
+# ============================================================================
+
+# Governance mode:
+#   advisor    - Proposes actions, requires human approval (RECOMMENDED)
+#   autonomous - Auto-executes approved actions
+#   oracle     - Defers to external API
+hive-governance-mode=advisor
+
+# ============================================================================
+# MEMBERSHIP & FEES
+# ============================================================================
+
+# Fee charged to full Hive members (0 = free routing within fleet)
+hive-member-fee-ppm=0
+
+# Fee discount for Neophyte (probationary) members (0.5 = 50% of public rate)
+hive-neophyte-fee-discount=0.5
+
+# Days required as Neophyte before promotion eligibility
+hive-probation-days=30
+
+# ============================================================================
+# PROMOTION & VOTING
+# ============================================================================
+
+# Percentage of member vouches required for promotion (0.51 = 51% majority)
+hive-vouch-threshold=0.51
+
+# Minimum number of vouches required (prevents 1-member approval)
+hive-min-vouch-count=3
+
+# Auto-vouch for eligible neophytes meeting contribution requirements
+hive-auto-vouch=true
+
+# Auto-promote when vouch quorum is reached
+hive-auto-promote=true
+
+# ============================================================================
+# BANNING & ANTI-LEECH
+# ============================================================================
+
+# Auto-trigger ban proposal on sustained leeching (use with caution)
+hive-ban-autotrigger=false
+
+# ============================================================================
+# NETWORK LIMITS
+# ============================================================================
+
+# Maximum Hive members (Dunbar cap for gossip efficiency)
+hive-max-members=50
+
+# Maximum market share per target (anti-monopoly, 0.20 = 20%)
+hive-market-share-cap=0.20
+
+# ============================================================================
+# COORDINATION PROTOCOL
+# ============================================================================
+
+# Hold period before committing an Intent (allows conflict detection)
+hive-intent-hold-seconds=60
+
+# Capacity change threshold to trigger gossip broadcast (0.10 = 10%)
+hive-gossip-threshold=0.10
+
+# Heartbeat broadcast interval in seconds
+hive-heartbeat-interval=300
+
+# ============================================================================
+# TOPOLOGY PLANNER
+# ============================================================================
+
+# Planner cycle interval in seconds (how often to analyze topology)
+hive-planner-interval=3600
+
+# Enable expansion proposals (new channel openings)
+# WARNING: Set to false until you trust the algorithm
+hive-planner-enable-expansions=false
+
+# ============================================================================
+# DATABASE
+# ============================================================================
+
+# Path to SQLite database for Hive state
+#hive-db-path=~/.lightning/cl_hive.db
