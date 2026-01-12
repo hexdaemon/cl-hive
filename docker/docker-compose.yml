@@ -45,15 +45,13 @@ services:
       # Tor
       - TOR_ENABLED=${TOR_ENABLED:-true}
 
-      # WireGuard
+      # WireGuard VPN (credentials from VPN admin)
       - WIREGUARD_ENABLED=${WIREGUARD_ENABLED:-false}
-      # WireGuard config from env vars (Option 1)
       - WG_PRIVATE_KEY=${WG_PRIVATE_KEY:-}
-      - WG_ADDRESS=${WG_ADDRESS:-10.0.0.2/24}
-      - WG_DNS=${WG_DNS:-}
+      - WG_ADDRESS=${WG_ADDRESS:-}
       - WG_PEER_PUBLIC_KEY=${WG_PEER_PUBLIC_KEY:-}
       - WG_PEER_ENDPOINT=${WG_PEER_ENDPOINT:-}
-      - WG_PEER_ALLOWED_IPS=${WG_PEER_ALLOWED_IPS:-0.0.0.0/0}
+      - WG_DNS=${WG_DNS:-}
       - WG_PEER_KEEPALIVE=${WG_PEER_KEEPALIVE:-25}
 
       # CLBOSS

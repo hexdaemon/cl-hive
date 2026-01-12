@@ -72,17 +72,18 @@ docker-compose exec cln lightning-cli hive-status
 | `HIVE_GOVERNANCE_MODE` | `advisor` | Hive governance mode |
 | `LOG_LEVEL` | `info` | Log level |
 
-#### WireGuard Settings (when `WIREGUARD_ENABLED=true`)
+#### WireGuard Settings (provided by VPN administrator)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WG_PRIVATE_KEY` | - | Your WireGuard private key (required) |
-| `WG_ADDRESS` | `10.0.0.2/24` | Your VPN IP address |
-| `WG_DNS` | - | DNS server through VPN (optional) |
-| `WG_PEER_PUBLIC_KEY` | - | VPN server's public key (required) |
-| `WG_PEER_ENDPOINT` | - | VPN server endpoint (host:port) |
-| `WG_PEER_ALLOWED_IPS` | `0.0.0.0/0` | IPs to route through VPN |
-| `WG_PEER_KEEPALIVE` | `25` | Keepalive interval (seconds)
+| Variable | Description |
+|----------|-------------|
+| `WG_PRIVATE_KEY` | Your WireGuard private key (generate with `wg genkey`) |
+| `WG_ADDRESS` | Your VPN IP address (e.g., `10.8.0.2/24`) |
+| `WG_PEER_PUBLIC_KEY` | VPN server's public key |
+| `WG_PEER_ENDPOINT` | VPN server endpoint (host:port) |
+| `WG_DNS` | DNS server on VPN (optional) |
+| `WG_PEER_KEEPALIVE` | Keepalive interval, default `25` seconds |
+
+The VPN subnet is automatically derived from `WG_ADDRESS`. MTU is set to 1420.
 
 ### Volumes
 
@@ -112,66 +113,54 @@ ANNOUNCE_ADDR=your.public.ip:9735
 
 ## WireGuard Configuration
 
-WireGuard can be used to securely connect to your bitcoind backend over a VPN tunnel.
+WireGuard VPN allows secure connection to your bitcoind backend. Your VPN administrator will provide the required credentials.
 
-### Option 1: Environment Variables (Recommended)
+### Setup
 
-Set in `.env`:
+1. Get VPN credentials from your administrator:
+   - Your VPN IP address (e.g., `10.8.0.2/24`)
+   - Server public key
+   - Server endpoint (host:port)
+
+2. Generate your private key:
+   ```bash
+   wg genkey
+   ```
+
+3. Configure in `.env`:
+   ```bash
+   WIREGUARD_ENABLED=true
+
+   # Your credentials
+   WG_PRIVATE_KEY=your_generated_private_key
+   WG_ADDRESS=10.8.0.2/24
+
+   # Server details (from VPN admin)
+   WG_PEER_PUBLIC_KEY=server_public_key_here
+   WG_PEER_ENDPOINT=vpn.example.com:51820
+
+   # Bitcoin RPC through VPN
+   BITCOIN_RPCHOST=10.8.0.1
+   ```
+
+The system automatically:
+- Sets MTU to 1420
+- Routes only VPN subnet traffic (derived from your `WG_ADDRESS`)
+- Configures keepalive for NAT traversal
+
+### Alternative: Mount Config File
+
+If you have a complete `wg0.conf` from your VPN admin:
+
 ```bash
-WIREGUARD_ENABLED=true
-
-# Generate a private key: wg genkey
-WG_PRIVATE_KEY=your_private_key_here
-
-# Your VPN IP (assigned by VPN provider)
-WG_ADDRESS=10.0.0.2/24
-
-# VPN server details
-WG_PEER_PUBLIC_KEY=server_public_key_here
-WG_PEER_ENDPOINT=vpn.example.com:51820
-
-# Route only bitcoind traffic through VPN (more efficient)
-# Replace with your bitcoind server's IP
-WG_PEER_ALLOWED_IPS=192.168.1.100/32
-
-# Or route all traffic through VPN
-# WG_PEER_ALLOWED_IPS=0.0.0.0/0
-
-WG_PEER_KEEPALIVE=25
-```
-
-### Option 2: Mount Config File
-
-Create `wireguard/wg0.conf`:
-
-```ini
-[Interface]
-PrivateKey = <your-private-key>
-Address = 10.0.0.2/24
-
-[Peer]
-PublicKey = <server-public-key>
-Endpoint = vpn.example.com:51820
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
+mkdir wireguard
+cp /path/to/wg0.conf wireguard/
 ```
 
 Set in `.env`:
 ```
 WIREGUARD_ENABLED=true
 WIREGUARD_CONFIG_PATH=./wireguard
-```
-
-### Using WireGuard with Bitcoin RPC
-
-To connect to bitcoind through the VPN:
-
-```bash
-# In .env, set BITCOIN_RPCHOST to the bitcoind IP on the VPN network
-BITCOIN_RPCHOST=10.0.0.1
-
-# Route only that IP through WireGuard
-WG_PEER_ALLOWED_IPS=10.0.0.1/32
 ```
 
 ## Hive Operations

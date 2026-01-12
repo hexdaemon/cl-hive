@@ -170,11 +170,16 @@ if [ "$WIREGUARD_ENABLED" = "true" ]; then
     if [ -n "$WG_PRIVATE_KEY" ] && [ -n "$WG_PEER_PUBLIC_KEY" ]; then
         echo "Generating WireGuard config from environment variables..."
 
+        # Extract VPN subnet from WG_ADDRESS (e.g., 10.8.0.2/24 -> 10.8.0.0/24)
+        WG_ADDR="${WG_ADDRESS:-10.8.0.2/24}"
+        WG_SUBNET=$(echo "$WG_ADDR" | sed -E 's/\.[0-9]+\//.0\//')
+
         mkdir -p /etc/wireguard
         cat > "$WG_CONFIG_FILE" << EOF
 [Interface]
 PrivateKey = $WG_PRIVATE_KEY
-Address = ${WG_ADDRESS:-10.0.0.2/24}
+Address = $WG_ADDR
+MTU = 1420
 EOF
 
         # Add DNS if specified
@@ -183,22 +188,19 @@ EOF
         fi
 
         # Add peer configuration
+        # AllowedIPs is set to VPN subnet only (extracted from WG_ADDRESS)
         cat >> "$WG_CONFIG_FILE" << EOF
 
 [Peer]
 PublicKey = $WG_PEER_PUBLIC_KEY
-Endpoint = ${WG_PEER_ENDPOINT:-vpn.example.com:51820}
-AllowedIPs = ${WG_PEER_ALLOWED_IPS:-0.0.0.0/0}
+Endpoint = ${WG_PEER_ENDPOINT}
+AllowedIPs = $WG_SUBNET
+PersistentKeepalive = ${WG_PEER_KEEPALIVE:-25}
 EOF
-
-        # Add keepalive if specified and non-zero
-        if [ -n "$WG_PEER_KEEPALIVE" ] && [ "$WG_PEER_KEEPALIVE" != "0" ]; then
-            echo "PersistentKeepalive = $WG_PEER_KEEPALIVE" >> "$WG_CONFIG_FILE"
-        fi
 
         chmod 600 "$WG_CONFIG_FILE"
         WG_CONFIG_GENERATED=true
-        echo "WireGuard config generated"
+        echo "WireGuard config generated (VPN subnet: $WG_SUBNET)"
 
     # Option 2: Use mounted config file
     elif [ -f "$WG_CONFIG_FILE" ]; then
