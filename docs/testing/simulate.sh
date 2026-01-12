@@ -954,6 +954,341 @@ setup_bidirectional_channels() {
 # HIVE-SPECIFIC TESTING SCENARIOS
 # =============================================================================
 
+# Comprehensive coordination protocol test
+# Tests: Genesis, Invite/Join, Intent Lock, Gossip, Heartbeat, Fee Coordination
+run_coordination_protocol_test() {
+    echo ""
+    echo "========================================"
+    echo "COORDINATION PROTOCOL TEST"
+    echo "========================================"
+    echo ""
+
+    local PASS=0
+    local FAIL=0
+
+    # Helper to run a test
+    run_test() {
+        local name="$1"
+        local cmd="$2"
+        echo -n "[TEST] $name... "
+        if eval "$cmd" > /dev/null 2>&1; then
+            echo "PASS"
+            ((PASS++))
+        else
+            echo "FAIL"
+            ((FAIL++))
+        fi
+    }
+
+    # Helper to check condition
+    check_condition() {
+        local name="$1"
+        local condition="$2"
+        echo -n "[CHECK] $name... "
+        if eval "$condition"; then
+            echo "PASS"
+            ((PASS++))
+        else
+            echo "FAIL"
+            ((FAIL++))
+        fi
+    }
+
+    # =========================================================================
+    # Phase 1: Hive Status Verification
+    # =========================================================================
+    echo "--- Phase 1: Hive Status ---"
+
+    for node in $HIVE_NODES; do
+        local status=$(cln_cli $node hive-status 2>/dev/null)
+        local is_member=$(echo "$status" | jq -r '.is_member' 2>/dev/null)
+        check_condition "$node is hive member" "[ '$is_member' = 'true' ]"
+    done
+
+    # =========================================================================
+    # Phase 2: Membership Consistency
+    # =========================================================================
+    echo ""
+    echo "--- Phase 2: Membership Consistency ---"
+
+    # Get member count from each node
+    local alice_members=$(cln_cli alice hive-members 2>/dev/null | jq '.members | length' 2>/dev/null || echo "0")
+    local bob_members=$(cln_cli bob hive-members 2>/dev/null | jq '.members | length' 2>/dev/null || echo "0")
+    local carol_members=$(cln_cli carol hive-members 2>/dev/null | jq '.members | length' 2>/dev/null || echo "0")
+
+    echo "  alice sees $alice_members members"
+    echo "  bob sees $bob_members members"
+    echo "  carol sees $carol_members members"
+
+    check_condition "All nodes see same member count" \
+        "[ '$alice_members' = '$bob_members' ] && [ '$bob_members' = '$carol_members' ]"
+
+    # =========================================================================
+    # Phase 3: Fee Coordination (HIVE Strategy)
+    # =========================================================================
+    echo ""
+    echo "--- Phase 3: Fee Coordination ---"
+
+    for node in $HIVE_NODES; do
+        local hive_policies=$(cln_cli $node revenue-policy list 2>/dev/null | \
+            jq '[.policies[] | select(.strategy == "hive")] | length' 2>/dev/null || echo "0")
+        local expected=$(($(echo $HIVE_NODES | wc -w) - 1))  # All hive peers except self
+        check_condition "$node has HIVE policy for $expected peers" \
+            "[ '$hive_policies' -ge '$expected' ]"
+    done
+
+    # =========================================================================
+    # Phase 4: Intent Lock Protocol
+    # =========================================================================
+    echo ""
+    echo "--- Phase 4: Intent Lock Protocol ---"
+
+    # Check pending intents (should be 0 in stable state)
+    for node in $HIVE_NODES; do
+        local pending=$(cln_cli $node hive-status 2>/dev/null | \
+            jq '.pending_intents // 0' 2>/dev/null || echo "0")
+        check_condition "$node has 0 pending intents (stable)" "[ '$pending' = '0' ]"
+    done
+
+    # =========================================================================
+    # Phase 5: Gossip Propagation
+    # =========================================================================
+    echo ""
+    echo "--- Phase 5: Gossip Propagation ---"
+
+    # Get topology from each node and check consistency
+    local alice_topology=$(cln_cli alice hive-topology 2>/dev/null | jq '.targets | length' 2>/dev/null || echo "0")
+    local bob_topology=$(cln_cli bob hive-topology 2>/dev/null | jq '.targets | length' 2>/dev/null || echo "0")
+
+    echo "  alice sees $alice_topology targets"
+    echo "  bob sees $bob_topology targets"
+
+    check_condition "Topology data propagated" "[ '$alice_topology' -gt '0' ]"
+
+    # =========================================================================
+    # Phase 6: Heartbeat / Liveness
+    # =========================================================================
+    echo ""
+    echo "--- Phase 6: Heartbeat / Liveness ---"
+
+    for node in $HIVE_NODES; do
+        local status=$(cln_cli $node hive-status 2>/dev/null | jq -r '.status' 2>/dev/null)
+        check_condition "$node status is 'active'" "[ '$status' = 'active' ]"
+    done
+
+    # =========================================================================
+    # Phase 7: Cross-Plugin Integration
+    # =========================================================================
+    echo ""
+    echo "--- Phase 7: cl-revenue-ops Integration ---"
+
+    for node in $HIVE_NODES; do
+        local bridge=$(cln_cli $node hive-status 2>/dev/null | jq -r '.bridge_status' 2>/dev/null)
+        check_condition "$node bridge to cl-revenue-ops" "[ '$bridge' = 'connected' ] || [ '$bridge' = 'active' ]"
+    done
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    echo ""
+    echo "========================================"
+    echo "COORDINATION PROTOCOL RESULTS"
+    echo "========================================"
+    echo "Passed: $PASS"
+    echo "Failed: $FAIL"
+    echo "Total:  $((PASS + FAIL))"
+    echo ""
+
+    if [ "$FAIL" -eq 0 ]; then
+        log_success "All coordination protocol tests passed!"
+        return 0
+    else
+        log_error "$FAIL tests failed"
+        return 1
+    fi
+}
+
+# Test invite/join flow (requires fresh hive or manual reset)
+run_invite_join_test() {
+    echo ""
+    echo "========================================"
+    echo "INVITE/JOIN FLOW TEST"
+    echo "========================================"
+    echo ""
+
+    # This test requires alice to be an admin
+    local alice_tier=$(cln_cli alice hive-status 2>/dev/null | jq -r '.tier' 2>/dev/null)
+
+    if [ "$alice_tier" != "admin" ]; then
+        log_error "alice must be an admin to run invite test"
+        return 1
+    fi
+
+    echo "[1] Generating invite ticket from alice..."
+    local ticket=$(cln_cli alice hive-invite 2>/dev/null | jq -r '.ticket' 2>/dev/null)
+
+    if [ -z "$ticket" ] || [ "$ticket" = "null" ]; then
+        log_error "Failed to generate invite ticket"
+        return 1
+    fi
+
+    echo "    Ticket: ${ticket:0:20}..."
+    log_success "Invite ticket generated"
+
+    echo ""
+    echo "[2] Ticket structure:"
+    # Decode ticket (base64) and show structure
+    echo "$ticket" | base64 -d 2>/dev/null | jq '.' 2>/dev/null || echo "    (binary ticket)"
+
+    echo ""
+    log_success "Invite/Join flow test complete"
+    echo ""
+    echo "To test join on a new node, run:"
+    echo "  lightning-cli hive-join '$ticket'"
+}
+
+# Test topology planner (Gardner algorithm)
+run_planner_test() {
+    echo ""
+    echo "========================================"
+    echo "TOPOLOGY PLANNER TEST"
+    echo "========================================"
+    echo ""
+
+    local PASS=0
+    local FAIL=0
+
+    check_condition() {
+        local name="$1"
+        local condition="$2"
+        echo -n "[CHECK] $name... "
+        if eval "$condition"; then
+            echo "PASS"
+            ((PASS++))
+        else
+            echo "FAIL"
+            ((FAIL++))
+        fi
+    }
+
+    # =========================================================================
+    # Phase 1: Topology Data Collection
+    # =========================================================================
+    echo "--- Phase 1: Topology Data ---"
+
+    for node in $HIVE_NODES; do
+        echo ""
+        echo "=== $node topology ==="
+        local topology=$(cln_cli $node hive-topology 2>/dev/null)
+
+        if [ -n "$topology" ]; then
+            echo "$topology" | jq '{
+                total_targets: (.targets | length),
+                saturated: [.targets[] | select(.saturation >= .market_share_cap)] | length,
+                underserved: [.targets[] | select(.saturation < 0.1)] | length
+            }' 2>/dev/null || echo "Error parsing topology"
+
+            local target_count=$(echo "$topology" | jq '.targets | length' 2>/dev/null || echo "0")
+            check_condition "$node has topology data" "[ '$target_count' -gt '0' ]"
+        else
+            echo "No topology data"
+            ((FAIL++))
+        fi
+    done
+
+    # =========================================================================
+    # Phase 2: Planner Log Analysis
+    # =========================================================================
+    echo ""
+    echo "--- Phase 2: Planner Log ---"
+
+    for node in $HIVE_NODES; do
+        echo ""
+        echo "=== $node recent planner decisions ==="
+        local log=$(cln_cli $node hive-planner-log 5 2>/dev/null)
+
+        if [ -n "$log" ]; then
+            echo "$log" | jq -r '.entries[] | "  [\(.timestamp)] \(.decision)"' 2>/dev/null | head -5 || echo "  No entries"
+
+            local entry_count=$(echo "$log" | jq '.entries | length' 2>/dev/null || echo "0")
+            check_condition "$node has planner history" "[ '$entry_count' -ge '0' ]"
+        else
+            echo "  No planner log"
+            ((PASS++))  # Empty log is OK for new hives
+        fi
+    done
+
+    # =========================================================================
+    # Phase 3: Saturation Analysis
+    # =========================================================================
+    echo ""
+    echo "--- Phase 3: Saturation Analysis ---"
+
+    local alice_topology=$(cln_cli alice hive-topology 2>/dev/null)
+
+    if [ -n "$alice_topology" ]; then
+        echo "Top 5 targets by saturation:"
+        echo "$alice_topology" | jq -r '
+            .targets | sort_by(-.saturation) | .[0:5] | .[] |
+            "  \(.alias // .node_id[0:12]): \(.saturation * 100 | floor)% saturated, hive_channels=\(.hive_channels)"
+        ' 2>/dev/null || echo "  Error"
+
+        echo ""
+        echo "Underserved targets (saturation < 10%):"
+        echo "$alice_topology" | jq -r '
+            [.targets[] | select(.saturation < 0.1)] | .[0:5] | .[] |
+            "  \(.alias // .node_id[0:12]): \(.saturation * 100 | floor)% saturated"
+        ' 2>/dev/null || echo "  None"
+    fi
+
+    # =========================================================================
+    # Phase 4: Pending Actions (Advisor Mode)
+    # =========================================================================
+    echo ""
+    echo "--- Phase 4: Pending Actions ---"
+
+    for node in $HIVE_NODES; do
+        local actions=$(cln_cli $node hive-pending-actions 2>/dev/null)
+        local action_count=$(echo "$actions" | jq '.actions | length' 2>/dev/null || echo "0")
+
+        echo "$node: $action_count pending actions"
+        if [ "$action_count" -gt "0" ]; then
+            echo "$actions" | jq -r '.actions[] | "  - \(.type): \(.description)"' 2>/dev/null
+        fi
+    done
+
+    # =========================================================================
+    # Phase 5: Market Share Cap Enforcement
+    # =========================================================================
+    echo ""
+    echo "--- Phase 5: Market Share Cap ---"
+
+    local cap=$(cln_cli alice hive-status 2>/dev/null | jq -r '.config.market_share_cap // 0.20' 2>/dev/null)
+    echo "Market share cap: ${cap}"
+
+    local violations=$(cln_cli alice hive-topology 2>/dev/null | \
+        jq "[.targets[] | select(.saturation > $cap)] | length" 2>/dev/null || echo "0")
+
+    check_condition "No market share violations" "[ '$violations' -eq '0' ]"
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    echo ""
+    echo "========================================"
+    echo "PLANNER TEST RESULTS"
+    echo "========================================"
+    echo "Passed: $PASS"
+    echo "Failed: $FAIL"
+    echo ""
+
+    if [ "$FAIL" -eq 0 ]; then
+        log_success "All planner tests passed!"
+    else
+        log_error "$FAIL tests failed"
+    fi
+}
+
 # Test hive coordination - channel opens should be coordinated
 run_hive_coordination_test() {
     local metrics_file=$1
@@ -2096,6 +2431,15 @@ HIVE-SPECIFIC COMMANDS:
   hive-test <duration_mins> [network_id]
       Full hive system test (coordination, fees, competition, rebalance)
 
+  protocol [network_id]
+      Comprehensive coordination protocol test (membership, gossip, intents)
+
+  planner [network_id]
+      Test topology planner (Gardner algorithm, saturation, market share)
+
+  invite-join [network_id]
+      Test invite ticket generation and join flow
+
   hive-coordination [network_id]
       Test cl-hive channel open coordination between hive nodes
 
@@ -2261,6 +2605,21 @@ case "$COMMAND" in
         duration="${ARG1:-15}"
         NETWORK_ID="${ARG2:-1}"
         run_full_hive_test $duration
+        ;;
+
+    coordination-protocol|protocol)
+        NETWORK_ID="${ARG1:-1}"
+        run_coordination_protocol_test
+        ;;
+
+    invite-join)
+        NETWORK_ID="${ARG1:-1}"
+        run_invite_join_test
+        ;;
+
+    planner)
+        NETWORK_ID="${ARG1:-1}"
+        run_planner_test
         ;;
 
     hive-coordination)

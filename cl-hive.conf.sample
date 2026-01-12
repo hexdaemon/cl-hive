@@ -52,10 +52,10 @@ hive-ban-autotrigger=false
 # ============================================================================
 
 # Maximum Hive members (Dunbar cap for gossip efficiency)
-hive-max-members=50
+hive-max-members=9
 
 # Maximum market share per target (anti-monopoly, 0.20 = 20%)
-hive-market-share-cap=0.20
+hive-market-share-cap=0.10
 
 # ============================================================================
 # COORDINATION PROTOCOL
