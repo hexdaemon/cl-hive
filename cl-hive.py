@@ -2095,6 +2095,43 @@ def hive_status(plugin: Plugin):
     }
 
 
+@plugin.method("hive-reinit-bridge")
+def hive_reinit_bridge(plugin: Plugin):
+    """
+    Re-attempt bridge initialization if it failed at startup.
+
+    Useful for recovering from startup race conditions where cl-revenue-ops
+    wasn't ready when cl-hive initialized. Also useful after cl-revenue-ops
+    is installed or restarted.
+
+    Returns:
+        Dict with bridge status and details.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not bridge:
+        return {"error": "Bridge module not initialized"}
+
+    previous_status = bridge.status.value
+    new_status = bridge.reinitialize()
+
+    return {
+        "previous_status": previous_status,
+        "new_status": new_status.value,
+        "revenue_ops_version": bridge._revenue_ops_version,
+        "clboss_available": bridge._clboss_available,
+        "message": (
+            "Bridge enabled successfully" if new_status == BridgeStatus.ENABLED
+            else "Bridge still disabled - check cl-revenue-ops installation"
+        )
+    }
+
+
 @plugin.method("hive-members")
 def hive_members(plugin: Plugin):
     """

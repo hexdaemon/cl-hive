@@ -37,6 +37,10 @@ HALF_OPEN_SUCCESS_THRESHOLD = 3  # Consecutive successes needed to close circuit
 # Minimum required version of cl-revenue-ops
 MIN_REVENUE_OPS_VERSION = (1, 4, 0)
 
+# Startup retry configuration (Issue: plugin startup race condition)
+STARTUP_RETRY_ATTEMPTS = 5        # Number of retries for cl-revenue-ops detection
+STARTUP_RETRY_BASE_DELAY = 1.0    # Base delay in seconds (doubles each retry)
+
 # Security hardening (Issue #27)
 POLICY_RATE_LIMIT_SECONDS = 60       # Min seconds between policy changes per peer
 MAX_REBALANCE_SATS = 10_000_000      # 0.1 BTC max per single rebalance (safety cap)
@@ -267,27 +271,63 @@ class Bridge:
     def initialize(self) -> BridgeStatus:
         """
         Detect available integrations and verify versions.
-        
-        Should be called once during plugin startup.
-        
+
+        Should be called once during plugin startup. Uses exponential backoff
+        retry to handle plugin startup race conditions where cl-revenue-ops
+        may not be fully initialized yet.
+
         Returns:
             BridgeStatus indicating availability
         """
-        revenue_ops_ok = self._detect_revenue_ops()
+        revenue_ops_ok = False
+
+        # Retry with exponential backoff to handle startup race condition
+        for attempt in range(STARTUP_RETRY_ATTEMPTS):
+            revenue_ops_ok = self._detect_revenue_ops()
+            if revenue_ops_ok:
+                break
+
+            # Don't sleep after the last attempt
+            if attempt < STARTUP_RETRY_ATTEMPTS - 1:
+                delay = STARTUP_RETRY_BASE_DELAY * (2 ** attempt)
+                self._log(
+                    f"cl-revenue-ops not ready, retry {attempt + 1}/{STARTUP_RETRY_ATTEMPTS} "
+                    f"in {delay:.1f}s",
+                    level='debug'
+                )
+                time.sleep(delay)
+
         clboss_ok = self._detect_clboss()
-        
+
         if revenue_ops_ok:
             self._status = BridgeStatus.ENABLED
             self._log(f"Bridge enabled: cl-revenue-ops {self._revenue_ops_version}")
         else:
             self._status = BridgeStatus.DISABLED
             self._log("Bridge disabled: cl-revenue-ops not available", level='warn')
-        
+
         if clboss_ok:
             self._log("CLBoss integration available")
-        
+
         return self._status
-    
+
+    def reinitialize(self) -> BridgeStatus:
+        """
+        Re-attempt bridge initialization if currently disabled.
+
+        Useful for recovering from startup race conditions or after
+        cl-revenue-ops is installed/restarted.
+
+        Returns:
+            BridgeStatus indicating new availability
+        """
+        if self._status == BridgeStatus.ENABLED:
+            self._log("Bridge already enabled, skipping reinitialize")
+            return self._status
+
+        self._log("Attempting bridge re-initialization")
+        return self.initialize()
+
     def _detect_revenue_ops(self) -> bool:
         """
         Detect cl-revenue-ops plugin and verify version.
