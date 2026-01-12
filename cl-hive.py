@@ -2189,6 +2189,200 @@ def hive_planner_log(plugin: Plugin, limit: int = 50):
     }
 
 
+@plugin.method("hive-test-intent")
+def hive_test_intent(plugin: Plugin, target: str, intent_type: str = "channel_open",
+                     broadcast: bool = True):
+    """
+    Create and optionally broadcast a test intent (for simulation/testing).
+
+    This command is for testing the Intent Lock Protocol and conflict resolution.
+
+    Args:
+        target: Target peer pubkey for the intent
+        intent_type: Type of intent (channel_open, rebalance, ban_peer)
+        broadcast: Whether to broadcast to Hive members (default: True)
+
+    Returns:
+        Dict with intent details and broadcast result.
+
+    Example:
+        lightning-cli hive-test-intent 02abc123...
+    """
+    # Permission check: Admin only (test commands)
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not planner or not planner.intent_manager:
+        return {"error": "Intent manager not initialized"}
+
+    intent_mgr = planner.intent_manager
+
+    try:
+        # Create the intent
+        intent = intent_mgr.create_intent(intent_type, target)
+
+        result = {
+            "intent_id": intent.intent_id,
+            "intent_type": intent.intent_type,
+            "target": target,
+            "initiator": intent.initiator,
+            "timestamp": intent.timestamp,
+            "expires_at": intent.expires_at,
+            "hold_seconds": intent.expires_at - intent.timestamp,
+            "status": intent.status,
+            "broadcast": False,
+            "broadcast_count": 0
+        }
+
+        # Broadcast if requested
+        if broadcast:
+            success = planner._broadcast_intent(intent)
+            result["broadcast"] = success
+            if success:
+                members = database.get_all_members()
+                our_id = plugin.rpc.getinfo()['id']
+                result["broadcast_count"] = len([m for m in members if m.get('peer_id') != our_id])
+
+        return result
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("hive-intent-status")
+def hive_intent_status(plugin: Plugin):
+    """
+    Get current intent status (local and remote intents).
+
+    Returns:
+        Dict with pending intents and stats.
+    """
+    if not planner or not planner.intent_manager:
+        return {"error": "Intent manager not initialized"}
+
+    intent_mgr = planner.intent_manager
+    stats = intent_mgr.get_intent_stats()
+
+    # Get pending local intents from DB
+    pending = database.get_pending_intents() if database else []
+
+    # Get remote intents from cache
+    remote = intent_mgr.get_remote_intents()
+
+    return {
+        "local_pending": len(pending),
+        "local_intents": pending,
+        "remote_cached": len(remote),
+        "remote_intents": [r.to_dict() for r in remote],
+        "stats": stats
+    }
+
+
+@plugin.method("hive-test-pending-action")
+def hive_test_pending_action(plugin: Plugin, action_type: str = "channel_open",
+                              target: str = None, capacity_sats: int = 1000000,
+                              reason: str = "test_action"):
+    """
+    Create a test pending action for AI advisor testing.
+
+    This command creates an entry in the pending_actions table that the AI
+    advisor can evaluate. Use this to test the advisor without triggering
+    the actual planner.
+
+    Args:
+        action_type: Type of action (channel_open, ban, unban, expand)
+        target: Target peer pubkey (default: uses first external node in graph)
+        capacity_sats: Proposed capacity for channel_open (default: 1M sats)
+        reason: Reason for the action (default: test_action)
+
+    Returns:
+        Dict with the created pending action details.
+
+    Example:
+        lightning-cli hive-test-pending-action
+        lightning-cli hive-test-pending-action channel_open 02abc123... 500000 "underserved_target"
+    """
+    # Permission check: Admin only (test commands)
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Get a target if not specified
+    if not target:
+        # Try to find an external node from the network graph
+        try:
+            channels = plugin.rpc.listchannels()
+            our_id = plugin.rpc.getinfo()['id']
+            members = database.get_all_members()
+            member_ids = {m['peer_id'] for m in members}
+
+            # Find a node that's not in our hive
+            for ch in channels.get('channels', []):
+                candidate = ch.get('destination')
+                if candidate and candidate not in member_ids and candidate != our_id:
+                    target = candidate
+                    break
+
+            if not target:
+                return {"error": "No external target found in graph. Specify target manually."}
+        except Exception as e:
+            return {"error": f"Failed to find target: {e}"}
+
+    # Build payload based on action type
+    if action_type == "channel_open":
+        # Create an intent for channel_open actions (required for approval)
+        intent_id = None
+        if planner and planner.intent_manager:
+            try:
+                intent = planner.intent_manager.create_intent("channel_open", target)
+                intent_id = intent.intent_id
+            except Exception as e:
+                return {"error": f"Failed to create intent: {e}"}
+        else:
+            return {"error": "Intent manager not initialized (required for channel_open)"}
+
+        payload = {
+            "target": target,
+            "capacity_sats": capacity_sats,
+            "reason": reason,
+            "intent_id": intent_id,
+            "scoring": {
+                "connectivity_score": 0.8,
+                "fee_score": 0.7,
+                "capacity_score": 0.6
+            }
+        }
+    elif action_type == "ban":
+        payload = {
+            "target": target,
+            "reason": reason,
+            "evidence": "test_evidence"
+        }
+    else:
+        payload = {
+            "target": target,
+            "action_type": action_type,
+            "reason": reason
+        }
+
+    try:
+        action_id = database.add_pending_action(action_type, payload, expires_hours=24)
+        return {
+            "status": "created",
+            "action_id": action_id,
+            "action_type": action_type,
+            "target": target,
+            "payload": payload,
+            "expires_in_hours": 24
+        }
+    except Exception as e:
+        return {"error": f"Failed to create pending action: {e}"}
+
+
 @plugin.method("hive-pending-actions")
 def hive_pending_actions(plugin: Plugin):
     """
@@ -2415,6 +2609,40 @@ def hive_set_mode(plugin: Plugin, mode: str):
         "status": "ok",
         "previous_mode": previous_mode,
         "current_mode": mode_lower,
+    }
+
+
+@plugin.method("hive-enable-expansions")
+def hive_enable_expansions(plugin: Plugin, enabled: bool = True):
+    """
+    Enable or disable expansion proposals at runtime.
+
+    Args:
+        enabled: True to enable expansions, False to disable (default: True)
+
+    Returns:
+        Dict with new setting.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not config:
+        return {"error": "Config not initialized"}
+
+    previous = config.planner_enable_expansions
+    config.planner_enable_expansions = enabled
+    config._version += 1
+
+    plugin.log(f"cl-hive: Expansion proposals {'enabled' if enabled else 'disabled'}")
+
+    return {
+        "status": "ok",
+        "previous_setting": previous,
+        "expansions_enabled": enabled,
     }
 
 
