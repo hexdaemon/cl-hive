@@ -2386,6 +2386,47 @@ test_hive_rpc() {
         fi
     done
 
+    # =========================================================================
+    # Test action management commands (Phase 2)
+    # =========================================================================
+    log_info "Testing action management commands..."
+
+    run_test "hive-pending-actions returns object" \
+        "hive_cli alice hive-pending-actions | jq -e 'type == \"object\"'"
+
+    run_test "hive-pending-actions has count" \
+        "hive_cli alice hive-pending-actions | jq -e '.count >= 0'"
+
+    run_test "hive-pending-actions has actions array" \
+        "hive_cli alice hive-pending-actions | jq -e '.actions | type == \"array\"'"
+
+    run_test "hive-budget-summary returns object" \
+        "hive_cli alice hive-budget-summary | jq -e 'type == \"object\"'"
+
+    run_test "hive-budget-summary has daily_budget_sats" \
+        "hive_cli alice hive-budget-summary | jq -e '.daily_budget_sats > 0'"
+
+    run_test "hive-budget-summary has governance_mode" \
+        "hive_cli alice hive-budget-summary | jq -e '.governance_mode != null'"
+
+    # Test with days parameter
+    run_test "hive-budget-summary accepts days param" \
+        "hive_cli alice hive-budget-summary days=14 | jq -e 'type == \"object\"'"
+
+    # Test action management across nodes
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            NODE_STATUS=$(hive_cli $node hive-status 2>/dev/null | jq -r '.status // "none"')
+            if [ "$NODE_STATUS" = "active" ]; then
+                run_test "$node hive-pending-actions works" \
+                    "hive_cli $node hive-pending-actions | jq -e '.count >= 0'"
+
+                run_test "$node hive-budget-summary works" \
+                    "hive_cli $node hive-budget-summary | jq -e '.daily_budget_sats > 0'"
+            fi
+        fi
+    done
+
     log_info "RPC modularization tests complete"
 }
 

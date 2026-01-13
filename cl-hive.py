@@ -82,6 +82,10 @@ from modules.rpc_commands import (
     vpn_status as rpc_vpn_status,
     vpn_add_peer as rpc_vpn_add_peer,
     vpn_remove_peer as rpc_vpn_remove_peer,
+    pending_actions as rpc_pending_actions,
+    approve_action as rpc_approve_action,
+    reject_action as rpc_reject_action,
+    budget_summary as rpc_budget_summary,
 )
 
 # Initialize the plugin
@@ -399,6 +403,10 @@ def _get_hive_context() -> HiveContext:
     # coop_expansion is the global name, not coop_expansion_mgr
     _coop_expansion = coop_expansion if 'coop_expansion' in globals() else None
 
+    # Create a log wrapper that calls plugin.log
+    def _log(msg: str, level: str = 'info'):
+        plugin.log(msg, level=level)
+
     return HiveContext(
         database=_database,
         config=_config,
@@ -411,6 +419,7 @@ def _get_hive_context() -> HiveContext:
         intent_mgr=_intent_mgr,
         membership_mgr=_membership_mgr,
         coop_expansion_mgr=_coop_expansion,
+        log=_log,
     )
 
 
@@ -4693,14 +4702,7 @@ def hive_pending_actions(plugin: Plugin):
     Returns:
         Dict with list of pending actions.
     """
-    if not database:
-        return {"error": "Database not initialized"}
-
-    actions = database.get_pending_actions()
-    return {
-        "count": len(actions),
-        "actions": actions,
-    }
+    return rpc_pending_actions(_get_hive_context())
 
 
 @plugin.method("hive-approve-action")
@@ -4719,281 +4721,7 @@ def hive_approve_action(plugin: Plugin, action_id: int, amount_sats: int = None)
 
     Permission: Member or Admin only
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
-    if perm_error:
-        return perm_error
-
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Get the action
-    action = database.get_pending_action_by_id(action_id)
-    if not action:
-        return {"error": "Action not found", "action_id": action_id}
-
-    if action['status'] != 'pending':
-        return {"error": f"Action already {action['status']}", "action_id": action_id}
-
-    # Check if expired
-    now = int(time.time())
-    if action.get('expires_at') and now > action['expires_at']:
-        database.update_action_status(action_id, 'expired')
-        return {"error": "Action has expired", "action_id": action_id}
-
-    action_type = action['action_type']
-    payload = action['payload']
-
-    # Execute based on action type
-    if action_type == 'channel_open':
-        # Extract channel details from payload
-        target = payload.get('target')
-        context = payload.get('context', {})
-        intent_id = context.get('intent_id') or payload.get('intent_id')
-
-        # Get channel size from context (planner) or top-level (cooperative expansion)
-        proposed_size = (
-            context.get('channel_size_sats') or
-            context.get('amount_sats') or
-            payload.get('amount_sats') or
-            payload.get('channel_size_sats') or
-            1_000_000  # Default 1M sats
-        )
-
-        # Apply member override if provided
-        if amount_sats is not None:
-            channel_size_sats = amount_sats
-            override_applied = True
-        else:
-            channel_size_sats = proposed_size
-            override_applied = False
-
-        if not target:
-            return {"error": "Missing target in action payload", "action_id": action_id}
-
-        # Calculate intelligent budget limits
-        cfg = config.snapshot() if config else None
-        budget_info = {}
-        if cfg:
-            # Get onchain balance for reserve calculation
-            try:
-                funds = safe_plugin.rpc.listfunds()
-                onchain_sats = sum(o.get('amount_msat', 0) // 1000 for o in funds.get('outputs', [])
-                                   if o.get('status') == 'confirmed')
-            except Exception:
-                onchain_sats = 0
-
-            # Calculate budget components:
-            # 1. Daily budget remaining
-            daily_remaining = database.get_available_budget(cfg.autonomous_budget_per_day)
-
-            # 2. Onchain reserve limit (keep reserve_pct for future expansion)
-            spendable_onchain = int(onchain_sats * (1.0 - cfg.budget_reserve_pct))
-
-            # 3. Max per-channel limit (percentage of daily budget)
-            max_per_channel = int(cfg.autonomous_budget_per_day * cfg.budget_max_per_channel_pct)
-
-            # Effective budget is the minimum of all constraints
-            effective_budget = min(daily_remaining, spendable_onchain, max_per_channel)
-
-            budget_info = {
-                "onchain_sats": onchain_sats,
-                "reserve_pct": cfg.budget_reserve_pct,
-                "spendable_onchain": spendable_onchain,
-                "daily_budget": cfg.autonomous_budget_per_day,
-                "daily_remaining": daily_remaining,
-                "max_per_channel_pct": cfg.budget_max_per_channel_pct,
-                "max_per_channel": max_per_channel,
-                "effective_budget": effective_budget,
-            }
-
-            if channel_size_sats > effective_budget:
-                # Reduce to effective budget if it's above minimum
-                if effective_budget >= cfg.planner_min_channel_sats:
-                    plugin.log(
-                        f"cl-hive: Reducing channel size from {channel_size_sats:,} to {effective_budget:,} "
-                        f"due to budget constraints (daily={daily_remaining:,}, reserve={spendable_onchain:,}, "
-                        f"per-channel={max_per_channel:,})",
-                        level='info'
-                    )
-                    channel_size_sats = effective_budget
-                else:
-                    limiting_factor = "daily budget" if daily_remaining == effective_budget else \
-                                     "reserve limit" if spendable_onchain == effective_budget else \
-                                     "per-channel limit"
-                    return {
-                        "error": f"Insufficient budget for channel open ({limiting_factor})",
-                        "action_id": action_id,
-                        "requested_sats": channel_size_sats,
-                        "effective_budget_sats": effective_budget,
-                        "min_channel_sats": cfg.planner_min_channel_sats,
-                        "budget_info": budget_info,
-                    }
-
-            # Validate member override is within bounds
-            if override_applied and channel_size_sats < cfg.planner_min_channel_sats:
-                return {
-                    "error": f"Override amount {channel_size_sats:,} below minimum {cfg.planner_min_channel_sats:,}",
-                    "action_id": action_id,
-                    "min_channel_sats": cfg.planner_min_channel_sats,
-                }
-
-        # Get intent from database (if available)
-        intent_record = None
-        if intent_id and database:
-            intent_record = database.get_intent_by_id(intent_id)
-
-        # Step 1: Broadcast the intent to all hive members (coordination)
-        broadcast_count = 0
-        if intent_mgr and intent_record:
-            try:
-                from modules.intent_manager import Intent
-                intent = Intent(
-                    intent_id=intent_record['id'],
-                    intent_type=intent_record['intent_type'],
-                    target=intent_record['target'],
-                    initiator=intent_record['initiator'],
-                    timestamp=intent_record['timestamp'],
-                    expires_at=intent_record['expires_at'],
-                    status=intent_record['status']
-                )
-
-                # Broadcast to all members
-                intent_payload = intent_mgr.create_intent_message(intent)
-                msg = serialize(HiveMessageType.INTENT, intent_payload)
-                members = database.get_all_members()
-
-                for member in members:
-                    member_id = member.get('peer_id')
-                    if not member_id or member_id == our_pubkey:
-                        continue
-                    try:
-                        safe_plugin.rpc.call("sendcustommsg", {
-                            "node_id": member_id,
-                            "msg": msg.hex()
-                        })
-                        broadcast_count += 1
-                    except Exception:
-                        pass
-
-                plugin.log(f"cl-hive: Broadcast intent to {broadcast_count} hive members")
-
-            except Exception as e:
-                plugin.log(f"cl-hive: Intent broadcast failed: {e}", level='warn')
-
-        # Step 2: Connect to target if not already connected
-        try:
-            # Check if already connected
-            peers = safe_plugin.rpc.listpeers(target)
-            if not peers.get('peers'):
-                # Try to connect (will fail if no address known, but that's OK)
-                try:
-                    safe_plugin.rpc.connect(target)
-                    plugin.log(f"cl-hive: Connected to {target[:16]}...")
-                except Exception as conn_err:
-                    plugin.log(f"cl-hive: Could not connect to {target[:16]}...: {conn_err}", level='warn')
-                    # Continue anyway - fundchannel might still work if peer connects to us
-        except Exception:
-            pass
-
-        # Step 3: Execute fundchannel to actually open the channel
-        try:
-            plugin.log(
-                f"cl-hive: Opening channel to {target[:16]}... "
-                f"for {channel_size_sats:,} sats"
-            )
-
-            # fundchannel with the calculated size
-            # Use rpc.call() for explicit control over parameter names
-            result = safe_plugin.rpc.call("fundchannel", {
-                "id": target,
-                "amount": channel_size_sats,
-                "announce": True  # Public channel
-            })
-
-            channel_id = result.get('channel_id', 'unknown')
-            txid = result.get('txid', 'unknown')
-
-            plugin.log(
-                f"cl-hive: Channel opened! txid={txid[:16]}... "
-                f"channel_id={channel_id}"
-            )
-
-            # Update intent status if we have one
-            if intent_id and database:
-                database.update_intent_status(intent_id, 'committed')
-
-            # Update action status
-            database.update_action_status(action_id, 'executed')
-
-            # Record budget spending
-            database.record_budget_spend(
-                action_type='channel_open',
-                amount_sats=channel_size_sats,
-                target=target,
-                action_id=action_id
-            )
-            plugin.log(f"cl-hive: Recorded budget spend of {channel_size_sats:,} sats", level='debug')
-
-            result = {
-                "status": "executed",
-                "action_id": action_id,
-                "action_type": action_type,
-                "target": target,
-                "channel_size_sats": channel_size_sats,
-                "proposed_size_sats": proposed_size,
-                "channel_id": channel_id,
-                "txid": txid,
-                "broadcast_count": broadcast_count,
-                "sizing_reasoning": context.get('sizing_reasoning', 'N/A'),
-            }
-            if channel_size_sats < proposed_size:
-                result["budget_reduced"] = True
-                result["reduction_reason"] = (
-                    f"Reduced from {proposed_size:,} to {channel_size_sats:,} sats due to budget constraints"
-                )
-            if override_applied:
-                result["override_applied"] = True
-                result["override_amount"] = amount_sats
-            if budget_info:
-                result["budget_info"] = budget_info
-            return result
-
-        except Exception as e:
-            error_msg = str(e)
-            plugin.log(f"cl-hive: fundchannel failed: {error_msg}", level='error')
-
-            # Update action status to failed
-            database.update_action_status(action_id, 'failed')
-
-            result = {
-                "status": "failed",
-                "action_id": action_id,
-                "action_type": action_type,
-                "target": target,
-                "channel_size_sats": channel_size_sats,
-                "proposed_size_sats": proposed_size,
-                "error": error_msg,
-                "broadcast_count": broadcast_count,
-            }
-            if channel_size_sats < proposed_size:
-                result["budget_reduced"] = True
-                result["reduction_reason"] = (
-                    f"Reduced from {proposed_size:,} to {channel_size_sats:,} sats due to budget constraints"
-                )
-            if budget_info:
-                result["budget_info"] = budget_info
-            return result
-
-    else:
-        # Unknown action type - just mark as approved
-        database.update_action_status(action_id, 'approved')
-        return {
-            "status": "approved",
-            "action_id": action_id,
-            "action_type": action_type,
-            "note": "Unknown action type, marked as approved only"
-        }
+    return rpc_approve_action(_get_hive_context(), action_id, amount_sats)
 
 
 @plugin.method("hive-reject-action")
@@ -5009,38 +4737,7 @@ def hive_reject_action(plugin: Plugin, action_id: int):
 
     Permission: Member or Admin only
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
-    if perm_error:
-        return perm_error
-
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Get the action
-    action = database.get_pending_action_by_id(action_id)
-    if not action:
-        return {"error": "Action not found", "action_id": action_id}
-
-    if action['status'] != 'pending':
-        return {"error": f"Action already {action['status']}", "action_id": action_id}
-
-    # Also abort the associated intent if it exists
-    payload = action['payload']
-    intent_id = payload.get('intent_id')
-    if intent_id:
-        database.update_intent_status(intent_id, 'aborted')
-
-    # Update action status
-    database.update_action_status(action_id, 'rejected')
-
-    plugin.log(f"cl-hive: Rejected action {action_id}")
-
-    return {
-        "status": "rejected",
-        "action_id": action_id,
-        "action_type": action['action_type'],
-    }
+    return rpc_reject_action(_get_hive_context(), action_id)
 
 
 @plugin.method("hive-budget-summary")
@@ -5056,26 +4753,7 @@ def hive_budget_summary(plugin: Plugin, days: int = 7):
 
     Permission: Member or Admin only
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
-    if perm_error:
-        return perm_error
-
-    if not database:
-        return {"error": "Database not initialized"}
-
-    cfg = config.snapshot() if config else None
-    if not cfg:
-        return {"error": "Config not initialized"}
-
-    daily_budget = cfg.autonomous_budget_per_day
-    summary = database.get_budget_summary(daily_budget, days)
-
-    return {
-        "daily_budget_sats": daily_budget,
-        "governance_mode": cfg.governance_mode,
-        **summary
-    }
+    return rpc_budget_summary(_get_hive_context(), days)
 
 
 @plugin.method("hive-set-mode")
