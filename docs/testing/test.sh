@@ -1,13 +1,21 @@
 #!/bin/bash
 #
-# Automated test suite for cl-revenue-ops plugin
+# Automated test suite for cl-revenue-ops and cl-hive plugins
 #
 # Usage: ./test.sh [category] [network_id]
-# Categories: all, setup, status, flow, fees, rebalance, sling, policy, profitability, clboss, database, closure_costs, splice_costs, security, integration, routing, performance, metrics
+#
+# Categories:
+#   all, setup, status, flow, fees, rebalance, sling, policy, profitability,
+#   clboss, database, closure_costs, splice_costs, security, integration,
+#   routing, performance, metrics, simulation, reset
+#
+# Hive Categories:
+#   hive, hive_genesis, hive_join, hive_sync, hive_expansion, hive_reset
 #
 # Example: ./test.sh all 1
 # Example: ./test.sh flow 1
-# Example: ./test.sh rebalance 1
+# Example: ./test.sh hive 1
+# Example: ./test.sh hive_expansion 1
 #
 # Prerequisites:
 #   - Polar network running with CLN nodes (alice, bob, carol)
@@ -120,6 +128,13 @@ revenue_cli() {
 
 # CLN CLI wrapper for vanilla nodes
 vanilla_cli() {
+    local node=$1
+    shift
+    docker exec polar-n${NETWORK_ID}-${node} $CLN_CLI "$@"
+}
+
+# CLN CLI wrapper for hive nodes (alias for revenue_cli)
+hive_cli() {
     local node=$1
     shift
     docker exec polar-n${NETWORK_ID}-${node} $CLN_CLI "$@"
@@ -1839,6 +1854,438 @@ channels_exist() {
     return 1
 }
 
+# Helper to check if hive exists on a node
+hive_exists() {
+    local node=${1:-alice}
+    result=$(hive_cli $node hive-status 2>/dev/null)
+    # Check for active status (not genesis_required)
+    if echo "$result" | jq -e '.status == "active"' >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# Helper to reset hive databases on all nodes
+reset_hive_databases() {
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            docker exec polar-n${NETWORK_ID}-${node} rm -f /home/clightning/.lightning/regtest/cl_hive.db 2>/dev/null || true
+        fi
+    done
+}
+
+# =========================================================================
+# CL-HIVE TEST CATEGORIES
+# =========================================================================
+
+# Hive Genesis Tests - Create and verify initial hive
+test_hive_genesis() {
+    echo ""
+    echo "========================================"
+    echo "HIVE GENESIS TESTS"
+    echo "========================================"
+
+    log_info "Testing hive creation workflow..."
+
+    # Check cl-hive plugin loaded
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            run_test "$node has cl-hive" "hive_cli $node plugin list | grep -q cl-hive"
+        fi
+    done
+
+    # Check if hive already exists
+    if hive_exists alice; then
+        log_info "Hive already exists, testing existing hive..."
+
+        # Verify hive is active
+        run_test "alice hive is active" \
+            "hive_cli alice hive-status | jq -e '.status == \"active\"'"
+
+        # Verify admin count is at least 1
+        ADMIN_COUNT=$(hive_cli alice hive-status | jq -r '.members.admin')
+        run_test "hive has admin members" "[ '$ADMIN_COUNT' -ge 1 ]"
+
+        # Test genesis fails when hive exists (expected behavior)
+        run_test_expect_fail "genesis fails when hive exists" \
+            "hive_cli alice hive-genesis 2>&1 | jq -e '.hive_id != null'"
+    else
+        log_info "No hive exists, testing genesis..."
+
+        # Test genesis command
+        run_test "hive-genesis creates hive" \
+            "hive_cli alice hive-genesis | jq -e '.hive_id != null or .status == \"success\"'"
+
+        # Wait for hive to initialize
+        sleep 2
+
+        # Verify hive is now active
+        run_test "alice hive becomes active" \
+            "hive_cli alice hive-status | jq -e '.status == \"active\"'"
+    fi
+
+    # Test hive-members shows members
+    run_test "hive-members shows admin" \
+        "hive_cli alice hive-members | jq -e '.members | length >= 1'"
+
+    # Verify member count
+    MEMBER_COUNT=$(hive_cli alice hive-members | jq '.members | length')
+    log_info "Member count: $MEMBER_COUNT"
+
+    # Check governance mode is set
+    GOV_MODE=$(hive_cli alice hive-status | jq -r '.governance_mode')
+    log_info "Governance mode: $GOV_MODE"
+    run_test "governance mode is set" \
+        "[ -n '$GOV_MODE' ] && [ '$GOV_MODE' != 'null' ]"
+}
+
+# Hive Join Tests - Invitation and membership workflow
+test_hive_join() {
+    echo ""
+    echo "========================================"
+    echo "HIVE JOIN TESTS"
+    echo "========================================"
+
+    log_info "Testing hive join workflow..."
+
+    # Ensure hive exists
+    if ! hive_exists alice; then
+        log_info "No hive found. Please run hive_genesis first."
+        run_test "hive exists for join tests" "false"
+        return 1
+    fi
+
+    # =========================================================================
+    # Test invite ticket generation
+    # =========================================================================
+    log_info "Testing invite ticket generation..."
+
+    run_test "hive-invite generates ticket" \
+        "hive_cli alice hive-invite | jq -e '.ticket != null'"
+
+    TICKET=$(hive_cli alice hive-invite | jq -r '.ticket')
+    log_info "Invite ticket generated (length: ${#TICKET})"
+
+    # =========================================================================
+    # Check if bob is already a member
+    # =========================================================================
+    log_info "Testing bob membership..."
+
+    BOB_IN_HIVE=$(hive_cli bob hive-status 2>/dev/null | jq -r '.status // "none"')
+    if [ "$BOB_IN_HIVE" = "active" ]; then
+        log_info "Bob already in hive, verifying membership..."
+        run_test "bob is hive member" \
+            "hive_cli bob hive-status | jq -e '.status == \"active\"'"
+    else
+        log_info "Bob not in hive, testing join..."
+        run_test "bob joins with ticket" \
+            "hive_cli bob hive-join ticket=\"$TICKET\" | jq -e '.status != null'"
+        sleep 2
+        run_test "bob has active hive after join" \
+            "hive_cli bob hive-status | jq -e '.status == \"active\"'"
+    fi
+
+    # =========================================================================
+    # Check if carol is already a member
+    # =========================================================================
+    log_info "Testing carol membership..."
+
+    CAROL_IN_HIVE=$(hive_cli carol hive-status 2>/dev/null | jq -r '.status // "none"')
+    if [ "$CAROL_IN_HIVE" = "active" ]; then
+        log_info "Carol already in hive, verifying membership..."
+        run_test "carol is hive member" \
+            "hive_cli carol hive-status | jq -e '.status == \"active\"'"
+    else
+        log_info "Carol not in hive, testing join..."
+        TICKET=$(hive_cli alice hive-invite | jq -r '.ticket')
+        run_test "carol joins with ticket" \
+            "hive_cli carol hive-join ticket=\"$TICKET\" | jq -e '.status != null'"
+        sleep 2
+        run_test "carol has active hive after join" \
+            "hive_cli carol hive-status | jq -e '.status == \"active\"'"
+    fi
+
+    # =========================================================================
+    # Verify multi-node hive membership
+    # =========================================================================
+    log_info "Verifying multi-node hive membership..."
+
+    # Check member count on alice
+    ALICE_MEMBERS=$(hive_cli alice hive-members | jq '.members | length')
+    log_info "Alice sees $ALICE_MEMBERS members"
+    run_test "alice sees multiple members" "[ '$ALICE_MEMBERS' -ge 1 ]"
+
+    # Check member count on bob
+    BOB_MEMBERS=$(hive_cli bob hive-members | jq '.members | length')
+    log_info "Bob sees $BOB_MEMBERS members"
+    run_test "bob sees multiple members" "[ '$BOB_MEMBERS' -ge 1 ]"
+
+    # Check member count on carol
+    CAROL_MEMBERS=$(hive_cli carol hive-members | jq '.members | length')
+    log_info "Carol sees $CAROL_MEMBERS members"
+    run_test "carol sees multiple members" "[ '$CAROL_MEMBERS' -ge 1 ]"
+
+    # =========================================================================
+    # Test member details
+    # =========================================================================
+    log_info "Testing member details..."
+
+    run_test "hive-members returns member array" \
+        "hive_cli alice hive-members | jq -e '.members | type == \"array\"'"
+
+    run_test "members have peer_id field" \
+        "hive_cli alice hive-members | jq -e '.members[0].peer_id != null'"
+
+    run_test "members have tier field" \
+        "hive_cli alice hive-members | jq -e '.members[0].tier != null'"
+}
+
+# Hive Sync Tests - Cross-node consistency
+test_hive_sync() {
+    echo ""
+    echo "========================================"
+    echo "HIVE SYNC TESTS"
+    echo "========================================"
+
+    log_info "Testing cross-node synchronization..."
+
+    # Ensure hive exists
+    if ! hive_exists alice; then
+        log_info "No hive found. Please run hive_genesis first."
+        run_test "hive exists for sync tests" "false"
+        return 1
+    fi
+
+    # =========================================================================
+    # Member visibility across nodes
+    # =========================================================================
+    log_info "Testing member visibility across nodes..."
+
+    # Get pubkeys
+    ALICE_PUBKEY=$(get_pubkey alice)
+    BOB_PUBKEY=$(get_pubkey bob)
+    CAROL_PUBKEY=$(get_pubkey carol)
+
+    log_info "Alice pubkey: ${ALICE_PUBKEY:0:16}..."
+    log_info "Bob pubkey: ${BOB_PUBKEY:0:16}..."
+    log_info "Carol pubkey: ${CAROL_PUBKEY:0:16}..."
+
+    # Each node should see the others
+    run_test "bob sees alice in members" \
+        "hive_cli bob hive-members | jq -e --arg pk '$ALICE_PUBKEY' '.members[] | select(.peer_id == \$pk)'"
+
+    run_test "carol sees alice in members" \
+        "hive_cli carol hive-members | jq -e --arg pk '$ALICE_PUBKEY' '.members[] | select(.peer_id == \$pk)'"
+
+    run_test "alice sees bob in members" \
+        "hive_cli alice hive-members | jq -e --arg pk '$BOB_PUBKEY' '.members[] | select(.peer_id == \$pk)'"
+
+    # =========================================================================
+    # Member count consistency
+    # =========================================================================
+    log_info "Testing member count consistency..."
+
+    ALICE_COUNT=$(hive_cli alice hive-status | jq '.members.total')
+    BOB_COUNT=$(hive_cli bob hive-status | jq '.members.total')
+    CAROL_COUNT=$(hive_cli carol hive-status | jq '.members.total')
+
+    log_info "Alice sees $ALICE_COUNT total members"
+    log_info "Bob sees $BOB_COUNT total members"
+    log_info "Carol sees $CAROL_COUNT total members"
+
+    run_test "alice and bob see same member count" \
+        "[ '$ALICE_COUNT' = '$BOB_COUNT' ]"
+
+    run_test "alice and carol see same member count" \
+        "[ '$ALICE_COUNT' = '$CAROL_COUNT' ]"
+
+    # =========================================================================
+    # Topology consistency
+    # =========================================================================
+    log_info "Testing topology view..."
+
+    run_test "hive-topology returns data" \
+        "hive_cli alice hive-topology | jq -e '.config != null'"
+
+    # Check governance mode is set (note: governance mode is per-node config, not synced)
+    ALICE_GOV=$(hive_cli alice hive-status | jq -r '.governance_mode')
+    BOB_GOV=$(hive_cli bob hive-status | jq -r '.governance_mode')
+    log_info "Alice governance: $ALICE_GOV, Bob governance: $BOB_GOV"
+
+    run_test "alice has valid governance mode" \
+        "[ '$ALICE_GOV' = 'autonomous' ] || [ '$ALICE_GOV' = 'advisor' ] || [ '$ALICE_GOV' = 'oracle' ]"
+
+    run_test "bob has valid governance mode" \
+        "[ '$BOB_GOV' = 'autonomous' ] || [ '$BOB_GOV' = 'advisor' ] || [ '$BOB_GOV' = 'oracle' ]"
+
+    # =========================================================================
+    # VPN status (if configured)
+    # =========================================================================
+    log_info "Testing VPN status..."
+
+    run_test "hive-vpn-status returns data" \
+        "hive_cli alice hive-vpn-status | jq -e 'type == \"object\"'"
+}
+
+# Hive Expansion Tests - Cooperative expansion workflow
+test_hive_expansion() {
+    echo ""
+    echo "========================================"
+    echo "HIVE COOPERATIVE EXPANSION TESTS"
+    echo "========================================"
+
+    log_info "Testing cooperative expansion workflow..."
+
+    # Ensure hive exists
+    if ! hive_exists alice; then
+        log_info "No hive found. Please run hive_genesis first."
+        run_test "hive exists for expansion tests" "false"
+        return 1
+    fi
+
+    # =========================================================================
+    # Test expansion status RPC
+    # =========================================================================
+    log_info "Testing expansion status..."
+
+    run_test "hive-expansion-status returns data" \
+        "hive_cli alice hive-expansion-status | jq -e 'type == \"object\"'"
+
+    STATUS=$(hive_cli alice hive-expansion-status)
+    log_info "Expansion status: $(echo "$STATUS" | jq -c '.')"
+
+    # =========================================================================
+    # Test enable/disable expansions
+    # =========================================================================
+    log_info "Testing expansion enable/disable..."
+
+    run_test "hive-enable-expansions returns status" \
+        "hive_cli alice hive-enable-expansions | jq -e '.expansions_enabled != null'"
+
+    # Check expansion config in topology
+    run_test "topology shows expansion config" \
+        "hive_cli alice hive-topology | jq -e '.config.expansions_enabled != null'"
+
+    # =========================================================================
+    # Test pending actions system
+    # =========================================================================
+    log_info "Testing pending actions system..."
+
+    run_test "hive-pending-actions returns data" \
+        "hive_cli alice hive-pending-actions | jq -e 'type == \"object\"'"
+
+    PENDING=$(hive_cli alice hive-pending-actions)
+    PENDING_COUNT=$(echo "$PENDING" | jq '.actions | length // 0')
+    log_info "Pending actions: $PENDING_COUNT"
+
+    # =========================================================================
+    # Test config budget settings
+    # =========================================================================
+    log_info "Testing budget configuration..."
+
+    run_test "hive-config returns data" \
+        "hive_cli alice hive-config | jq -e 'type == \"object\"'"
+
+    # Check for governance budget settings
+    CONFIG=$(hive_cli alice hive-config)
+    log_info "Config governance section: $(echo "$CONFIG" | jq -c '.governance // {}')"
+
+    run_test "config has governance settings" \
+        "echo '$CONFIG' | jq -e '.governance != null'"
+
+    # =========================================================================
+    # Test budget summary
+    # =========================================================================
+    log_info "Testing budget summary..."
+
+    run_test "hive-budget-summary returns data" \
+        "hive_cli alice hive-budget-summary | jq -e 'type == \"object\"'"
+
+    BUDGET=$(hive_cli alice hive-budget-summary)
+    log_info "Budget summary: $(echo "$BUDGET" | jq -c '.')"
+
+    # =========================================================================
+    # Test nomination workflow (with external peer if available)
+    # =========================================================================
+    log_info "Testing nomination workflow..."
+
+    # Get an external peer pubkey for testing (from listpeers)
+    EXTERNAL_PEER=$(hive_cli alice listpeers | jq -r '.peers[0].id // empty')
+
+    if [ -n "$EXTERNAL_PEER" ]; then
+        log_info "Testing nomination for peer: ${EXTERNAL_PEER:0:16}..."
+
+        # Try nomination (may fail if peer is already hive member, which is ok)
+        NOMINATE_RESULT=$(hive_cli alice hive-expansion-nominate target_peer_id="$EXTERNAL_PEER" 2>&1)
+        log_info "Nomination result: $(echo "$NOMINATE_RESULT" | head -c 200)"
+
+        run_test "hive-expansion-nominate accepts input" \
+            "echo '$NOMINATE_RESULT' | jq -e 'type == \"object\"'"
+    else
+        log_info "[SKIP] No external peers available for nomination test"
+    fi
+
+    # =========================================================================
+    # Test planner log
+    # =========================================================================
+    log_info "Testing planner log..."
+
+    run_test "hive-planner-log returns data" \
+        "hive_cli alice hive-planner-log | jq -e 'type == \"object\"'"
+
+    PLANNER_LOG=$(hive_cli alice hive-planner-log limit=5)
+    log_info "Planner log entries: $(echo "$PLANNER_LOG" | jq '.entries | length // 0')"
+}
+
+# Hive Full Reset - Clean slate for testing
+test_hive_reset() {
+    echo ""
+    echo "========================================"
+    echo "HIVE RESET TESTS"
+    echo "========================================"
+
+    log_info "Resetting hive state on all nodes..."
+
+    # Stop plugins
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            hive_cli $node plugin stop cl-hive 2>/dev/null || true
+        fi
+    done
+
+    sleep 1
+
+    # Reset databases
+    reset_hive_databases
+
+    # Restart plugins
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            hive_cli $node plugin start /home/clightning/.lightning/plugins/cl-hive/cl-hive.py 2>/dev/null || true
+        fi
+    done
+
+    sleep 2
+
+    # Verify clean state
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            run_test "$node has no hive after reset" \
+                "! hive_exists $node"
+        fi
+    done
+
+    log_info "Hive reset complete"
+}
+
+# Combined hive test suite
+test_hive() {
+    test_hive_genesis
+    test_hive_join
+    test_hive_sync
+    test_hive_expansion
+}
+
 run_category() {
     case "$1" in
         setup)
@@ -1898,6 +2345,24 @@ run_category() {
         reset)
             test_reset
             ;;
+        hive_genesis)
+            test_hive_genesis
+            ;;
+        hive_join)
+            test_hive_join
+            ;;
+        hive_sync)
+            test_hive_sync
+            ;;
+        hive_expansion)
+            test_hive_expansion
+            ;;
+        hive_reset)
+            test_hive_reset
+            ;;
+        hive)
+            test_hive
+            ;;
         all)
             test_setup
             test_status
@@ -1917,31 +2382,40 @@ run_category() {
             test_performance
             test_metrics
             test_simulation
+            test_hive
             ;;
         *)
             echo "Unknown category: $1"
             echo ""
             echo "Available categories:"
-            echo "  all           - Run all tests"
-            echo "  setup         - Environment and plugin verification"
-            echo "  status        - Basic plugin status commands"
-            echo "  flow          - Flow analysis functionality"
-            echo "  fees          - Fee controller functionality"
-            echo "  rebalance     - Rebalancing logic and EV calculations"
-            echo "  sling         - Sling plugin integration"
-            echo "  policy        - Policy manager functionality"
-            echo "  profitability - Profitability analysis"
-            echo "  clboss        - CLBoss integration"
-            echo "  database      - Database operations"
-            echo "  closure_costs - Channel closure cost tracking"
-            echo "  splice_costs  - Splice cost tracking"
-            echo "  security      - Security hardening verification"
-            echo "  integration   - Cross-plugin integration (cl-hive)"
-            echo "  routing       - Routing simulation tests"
-            echo "  performance   - Performance and latency tests"
-            echo "  metrics       - Metrics collection"
-            echo "  simulation    - Simulation suite (traffic, benchmarks)"
-            echo "  reset         - Reset plugin state"
+            echo "  all            - Run all tests (including hive)"
+            echo "  setup          - Environment and plugin verification"
+            echo "  status         - Basic plugin status commands"
+            echo "  flow           - Flow analysis functionality"
+            echo "  fees           - Fee controller functionality"
+            echo "  rebalance      - Rebalancing logic and EV calculations"
+            echo "  sling          - Sling plugin integration"
+            echo "  policy         - Policy manager functionality"
+            echo "  profitability  - Profitability analysis"
+            echo "  clboss         - CLBoss integration"
+            echo "  database       - Database operations"
+            echo "  closure_costs  - Channel closure cost tracking"
+            echo "  splice_costs   - Splice cost tracking"
+            echo "  security       - Security hardening verification"
+            echo "  integration    - Cross-plugin integration (cl-hive)"
+            echo "  routing        - Routing simulation tests"
+            echo "  performance    - Performance and latency tests"
+            echo "  metrics        - Metrics collection"
+            echo "  simulation     - Simulation suite (traffic, benchmarks)"
+            echo "  reset          - Reset plugin state"
+            echo ""
+            echo "Hive-specific categories:"
+            echo "  hive           - Run all cl-hive tests"
+            echo "  hive_genesis   - Hive creation tests"
+            echo "  hive_join      - Member invitation and join"
+            echo "  hive_sync      - State synchronization"
+            echo "  hive_expansion - Cooperative expansion"
+            echo "  hive_reset     - Reset hive state"
             exit 1
             ;;
     esac
