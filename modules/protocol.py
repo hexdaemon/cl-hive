@@ -84,6 +84,11 @@ class HiveMessageType(IntEnum):
     EXPANSION_NOMINATE = 32805  # Nominate self to open channel (Phase 6.4)
     EXPANSION_ELECT = 32807     # Announce elected member for expansion (Phase 6.4)
 
+    # Phase 7: Cooperative Fee Coordination
+    FEE_INTELLIGENCE = 32809    # Share fee observations with hive
+    LIQUIDITY_NEED = 32811      # Broadcast rebalancing needs
+    HEALTH_REPORT = 32813       # NNLB health status report
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -134,6 +139,125 @@ class WelcomePayload:
     tier: str           # 'neophyte', 'member', or 'admin'
     member_count: int   # Current Hive size
     state_hash: str     # Current state hash for anti-entropy
+
+
+# =============================================================================
+# PHASE 7: FEE INTELLIGENCE PAYLOADS
+# =============================================================================
+
+@dataclass
+class FeeIntelligencePayload:
+    """
+    FEE_INTELLIGENCE message payload - Share fee observations with hive.
+
+    Enables cooperative fee setting by sharing observations about
+    external peers' fee elasticity and routing performance.
+    """
+    reporter_id: str              # Who observed this (must match sender)
+    target_peer_id: str           # External peer being reported on
+    timestamp: int                # Unix timestamp of observation
+    signature: str                # Required signature over payload
+
+    # Current fee configuration
+    our_fee_ppm: int              # Fee we charge to this peer
+    their_fee_ppm: int            # Fee they charge us (if known)
+
+    # Performance metrics (observation period)
+    forward_count: int            # Number of forwards through this peer
+    forward_volume_sats: int      # Total volume routed
+    revenue_sats: int             # Fees earned from this peer
+
+    # Flow analysis
+    flow_direction: str           # 'source', 'sink', 'balanced'
+    utilization_pct: float        # Channel utilization (0.0-1.0)
+
+    # Elasticity observation (optional)
+    last_fee_change_ppm: int = 0  # Previous fee rate (for elasticity calc)
+    volume_delta_pct: float = 0.0 # Volume change after fee change
+
+    # Confidence
+    days_observed: int = 1        # How long we've observed this peer
+
+
+@dataclass
+class LiquidityNeedPayload:
+    """
+    LIQUIDITY_NEED message payload - Broadcast rebalancing needs.
+
+    Enables cooperative rebalancing by sharing liquidity requirements.
+    """
+    reporter_id: str              # Who needs liquidity
+    timestamp: int
+    signature: str
+
+    # What we need
+    need_type: str                # 'inbound', 'outbound', 'rebalance'
+    target_peer_id: str           # External peer (or hive member)
+    amount_sats: int              # How much we need
+    urgency: str                  # 'critical', 'high', 'medium', 'low'
+    max_fee_ppm: int              # Maximum fee we'll pay
+
+    # Why we need it
+    reason: str                   # 'channel_depleted', 'opportunity', 'nnlb_assist'
+    current_balance_pct: float    # Current local balance percentage
+
+    # Reciprocity - what we can offer
+    can_provide_inbound: int = 0  # Sats of inbound we can provide
+    can_provide_outbound: int = 0 # Sats of outbound we can provide
+
+
+@dataclass
+class HealthReportPayload:
+    """
+    HEALTH_REPORT message payload - NNLB health status.
+
+    Periodic health report for No Node Left Behind coordination.
+    Allows hive to identify who needs help.
+    """
+    reporter_id: str
+    timestamp: int
+    signature: str
+
+    # Self-reported health scores (0-100)
+    overall_health: int
+    capacity_score: int
+    revenue_score: int
+    connectivity_score: int
+
+    # Specific needs (optional flags)
+    needs_inbound: bool = False
+    needs_outbound: bool = False
+    needs_channels: bool = False
+
+    # Willingness to help others
+    can_provide_assistance: bool = False
+    assistance_budget_sats: int = 0
+
+
+# =============================================================================
+# PHASE 7 VALIDATION CONSTANTS
+# =============================================================================
+
+# Fee intelligence bounds
+MAX_FEE_PPM = 10000              # Maximum fee rate (1%)
+MAX_VOLUME_SATS = 1_000_000_000_000  # 10k BTC max volume
+MAX_DAYS_OBSERVED = 365          # Maximum observation period
+FEE_INTELLIGENCE_MAX_AGE = 3600  # 1 hour max message age
+
+# Liquidity need bounds
+MAX_LIQUIDITY_AMOUNT = 100_000_000_000  # 1000 BTC max
+VALID_NEED_TYPES = {'inbound', 'outbound', 'rebalance'}
+VALID_URGENCY_LEVELS = {'critical', 'high', 'medium', 'low'}
+VALID_FLOW_DIRECTIONS = {'source', 'sink', 'balanced'}
+
+# Health report bounds
+MAX_HEALTH_SCORE = 100
+MIN_HEALTH_SCORE = 0
+
+# Rate limits (count, period_seconds)
+FEE_INTELLIGENCE_RATE_LIMIT = (10, 3600)    # 10 per hour per sender
+LIQUIDITY_NEED_RATE_LIMIT = (5, 3600)       # 5 per hour per sender
+HEALTH_REPORT_RATE_LIMIT = (1, 3600)        # 1 per hour per sender
 
 
 # =============================================================================
@@ -868,3 +992,415 @@ def create_expansion_elect(
         payload["reason"] = reason
 
     return serialize(HiveMessageType.EXPANSION_ELECT, payload)
+
+
+# =============================================================================
+# PHASE 7: FEE INTELLIGENCE SIGNING & VALIDATION
+# =============================================================================
+
+def get_fee_intelligence_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for FEE_INTELLIGENCE messages.
+
+    Includes all critical fields to prevent tampering:
+    - reporter_id, target_peer_id, timestamp
+    - Fee and performance metrics
+    - Flow analysis data
+
+    Args:
+        payload: FEE_INTELLIGENCE message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    return (
+        f"FEE_INTELLIGENCE:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('target_peer_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('our_fee_ppm', 0)}:"
+        f"{payload.get('their_fee_ppm', 0)}:"
+        f"{payload.get('forward_count', 0)}:"
+        f"{payload.get('forward_volume_sats', 0)}:"
+        f"{payload.get('revenue_sats', 0)}:"
+        f"{payload.get('flow_direction', '')}:"
+        f"{payload.get('utilization_pct', 0.0):.4f}"
+    )
+
+
+def validate_fee_intelligence_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a FEE_INTELLIGENCE payload.
+
+    SECURITY: Bounds all values to prevent manipulation and overflow.
+
+    Args:
+        payload: FEE_INTELLIGENCE message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    import time as time_module
+
+    # Required string fields
+    reporter_id = payload.get("reporter_id")
+    target_peer_id = payload.get("target_peer_id")
+    signature = payload.get("signature")
+
+    if not isinstance(reporter_id, str) or not reporter_id:
+        return False
+    if not isinstance(target_peer_id, str) or not target_peer_id:
+        return False
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    # Timestamp freshness
+    timestamp = payload.get("timestamp", 0)
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+    if abs(time_module.time() - timestamp) > FEE_INTELLIGENCE_MAX_AGE:
+        return False
+
+    # Fee bounds
+    our_fee_ppm = payload.get("our_fee_ppm", 0)
+    their_fee_ppm = payload.get("their_fee_ppm", 0)
+    if not isinstance(our_fee_ppm, int) or not (0 <= our_fee_ppm <= MAX_FEE_PPM):
+        return False
+    if not isinstance(their_fee_ppm, int) or not (0 <= their_fee_ppm <= MAX_FEE_PPM):
+        return False
+
+    # Volume bounds (prevent overflow)
+    forward_count = payload.get("forward_count", 0)
+    forward_volume_sats = payload.get("forward_volume_sats", 0)
+    revenue_sats = payload.get("revenue_sats", 0)
+
+    if not isinstance(forward_count, int) or forward_count < 0:
+        return False
+    if not isinstance(forward_volume_sats, int) or not (0 <= forward_volume_sats <= MAX_VOLUME_SATS):
+        return False
+    if not isinstance(revenue_sats, int) or not (0 <= revenue_sats <= MAX_VOLUME_SATS):
+        return False
+
+    # Flow direction
+    flow_direction = payload.get("flow_direction", "")
+    if flow_direction and flow_direction not in VALID_FLOW_DIRECTIONS:
+        return False
+
+    # Utilization bounds
+    utilization_pct = payload.get("utilization_pct", 0.0)
+    if not isinstance(utilization_pct, (int, float)) or not (0 <= utilization_pct <= 1):
+        return False
+
+    # Days observed bounds
+    days_observed = payload.get("days_observed", 1)
+    if not isinstance(days_observed, int) or not (1 <= days_observed <= MAX_DAYS_OBSERVED):
+        return False
+
+    return True
+
+
+def get_liquidity_need_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for LIQUIDITY_NEED messages.
+
+    Args:
+        payload: LIQUIDITY_NEED message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    return (
+        f"LIQUIDITY_NEED:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('need_type', '')}:"
+        f"{payload.get('target_peer_id', '')}:"
+        f"{payload.get('amount_sats', 0)}:"
+        f"{payload.get('urgency', '')}:"
+        f"{payload.get('max_fee_ppm', 0)}"
+    )
+
+
+def validate_liquidity_need_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a LIQUIDITY_NEED payload.
+
+    Args:
+        payload: LIQUIDITY_NEED message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    # Required string fields
+    reporter_id = payload.get("reporter_id")
+    target_peer_id = payload.get("target_peer_id")
+    signature = payload.get("signature")
+
+    if not isinstance(reporter_id, str) or not reporter_id:
+        return False
+    if not isinstance(target_peer_id, str) or not target_peer_id:
+        return False
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    # Timestamp
+    timestamp = payload.get("timestamp", 0)
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # Need type validation
+    need_type = payload.get("need_type")
+    if need_type not in VALID_NEED_TYPES:
+        return False
+
+    # Urgency validation
+    urgency = payload.get("urgency")
+    if urgency not in VALID_URGENCY_LEVELS:
+        return False
+
+    # Amount bounds
+    amount_sats = payload.get("amount_sats", 0)
+    if not isinstance(amount_sats, int) or not (0 < amount_sats <= MAX_LIQUIDITY_AMOUNT):
+        return False
+
+    # Fee bounds
+    max_fee_ppm = payload.get("max_fee_ppm", 0)
+    if not isinstance(max_fee_ppm, int) or not (0 <= max_fee_ppm <= MAX_FEE_PPM):
+        return False
+
+    # Balance percentage
+    current_balance_pct = payload.get("current_balance_pct", 0.0)
+    if not isinstance(current_balance_pct, (int, float)) or not (0 <= current_balance_pct <= 1):
+        return False
+
+    return True
+
+
+def get_health_report_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for HEALTH_REPORT messages.
+
+    Args:
+        payload: HEALTH_REPORT message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    return (
+        f"HEALTH_REPORT:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('overall_health', 0)}:"
+        f"{payload.get('capacity_score', 0)}:"
+        f"{payload.get('revenue_score', 0)}:"
+        f"{payload.get('connectivity_score', 0)}"
+    )
+
+
+def validate_health_report_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a HEALTH_REPORT payload.
+
+    Args:
+        payload: HEALTH_REPORT message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    # Required string fields
+    reporter_id = payload.get("reporter_id")
+    signature = payload.get("signature")
+
+    if not isinstance(reporter_id, str) or not reporter_id:
+        return False
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    # Timestamp
+    timestamp = payload.get("timestamp", 0)
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # Health scores (0-100)
+    for score_field in ['overall_health', 'capacity_score', 'revenue_score', 'connectivity_score']:
+        score = payload.get(score_field, 0)
+        if not isinstance(score, int) or not (MIN_HEALTH_SCORE <= score <= MAX_HEALTH_SCORE):
+            return False
+
+    # Assistance budget bounds
+    assistance_budget = payload.get("assistance_budget_sats", 0)
+    if not isinstance(assistance_budget, int) or assistance_budget < 0:
+        return False
+
+    return True
+
+
+def create_fee_intelligence(
+    reporter_id: str,
+    target_peer_id: str,
+    timestamp: int,
+    signature: str,
+    our_fee_ppm: int,
+    their_fee_ppm: int,
+    forward_count: int,
+    forward_volume_sats: int,
+    revenue_sats: int,
+    flow_direction: str,
+    utilization_pct: float,
+    last_fee_change_ppm: int = 0,
+    volume_delta_pct: float = 0.0,
+    days_observed: int = 1
+) -> bytes:
+    """
+    Create a FEE_INTELLIGENCE message.
+
+    SECURITY: The signature must be created using signmessage() over the
+    canonical payload returned by get_fee_intelligence_signing_payload().
+
+    Args:
+        reporter_id: Hive member reporting this observation
+        target_peer_id: External peer being reported on
+        timestamp: Unix timestamp
+        signature: zbase-encoded signature from signmessage()
+        our_fee_ppm: Fee we charge to this peer
+        their_fee_ppm: Fee they charge us
+        forward_count: Number of forwards
+        forward_volume_sats: Total volume routed
+        revenue_sats: Fees earned
+        flow_direction: 'source', 'sink', or 'balanced'
+        utilization_pct: Channel utilization (0.0-1.0)
+        last_fee_change_ppm: Previous fee rate (for elasticity)
+        volume_delta_pct: Volume change after fee change
+        days_observed: How long this peer has been observed
+
+    Returns:
+        Serialized FEE_INTELLIGENCE message
+    """
+    payload = {
+        "reporter_id": reporter_id,
+        "target_peer_id": target_peer_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "our_fee_ppm": our_fee_ppm,
+        "their_fee_ppm": their_fee_ppm,
+        "forward_count": forward_count,
+        "forward_volume_sats": forward_volume_sats,
+        "revenue_sats": revenue_sats,
+        "flow_direction": flow_direction,
+        "utilization_pct": utilization_pct,
+        "last_fee_change_ppm": last_fee_change_ppm,
+        "volume_delta_pct": volume_delta_pct,
+        "days_observed": days_observed,
+    }
+
+    return serialize(HiveMessageType.FEE_INTELLIGENCE, payload)
+
+
+def create_liquidity_need(
+    reporter_id: str,
+    timestamp: int,
+    signature: str,
+    need_type: str,
+    target_peer_id: str,
+    amount_sats: int,
+    urgency: str,
+    max_fee_ppm: int,
+    reason: str,
+    current_balance_pct: float,
+    can_provide_inbound: int = 0,
+    can_provide_outbound: int = 0
+) -> bytes:
+    """
+    Create a LIQUIDITY_NEED message.
+
+    SECURITY: The signature must be created using signmessage() over the
+    canonical payload returned by get_liquidity_need_signing_payload().
+
+    Args:
+        reporter_id: Hive member needing liquidity
+        timestamp: Unix timestamp
+        signature: zbase-encoded signature from signmessage()
+        need_type: 'inbound', 'outbound', or 'rebalance'
+        target_peer_id: External peer (or hive member)
+        amount_sats: How much liquidity needed
+        urgency: 'critical', 'high', 'medium', or 'low'
+        max_fee_ppm: Maximum fee willing to pay
+        reason: Why liquidity is needed
+        current_balance_pct: Current local balance percentage
+        can_provide_inbound: Sats of inbound we can provide
+        can_provide_outbound: Sats of outbound we can provide
+
+    Returns:
+        Serialized LIQUIDITY_NEED message
+    """
+    payload = {
+        "reporter_id": reporter_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "need_type": need_type,
+        "target_peer_id": target_peer_id,
+        "amount_sats": amount_sats,
+        "urgency": urgency,
+        "max_fee_ppm": max_fee_ppm,
+        "reason": reason,
+        "current_balance_pct": current_balance_pct,
+        "can_provide_inbound": can_provide_inbound,
+        "can_provide_outbound": can_provide_outbound,
+    }
+
+    return serialize(HiveMessageType.LIQUIDITY_NEED, payload)
+
+
+def create_health_report(
+    reporter_id: str,
+    timestamp: int,
+    signature: str,
+    overall_health: int,
+    capacity_score: int,
+    revenue_score: int,
+    connectivity_score: int,
+    needs_inbound: bool = False,
+    needs_outbound: bool = False,
+    needs_channels: bool = False,
+    can_provide_assistance: bool = False,
+    assistance_budget_sats: int = 0
+) -> bytes:
+    """
+    Create a HEALTH_REPORT message.
+
+    SECURITY: The signature must be created using signmessage() over the
+    canonical payload returned by get_health_report_signing_payload().
+
+    Args:
+        reporter_id: Hive member reporting their health
+        timestamp: Unix timestamp
+        signature: zbase-encoded signature from signmessage()
+        overall_health: Overall health score (0-100)
+        capacity_score: Capacity score (0-100)
+        revenue_score: Revenue score (0-100)
+        connectivity_score: Connectivity score (0-100)
+        needs_inbound: Whether node needs inbound liquidity
+        needs_outbound: Whether node needs outbound liquidity
+        needs_channels: Whether node needs more channels
+        can_provide_assistance: Whether node can help others
+        assistance_budget_sats: How much node can spend helping
+
+    Returns:
+        Serialized HEALTH_REPORT message
+    """
+    payload = {
+        "reporter_id": reporter_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "overall_health": overall_health,
+        "capacity_score": capacity_score,
+        "revenue_score": revenue_score,
+        "connectivity_score": connectivity_score,
+        "needs_inbound": needs_inbound,
+        "needs_outbound": needs_outbound,
+        "needs_channels": needs_channels,
+        "can_provide_assistance": can_provide_assistance,
+        "assistance_budget_sats": assistance_budget_sats,
+    }
+
+    return serialize(HiveMessageType.HEALTH_REPORT, payload)

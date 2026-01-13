@@ -383,6 +383,85 @@ class HiveDatabase:
             ON budget_tracking(date_key)
         """)
 
+        # =====================================================================
+        # FEE INTELLIGENCE TABLE (Phase 7 - Cooperative Fee Coordination)
+        # =====================================================================
+        # Stores fee intelligence reports from hive members
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fee_intelligence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id TEXT NOT NULL,
+                target_peer_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                our_fee_ppm INTEGER,
+                their_fee_ppm INTEGER,
+                forward_count INTEGER,
+                forward_volume_sats INTEGER,
+                revenue_sats INTEGER,
+                flow_direction TEXT,
+                utilization_pct REAL,
+                last_fee_change_ppm INTEGER,
+                volume_delta_pct REAL,
+                days_observed INTEGER,
+                signature TEXT NOT NULL
+            )
+        """)
+
+        # Index for querying by target peer
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_fee_intel_target
+            ON fee_intelligence(target_peer_id)
+        """)
+
+        # Index for querying by reporter
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_fee_intel_reporter
+            ON fee_intelligence(reporter_id)
+        """)
+
+        # =====================================================================
+        # MEMBER HEALTH TABLE (Phase 7 - NNLB Health Tracking)
+        # =====================================================================
+        # Stores health reports from hive members for NNLB coordination
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS member_health (
+                peer_id TEXT PRIMARY KEY,
+                timestamp INTEGER NOT NULL,
+                overall_health INTEGER,
+                capacity_score INTEGER,
+                revenue_score INTEGER,
+                connectivity_score INTEGER,
+                tier TEXT,
+                needs_help INTEGER DEFAULT 0,
+                can_help_others INTEGER DEFAULT 0,
+                needs_inbound INTEGER DEFAULT 0,
+                needs_outbound INTEGER DEFAULT 0,
+                needs_channels INTEGER DEFAULT 0,
+                assistance_budget_sats INTEGER DEFAULT 0
+            )
+        """)
+
+        # =====================================================================
+        # PEER FEE PROFILES TABLE (Phase 7 - Aggregated Fee Intelligence)
+        # =====================================================================
+        # Stores aggregated fee profiles for external peers
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_fee_profiles (
+                peer_id TEXT PRIMARY KEY,
+                reporter_count INTEGER DEFAULT 0,
+                avg_fee_charged REAL DEFAULT 0,
+                min_fee_charged INTEGER DEFAULT 0,
+                max_fee_charged INTEGER DEFAULT 0,
+                total_hive_volume INTEGER DEFAULT 0,
+                total_hive_revenue INTEGER DEFAULT 0,
+                avg_utilization REAL DEFAULT 0,
+                estimated_elasticity REAL DEFAULT 0,
+                optimal_fee_estimate INTEGER DEFAULT 0,
+                last_update INTEGER NOT NULL,
+                confidence REAL DEFAULT 0
+            )
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -1781,3 +1860,407 @@ class HiveDatabase:
             'action_breakdown': action_breakdown,
             'history': daily_spending
         }
+
+    # =========================================================================
+    # FEE INTELLIGENCE OPERATIONS (Phase 7)
+    # =========================================================================
+
+    def store_fee_intelligence(
+        self,
+        reporter_id: str,
+        target_peer_id: str,
+        timestamp: int,
+        our_fee_ppm: int,
+        their_fee_ppm: int,
+        forward_count: int,
+        forward_volume_sats: int,
+        revenue_sats: int,
+        flow_direction: str,
+        utilization_pct: float,
+        signature: str,
+        last_fee_change_ppm: int = 0,
+        volume_delta_pct: float = 0.0,
+        days_observed: int = 1
+    ) -> int:
+        """
+        Store a fee intelligence report.
+
+        Args:
+            reporter_id: Hive member who reported this
+            target_peer_id: External peer being reported on
+            timestamp: Unix timestamp of the report
+            our_fee_ppm: Fee charged to the peer
+            their_fee_ppm: Fee the peer charges us
+            forward_count: Number of forwards
+            forward_volume_sats: Total volume routed
+            revenue_sats: Fees earned from this peer
+            flow_direction: 'source', 'sink', or 'balanced'
+            utilization_pct: Channel utilization (0.0-1.0)
+            signature: Cryptographic signature of the report
+            last_fee_change_ppm: Previous fee rate
+            volume_delta_pct: Volume change after fee change
+            days_observed: How long peer has been observed
+
+        Returns:
+            ID of the inserted record
+        """
+        conn = self._get_connection()
+        cursor = conn.execute("""
+            INSERT INTO fee_intelligence (
+                reporter_id, target_peer_id, timestamp, our_fee_ppm, their_fee_ppm,
+                forward_count, forward_volume_sats, revenue_sats, flow_direction,
+                utilization_pct, last_fee_change_ppm, volume_delta_pct, days_observed,
+                signature
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            reporter_id, target_peer_id, timestamp, our_fee_ppm, their_fee_ppm,
+            forward_count, forward_volume_sats, revenue_sats, flow_direction,
+            utilization_pct, last_fee_change_ppm, volume_delta_pct, days_observed,
+            signature
+        ))
+        return cursor.lastrowid
+
+    def get_fee_intelligence_for_peer(
+        self,
+        target_peer_id: str,
+        max_age_hours: int = 24
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all fee intelligence reports for a specific external peer.
+
+        Args:
+            target_peer_id: External peer to get reports for
+            max_age_hours: Maximum age of reports in hours
+
+        Returns:
+            List of fee intelligence reports
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+        rows = conn.execute("""
+            SELECT * FROM fee_intelligence
+            WHERE target_peer_id = ? AND timestamp >= ?
+            ORDER BY timestamp DESC
+        """, (target_peer_id, cutoff)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_fee_intelligence_by_reporter(
+        self,
+        reporter_id: str,
+        max_age_hours: int = 24
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all fee intelligence reports from a specific reporter.
+
+        Args:
+            reporter_id: Hive member who reported
+            max_age_hours: Maximum age of reports in hours
+
+        Returns:
+            List of fee intelligence reports
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+        rows = conn.execute("""
+            SELECT * FROM fee_intelligence
+            WHERE reporter_id = ? AND timestamp >= ?
+            ORDER BY timestamp DESC
+        """, (reporter_id, cutoff)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_all_fee_intelligence(
+        self,
+        max_age_hours: int = 24
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all recent fee intelligence reports.
+
+        Args:
+            max_age_hours: Maximum age of reports in hours
+
+        Returns:
+            List of fee intelligence reports
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+        rows = conn.execute("""
+            SELECT * FROM fee_intelligence
+            WHERE timestamp >= ?
+            ORDER BY target_peer_id, timestamp DESC
+        """, (cutoff,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def cleanup_old_fee_intelligence(self, max_age_hours: int = 168) -> int:
+        """
+        Remove old fee intelligence records.
+
+        Args:
+            max_age_hours: Maximum age to keep (default 7 days)
+
+        Returns:
+            Number of records deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+        cursor = conn.execute("""
+            DELETE FROM fee_intelligence WHERE timestamp < ?
+        """, (cutoff,))
+        return cursor.rowcount
+
+    # =========================================================================
+    # PEER FEE PROFILES OPERATIONS (Phase 7)
+    # =========================================================================
+
+    def update_peer_fee_profile(
+        self,
+        peer_id: str,
+        reporter_count: int,
+        avg_fee_charged: float,
+        min_fee_charged: int,
+        max_fee_charged: int,
+        total_hive_volume: int,
+        total_hive_revenue: int,
+        avg_utilization: float,
+        estimated_elasticity: float = 0.0,
+        optimal_fee_estimate: int = 0,
+        confidence: float = 0.5
+    ) -> None:
+        """
+        Update or insert aggregated fee profile for an external peer.
+
+        Args:
+            peer_id: External peer ID
+            reporter_count: Number of hive members reporting on this peer
+            avg_fee_charged: Average fee charged by hive to this peer
+            min_fee_charged: Minimum fee charged
+            max_fee_charged: Maximum fee charged
+            total_hive_volume: Total volume hive routes through this peer
+            total_hive_revenue: Total revenue from this peer
+            avg_utilization: Average channel utilization
+            estimated_elasticity: Estimated price elasticity (-1 to 1)
+            optimal_fee_estimate: Recommended optimal fee
+            confidence: Confidence score (0-1)
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        conn.execute("""
+            INSERT INTO peer_fee_profiles (
+                peer_id, reporter_count, avg_fee_charged, min_fee_charged,
+                max_fee_charged, total_hive_volume, total_hive_revenue,
+                avg_utilization, estimated_elasticity, optimal_fee_estimate,
+                last_update, confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(peer_id) DO UPDATE SET
+                reporter_count = excluded.reporter_count,
+                avg_fee_charged = excluded.avg_fee_charged,
+                min_fee_charged = excluded.min_fee_charged,
+                max_fee_charged = excluded.max_fee_charged,
+                total_hive_volume = excluded.total_hive_volume,
+                total_hive_revenue = excluded.total_hive_revenue,
+                avg_utilization = excluded.avg_utilization,
+                estimated_elasticity = excluded.estimated_elasticity,
+                optimal_fee_estimate = excluded.optimal_fee_estimate,
+                last_update = excluded.last_update,
+                confidence = excluded.confidence
+        """, (
+            peer_id, reporter_count, avg_fee_charged, min_fee_charged,
+            max_fee_charged, total_hive_volume, total_hive_revenue,
+            avg_utilization, estimated_elasticity, optimal_fee_estimate,
+            now, confidence
+        ))
+
+    def get_peer_fee_profile(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get aggregated fee profile for an external peer.
+
+        Args:
+            peer_id: External peer ID
+
+        Returns:
+            Fee profile dict or None if not found
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM peer_fee_profiles WHERE peer_id = ?
+        """, (peer_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_all_peer_fee_profiles(self) -> List[Dict[str, Any]]:
+        """
+        Get all aggregated fee profiles.
+
+        Returns:
+            List of fee profile dicts
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM peer_fee_profiles ORDER BY reporter_count DESC
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # MEMBER HEALTH OPERATIONS (Phase 7 - NNLB)
+    # =========================================================================
+
+    def update_member_health(
+        self,
+        peer_id: str,
+        overall_health: int,
+        capacity_score: int,
+        revenue_score: int,
+        connectivity_score: int,
+        tier: str = 'healthy',
+        needs_help: bool = False,
+        can_help_others: bool = False,
+        needs_inbound: bool = False,
+        needs_outbound: bool = False,
+        needs_channels: bool = False,
+        assistance_budget_sats: int = 0
+    ) -> None:
+        """
+        Update health record for a hive member.
+
+        Args:
+            peer_id: Hive member peer ID
+            overall_health: Overall health score (0-100)
+            capacity_score: Capacity score (0-100)
+            revenue_score: Revenue score (0-100)
+            connectivity_score: Connectivity score (0-100)
+            tier: 'thriving', 'healthy', 'struggling', or 'critical'
+            needs_help: Whether member needs assistance
+            can_help_others: Whether member can provide assistance
+            needs_inbound: Whether member needs inbound liquidity
+            needs_outbound: Whether member needs outbound liquidity
+            needs_channels: Whether member needs more channels
+            assistance_budget_sats: How much member can spend helping
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        conn.execute("""
+            INSERT INTO member_health (
+                peer_id, timestamp, overall_health, capacity_score,
+                revenue_score, connectivity_score, tier, needs_help,
+                can_help_others, needs_inbound, needs_outbound,
+                needs_channels, assistance_budget_sats
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(peer_id) DO UPDATE SET
+                timestamp = excluded.timestamp,
+                overall_health = excluded.overall_health,
+                capacity_score = excluded.capacity_score,
+                revenue_score = excluded.revenue_score,
+                connectivity_score = excluded.connectivity_score,
+                tier = excluded.tier,
+                needs_help = excluded.needs_help,
+                can_help_others = excluded.can_help_others,
+                needs_inbound = excluded.needs_inbound,
+                needs_outbound = excluded.needs_outbound,
+                needs_channels = excluded.needs_channels,
+                assistance_budget_sats = excluded.assistance_budget_sats
+        """, (
+            peer_id, now, overall_health, capacity_score,
+            revenue_score, connectivity_score, tier,
+            1 if needs_help else 0,
+            1 if can_help_others else 0,
+            1 if needs_inbound else 0,
+            1 if needs_outbound else 0,
+            1 if needs_channels else 0,
+            assistance_budget_sats
+        ))
+
+    def get_member_health(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get health record for a hive member.
+
+        Args:
+            peer_id: Hive member peer ID
+
+        Returns:
+            Health record dict or None if not found
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM member_health WHERE peer_id = ?
+        """, (peer_id,)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        # Convert integer flags to booleans
+        result['needs_help'] = bool(result.get('needs_help', 0))
+        result['can_help_others'] = bool(result.get('can_help_others', 0))
+        result['needs_inbound'] = bool(result.get('needs_inbound', 0))
+        result['needs_outbound'] = bool(result.get('needs_outbound', 0))
+        result['needs_channels'] = bool(result.get('needs_channels', 0))
+        return result
+
+    def get_all_member_health(self) -> List[Dict[str, Any]]:
+        """
+        Get health records for all hive members.
+
+        Returns:
+            List of health record dicts
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM member_health ORDER BY overall_health ASC
+        """).fetchall()
+        results = []
+        for row in rows:
+            result = dict(row)
+            result['needs_help'] = bool(result.get('needs_help', 0))
+            result['can_help_others'] = bool(result.get('can_help_others', 0))
+            result['needs_inbound'] = bool(result.get('needs_inbound', 0))
+            result['needs_outbound'] = bool(result.get('needs_outbound', 0))
+            result['needs_channels'] = bool(result.get('needs_channels', 0))
+            results.append(result)
+        return results
+
+    def get_struggling_members(self, threshold: int = 40) -> List[Dict[str, Any]]:
+        """
+        Get members with health below threshold (NNLB candidates).
+
+        Args:
+            threshold: Health score threshold (default 40)
+
+        Returns:
+            List of health records for struggling members
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM member_health
+            WHERE overall_health < ? OR needs_help = 1
+            ORDER BY overall_health ASC
+        """, (threshold,)).fetchall()
+        results = []
+        for row in rows:
+            result = dict(row)
+            result['needs_help'] = bool(result.get('needs_help', 0))
+            result['can_help_others'] = bool(result.get('can_help_others', 0))
+            result['needs_inbound'] = bool(result.get('needs_inbound', 0))
+            result['needs_outbound'] = bool(result.get('needs_outbound', 0))
+            result['needs_channels'] = bool(result.get('needs_channels', 0))
+            results.append(result)
+        return results
+
+    def get_helping_members(self) -> List[Dict[str, Any]]:
+        """
+        Get members who can provide assistance to others.
+
+        Returns:
+            List of health records for members who can help
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM member_health
+            WHERE can_help_others = 1
+            ORDER BY overall_health DESC
+        """).fetchall()
+        results = []
+        for row in rows:
+            result = dict(row)
+            result['needs_help'] = bool(result.get('needs_help', 0))
+            result['can_help_others'] = bool(result.get('can_help_others', 0))
+            result['needs_inbound'] = bool(result.get('needs_inbound', 0))
+            result['needs_outbound'] = bool(result.get('needs_outbound', 0))
+            result['needs_channels'] = bool(result.get('needs_channels', 0))
+            results.append(result)
+        return results

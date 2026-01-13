@@ -69,6 +69,7 @@ from modules.cooperative_expansion import CooperativeExpansionManager
 from modules.clboss_bridge import CLBossBridge
 from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
+from modules.fee_intelligence import FeeIntelligenceManager
 
 # Initialize the plugin
 plugin = Plugin()
@@ -202,6 +203,7 @@ clboss_bridge: Optional[CLBossBridge] = None
 decision_engine: Optional[DecisionEngine] = None
 vpn_transport: Optional[VPNTransportManager] = None
 coop_expansion: Optional[CooperativeExpansionManager] = None
+fee_intel_mgr: Optional[FeeIntelligenceManager] = None
 our_pubkey: Optional[str] = None
 
 
@@ -916,6 +918,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Cooperative expansion manager initialized")
 
+    # Initialize Fee Intelligence Manager (Phase 7 - Cooperative Fee Coordination)
+    global fee_intel_mgr
+    fee_intel_mgr = FeeIntelligenceManager(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey
+    )
+    plugin.log("cl-hive: Fee intelligence manager initialized")
+
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
     peer_available_limiter = RateLimiter(max_per_minute=10, window_seconds=60)
@@ -1041,6 +1052,11 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_expansion_nominate(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.EXPANSION_ELECT:
             return handle_expansion_elect(peer_id, msg_payload, plugin)
+        # Phase 7: Cooperative Fee Coordination
+        elif msg_type == HiveMessageType.FEE_INTELLIGENCE:
+            return handle_fee_intelligence(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.HEALTH_REPORT:
+            return handle_health_report(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type (Phase 4+)
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -3010,6 +3026,76 @@ def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
 
 # =============================================================================
+# PHASE 7: FEE INTELLIGENCE MESSAGE HANDLERS
+# =============================================================================
+
+def handle_fee_intelligence(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle FEE_INTELLIGENCE message from a hive member.
+
+    Validates signature and stores the fee observation for aggregation.
+    """
+    if not fee_intel_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: FEE_INTELLIGENCE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to fee intelligence manager
+    result = fee_intel_mgr.handle_fee_intelligence(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored fee intelligence from {peer_id[:16]}... "
+            f"for {payload.get('target_peer_id', '')[:16]}...",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: FEE_INTELLIGENCE rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_health_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HEALTH_REPORT message from a hive member.
+
+    Used for NNLB (No Node Left Behind) coordination.
+    """
+    if not fee_intel_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: HEALTH_REPORT from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to fee intelligence manager
+    result = fee_intel_mgr.handle_health_report(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        tier = result.get("tier", "unknown")
+        plugin.log(
+            f"cl-hive: Stored health report from {peer_id[:16]}... (tier={tier})",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: HEALTH_REPORT rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+# =============================================================================
 # PHASE 3: INTENT MONITOR BACKGROUND THREAD
 # =============================================================================
 
@@ -4829,6 +4915,290 @@ def hive_budget_summary(plugin: Plugin, days: int = 7):
         "daily_budget_sats": daily_budget,
         "governance_mode": cfg.governance_mode,
         **summary
+    }
+
+
+# =============================================================================
+# PHASE 7: FEE INTELLIGENCE RPC COMMANDS
+# =============================================================================
+
+@plugin.method("hive-fee-profiles")
+def hive_fee_profiles(plugin: Plugin, peer_id: str = None):
+    """
+    Get aggregated fee profiles for external peers.
+
+    Fee profiles are built from collective intelligence shared by hive members.
+    Includes optimal fee recommendations based on elasticity and NNLB.
+
+    Args:
+        peer_id: Optional specific peer to query (otherwise returns all)
+
+    Returns:
+        Dict with fee profile(s) and aggregation stats.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database or not fee_intel_mgr:
+        return {"error": "Fee intelligence not initialized"}
+
+    if peer_id:
+        # Query specific peer
+        profile = database.get_peer_fee_profile(peer_id)
+        if not profile:
+            return {
+                "peer_id": peer_id,
+                "error": "No fee profile found",
+                "hint": "No hive members have reported on this peer yet"
+            }
+        return {
+            "profile": profile
+        }
+    else:
+        # Return all profiles
+        profiles = database.get_all_peer_fee_profiles()
+        return {
+            "profile_count": len(profiles),
+            "profiles": profiles
+        }
+
+
+@plugin.method("hive-fee-recommendation")
+def hive_fee_recommendation(plugin: Plugin, peer_id: str, channel_size: int = 0):
+    """
+    Get fee recommendation for an external peer.
+
+    Uses collective fee intelligence and NNLB health adjustments
+    to recommend optimal fee for maximum revenue while supporting
+    struggling hive members.
+
+    Args:
+        peer_id: External peer to get recommendation for
+        channel_size: Our channel size to this peer (for context)
+
+    Returns:
+        Dict with recommended fee and reasoning.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database or not fee_intel_mgr:
+        return {"error": "Fee intelligence not initialized"}
+
+    # Get our health for NNLB adjustment
+    our_health = 50  # Default to healthy
+    if our_pubkey:
+        health_record = database.get_member_health(our_pubkey)
+        if health_record:
+            our_health = health_record.get("overall_health", 50)
+
+    recommendation = fee_intel_mgr.get_fee_recommendation(
+        target_peer_id=peer_id,
+        our_channel_size=channel_size,
+        our_health=our_health
+    )
+
+    return recommendation
+
+
+@plugin.method("hive-fee-intelligence")
+def hive_fee_intelligence(plugin: Plugin, max_age_hours: int = 24, peer_id: str = None):
+    """
+    Get raw fee intelligence reports.
+
+    Returns individual fee observations from hive members before aggregation.
+
+    Args:
+        max_age_hours: Maximum age of reports to return (default 24)
+        peer_id: Optional filter by target peer
+
+    Returns:
+        Dict with fee intelligence reports.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if peer_id:
+        reports = database.get_fee_intelligence_for_peer(peer_id, max_age_hours)
+    else:
+        reports = database.get_all_fee_intelligence(max_age_hours)
+
+    return {
+        "report_count": len(reports),
+        "max_age_hours": max_age_hours,
+        "reports": reports
+    }
+
+
+@plugin.method("hive-aggregate-fees")
+def hive_aggregate_fees(plugin: Plugin):
+    """
+    Trigger fee profile aggregation.
+
+    Aggregates all recent fee intelligence into peer fee profiles.
+    Normally runs automatically, but can be triggered manually.
+
+    Returns:
+        Dict with aggregation results.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not fee_intel_mgr:
+        return {"error": "Fee intelligence manager not initialized"}
+
+    updated_count = fee_intel_mgr.aggregate_fee_profiles()
+
+    return {
+        "status": "ok",
+        "profiles_updated": updated_count
+    }
+
+
+@plugin.method("hive-nnlb-status")
+def hive_nnlb_status(plugin: Plugin):
+    """
+    Get NNLB (No Node Left Behind) status.
+
+    Shows health distribution across hive members and identifies
+    struggling members who may need assistance.
+
+    Returns:
+        Dict with NNLB statistics and member health tiers.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not fee_intel_mgr:
+        return {"error": "Fee intelligence manager not initialized"}
+
+    return fee_intel_mgr.get_nnlb_status()
+
+
+@plugin.method("hive-member-health")
+def hive_member_health(plugin: Plugin, peer_id: str = None):
+    """
+    Get health records for hive members.
+
+    Health records include capacity, revenue, and connectivity scores
+    used for NNLB assistance decisions.
+
+    Args:
+        peer_id: Optional specific member to query
+
+    Returns:
+        Dict with health record(s).
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if peer_id:
+        health = database.get_member_health(peer_id)
+        if not health:
+            return {
+                "peer_id": peer_id,
+                "error": "No health record found"
+            }
+        return {"health": health}
+    else:
+        all_health = database.get_all_member_health()
+        return {
+            "member_count": len(all_health),
+            "health_records": all_health
+        }
+
+
+@plugin.method("hive-calculate-health")
+def hive_calculate_health(plugin: Plugin):
+    """
+    Calculate and return our node's health score.
+
+    Uses local channel and revenue data to calculate health scores
+    for NNLB purposes.
+
+    Returns:
+        Dict with our health assessment.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not fee_intel_mgr or not safe_plugin:
+        return {"error": "Not initialized"}
+
+    # Get our channel data
+    try:
+        funds = safe_plugin.rpc.listfunds()
+        channels = funds.get("channels", [])
+
+        capacity_sats = sum(
+            ch.get("our_amount_msat", 0) // 1000 + ch.get("amount_msat", 0) // 1000 - ch.get("our_amount_msat", 0) // 1000
+            for ch in channels if ch.get("state") == "CHANNELD_NORMAL"
+        )
+        available_sats = sum(
+            ch.get("our_amount_msat", 0) // 1000
+            for ch in channels if ch.get("state") == "CHANNELD_NORMAL"
+        )
+        channel_count = len([ch for ch in channels if ch.get("state") == "CHANNELD_NORMAL"])
+
+    except Exception as e:
+        return {"error": f"Failed to get channel data: {e}"}
+
+    # Get hive averages for comparison
+    all_health = database.get_all_member_health() if database else []
+    if all_health:
+        hive_avg_capacity = sum(h.get("capacity_score", 50) for h in all_health) / len(all_health) * 200000
+    else:
+        hive_avg_capacity = 10_000_000  # 10M default
+
+    # Calculate health (revenue estimation simplified)
+    health = fee_intel_mgr.calculate_our_health(
+        capacity_sats=capacity_sats,
+        available_sats=available_sats,
+        channel_count=channel_count,
+        daily_revenue_sats=0,  # Would need forwarding stats
+        hive_avg_capacity=int(hive_avg_capacity)
+    )
+
+    return {
+        "our_pubkey": our_pubkey,
+        "channel_count": channel_count,
+        "capacity_sats": capacity_sats,
+        "available_sats": available_sats,
+        **health
     }
 
 
