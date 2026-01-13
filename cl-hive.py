@@ -59,7 +59,7 @@ from modules.protocol import (
     validate_gossip, validate_state_hash, validate_full_sync, validate_intent_abort,
     get_gossip_signing_payload, get_state_hash_signing_payload,
     get_full_sync_signing_payload, get_intent_abort_signing_payload,
-    get_peer_available_signing_payload,
+    get_peer_available_signing_payload, compute_states_hash,
 )
 from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager
@@ -1507,6 +1507,19 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         )
         return {"result": "continue"}
 
+    # SECURITY: Verify states match the signed fleet_hash (prevent state injection)
+    states = payload.get("states", [])
+    fleet_hash = payload.get("fleet_hash", "")
+    if states and fleet_hash:
+        computed_hash = compute_states_hash(states)
+        if computed_hash != fleet_hash:
+            plugin.log(
+                f"cl-hive: FULL_SYNC states hash mismatch from {peer_id[:16]}...: "
+                f"computed={computed_hash[:16]}... expected={fleet_hash[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+
     # SECURITY: Membership check to prevent state poisoning
     if database:
         member = database.get_member(peer_id)
@@ -1652,8 +1665,9 @@ def _create_signed_state_hash_msg() -> Optional[bytes]:
     # Create base payload
     state_hash_payload = gossip_mgr.create_state_hash_payload()
 
-    # Add sender identification
+    # Add sender identification and timestamp
     state_hash_payload["sender_id"] = our_pubkey
+    state_hash_payload["timestamp"] = int(time.time())
 
     # Sign the payload
     signing_payload = get_state_hash_signing_payload(state_hash_payload)
@@ -1665,6 +1679,51 @@ def _create_signed_state_hash_msg() -> Optional[bytes]:
         return None
 
     return serialize(HiveMessageType.STATE_HASH, state_hash_payload)
+
+
+def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
+                               fee_policy: Dict, topology: list) -> Optional[bytes]:
+    """
+    Create a signed GOSSIP message for broadcast.
+
+    SECURITY: All GOSSIP messages must be cryptographically signed
+    to prevent data tampering attacks where attackers modify fee
+    policies, topology, or capacity data.
+
+    Args:
+        capacity_sats: Total Hive channel capacity
+        available_sats: Available outbound liquidity
+        fee_policy: Current fee policy dict
+        topology: List of external peer connections
+
+    Returns:
+        Serialized and signed GOSSIP message, or None if signing fails
+    """
+    if not gossip_mgr or not safe_plugin or not our_pubkey:
+        return None
+
+    # Create gossip payload using GossipManager
+    gossip_payload = gossip_mgr.create_gossip_payload(
+        our_pubkey=our_pubkey,
+        capacity_sats=capacity_sats,
+        available_sats=available_sats,
+        fee_policy=fee_policy,
+        topology=topology
+    )
+
+    # Add sender identification for signature verification
+    gossip_payload["sender_id"] = our_pubkey
+
+    # Sign the payload (includes data hash for integrity)
+    signing_payload = get_gossip_signing_payload(gossip_payload)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        gossip_payload["signature"] = sig_result["zbase"]
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign GOSSIP: {e}", level='error')
+        return None
+
+    return serialize(HiveMessageType.GOSSIP, gossip_payload)
 
 
 def _broadcast_full_sync_to_members(plugin: Plugin) -> None:

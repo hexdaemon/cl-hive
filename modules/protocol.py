@@ -17,6 +17,7 @@ Wire Format:
 Message ID Range: 32769 - 33000 (Odd numbers for safe ignoring by non-Hive peers)
 """
 
+import hashlib
 import json
 from enum import IntEnum
 from typing import Dict, Any, Optional, Tuple
@@ -532,17 +533,45 @@ def validate_gossip(payload: Dict[str, Any]) -> bool:
     return True
 
 
+def compute_gossip_data_hash(payload: Dict[str, Any]) -> str:
+    """
+    Compute a hash of the GOSSIP data fields.
+
+    SECURITY: This hash is included in the signature to prevent
+    data tampering while keeping the signing payload small.
+    """
+    data_fields = {
+        "capacity_sats": payload.get("capacity_sats", 0),
+        "available_sats": payload.get("available_sats", 0),
+        "fee_policy": payload.get("fee_policy", {}),
+        "topology": sorted(payload.get("topology", [])),  # Sort for determinism
+    }
+    json_str = json.dumps(data_fields, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
+
 def get_gossip_signing_payload(payload: Dict[str, Any]) -> str:
     """
     Get the canonical payload string for signing GOSSIP messages.
 
-    The signature covers core fields in sorted order.
+    SECURITY: The signature covers:
+    - sender_id: Identity of sender
+    - timestamp: Replay protection
+    - version: State version for conflict resolution
+    - fleet_hash: Overall fleet state hash
+    - data_hash: Hash of actual gossip data (fee_policy, topology, capacity)
+
+    This prevents data tampering attacks where an attacker modifies
+    the fee policies or topology while keeping the signature valid.
     """
+    data_hash = compute_gossip_data_hash(payload)
+
     signing_fields = {
         "sender_id": payload.get("sender_id", ""),
         "timestamp": payload.get("timestamp", 0),
         "version": payload.get("version", 0),
         "fleet_hash": payload.get("fleet_hash", ""),
+        "data_hash": data_hash,
     }
     return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
 
@@ -638,18 +667,98 @@ def validate_full_sync(payload: Dict[str, Any]) -> bool:
     return True
 
 
+def compute_members_hash(members: list) -> str:
+    """
+    Compute a deterministic hash of the members list.
+
+    SECURITY: This hash is included in the FULL_SYNC signature to prevent
+    membership injection attacks. Without this, an attacker could modify
+    the members array while keeping the signature valid.
+
+    Args:
+        members: List of member dicts with peer_id, tier, joined_at
+
+    Returns:
+        Hex-encoded SHA256 hash of the sorted members array
+    """
+    if not members:
+        return ""
+
+    # Extract minimal fields and sort by peer_id for determinism
+    member_tuples = [
+        {
+            "peer_id": m.get("peer_id", ""),
+            "tier": m.get("tier", ""),
+            "joined_at": m.get("joined_at", 0),
+        }
+        for m in members
+    ]
+    member_tuples.sort(key=lambda x: x["peer_id"])
+
+    json_str = json.dumps(member_tuples, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
+
+def compute_states_hash(states: list) -> str:
+    """
+    Compute a deterministic hash of the states list.
+
+    SECURITY: This allows receivers to verify that received states
+    match the signed fleet_hash, preventing state injection attacks.
+
+    Algorithm matches StateManager.calculate_fleet_hash():
+    1. Extract minimal tuples: (peer_id, version, timestamp)
+    2. Sort by peer_id (lexicographic)
+    3. Serialize to JSON with sorted keys
+    4. SHA256 hash the result
+
+    Args:
+        states: List of state dicts from FULL_SYNC
+
+    Returns:
+        Hex-encoded SHA256 hash of the sorted state tuples
+    """
+    if not states:
+        return ""
+
+    # Extract minimal state tuples (matching StateManager algorithm)
+    state_tuples = [
+        {
+            "peer_id": s.get("peer_id", ""),
+            "version": s.get("version", 0),
+            "timestamp": s.get("last_update", s.get("timestamp", 0)),
+        }
+        for s in states
+    ]
+
+    # Sort by peer_id for determinism
+    state_tuples.sort(key=lambda x: x["peer_id"])
+
+    # Serialize and hash
+    json_str = json.dumps(state_tuples, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
+
 def get_full_sync_signing_payload(payload: Dict[str, Any]) -> str:
     """
     Get the canonical payload string for signing FULL_SYNC messages.
 
-    The signature covers the fleet_hash which is a digest of all states,
-    plus sender identification. This prevents state tampering.
+    SECURITY: The signature covers:
+    - sender_id: Identity of sender
+    - fleet_hash: Cryptographic digest of states (verified separately)
+    - members_hash: Cryptographic digest of members list
+    - timestamp: Replay protection
+
+    This prevents both state tampering AND membership injection attacks.
     """
+    members = payload.get("members", [])
+    members_hash = compute_members_hash(members)
+
     signing_fields = {
         "sender_id": payload.get("sender_id", ""),
         "fleet_hash": payload.get("fleet_hash", ""),
+        "members_hash": members_hash,
         "timestamp": payload.get("timestamp", 0),
-        "state_count": len(payload.get("states", [])),
     }
     return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
 
