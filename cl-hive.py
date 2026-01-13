@@ -54,7 +54,12 @@ from modules.protocol import (
     create_expansion_nominate, create_expansion_elect,
     get_expansion_nominate_signing_payload, get_expansion_elect_signing_payload,
     VOUCH_TTL_SECONDS, MAX_VOUCHES_IN_PROMOTION,
-    create_challenge, create_welcome
+    create_challenge, create_welcome,
+    # Signed message validation (security hardening)
+    validate_gossip, validate_state_hash, validate_full_sync, validate_intent_abort,
+    get_gossip_signing_payload, get_state_hash_signing_payload,
+    get_full_sync_signing_payload, get_intent_abort_signing_payload,
+    get_peer_available_signing_payload, compute_states_hash,
 )
 from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager
@@ -1312,17 +1317,16 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Initiate state sync with the peer that welcomed us
     if gossip_mgr and safe_plugin:
-        state_hash_payload = gossip_mgr.create_state_hash_payload()
-        state_hash_msg = serialize(HiveMessageType.STATE_HASH, state_hash_payload)
-
-        try:
-            safe_plugin.rpc.call("sendcustommsg", {
-                "node_id": peer_id,
-                "msg": state_hash_msg.hex()
-            })
-            plugin.log(f"cl-hive: STATE_HASH sent to {peer_id[:16]}... for anti-entropy sync")
-        except Exception as e:
-            plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
+        state_hash_msg = _create_signed_state_hash_msg()
+        if state_hash_msg:
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": peer_id,
+                    "msg": state_hash_msg.hex()
+                })
+                plugin.log(f"cl-hive: STATE_HASH sent to {peer_id[:16]}... for anti-entropy sync")
+            except Exception as e:
+                plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
 
     return {"result": "continue"}
 
@@ -1337,11 +1341,46 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     Process incoming gossip and update our local state cache.
     The GossipManager handles version validation and StateManager updates.
+
+    SECURITY: Requires cryptographic signature verification.
     """
     if not gossip_mgr:
         return {"result": "continue"}
 
-    # P3-02: Verify sender is a Hive member before processing
+    # SECURITY: Validate payload structure including signature field
+    if not validate_gossip(payload):
+        plugin.log(
+            f"cl-hive: GOSSIP rejected from {peer_id[:16]}...: invalid payload",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # SECURITY: Verify cryptographic signature
+    sender_id = payload.get("sender_id")
+    signature = payload.get("signature")
+    signing_payload = get_gossip_signing_payload(payload)
+
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != sender_id:
+            plugin.log(
+                f"cl-hive: GOSSIP signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: GOSSIP signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify sender identity matches peer_id
+    if sender_id != peer_id:
+        plugin.log(
+            f"cl-hive: GOSSIP sender mismatch: claimed {sender_id[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Verify sender is a Hive member before processing
     if not database:
         return {"result": "continue"}
     member = database.get_member(peer_id)
@@ -1350,11 +1389,11 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     accepted = gossip_mgr.process_gossip(peer_id, payload)
-    
+
     if accepted:
         plugin.log(f"cl-hive: GOSSIP accepted from {peer_id[:16]}... "
                    f"(v{payload.get('version', '?')})", level='debug')
-    
+
     return {"result": "continue"}
 
 
@@ -1364,27 +1403,60 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     Compare remote hash against our local state. If mismatch,
     send a FULL_SYNC with our complete state including membership.
+
+    SECURITY: Requires cryptographic signature verification.
     """
     if not gossip_mgr or not state_manager:
+        return {"result": "continue"}
+
+    # SECURITY: Validate payload structure including signature field
+    if not validate_state_hash(payload):
+        plugin.log(
+            f"cl-hive: STATE_HASH rejected from {peer_id[:16]}...: invalid payload",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # SECURITY: Verify cryptographic signature
+    sender_id = payload.get("sender_id")
+    signature = payload.get("signature")
+    signing_payload = get_state_hash_signing_payload(payload)
+
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != sender_id:
+            plugin.log(
+                f"cl-hive: STATE_HASH signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: STATE_HASH signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify sender identity matches peer_id
+    if sender_id != peer_id:
+        plugin.log(
+            f"cl-hive: STATE_HASH sender mismatch: claimed {sender_id[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
         return {"result": "continue"}
 
     hashes_match = gossip_mgr.process_state_hash(peer_id, payload)
 
     if not hashes_match:
-        # State divergence detected - send FULL_SYNC with membership
+        # State divergence detected - send signed FULL_SYNC with membership
         plugin.log(f"cl-hive: State divergence with {peer_id[:16]}..., sending FULL_SYNC")
 
-        full_sync_payload = gossip_mgr.create_full_sync_payload()
-        full_sync_payload["members"] = _create_membership_payload()
-        full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
-
-        try:
-            safe_plugin.rpc.call("sendcustommsg", {
-                "node_id": peer_id,
-                "msg": full_sync_msg.hex()
-            })
-        except Exception as e:
-            plugin.log(f"cl-hive: Failed to send FULL_SYNC: {e}", level='warn')
+        full_sync_msg = _create_signed_full_sync_msg()
+        if full_sync_msg:
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": peer_id,
+                    "msg": full_sync_msg.hex()
+                })
+            except Exception as e:
+                plugin.log(f"cl-hive: Failed to send FULL_SYNC: {e}", level='warn')
 
     return {"result": "continue"}
 
@@ -1396,13 +1468,59 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     Merge the received state with our local state, preferring
     higher version numbers for each peer.
 
-    SECURITY: Only accept FULL_SYNC from Hive members to prevent
-    state poisoning attacks from arbitrary peers.
+    SECURITY: Requires cryptographic signature verification.
+    Only accept FULL_SYNC from authenticated Hive members.
     """
     if not gossip_mgr:
         return {"result": "continue"}
 
-    # SECURITY: Membership check to prevent state poisoning (Issue #8)
+    # SECURITY: Validate payload structure including signature field
+    if not validate_full_sync(payload):
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: invalid payload structure",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # SECURITY: Verify cryptographic signature
+    sender_id = payload.get("sender_id")
+    signature = payload.get("signature")
+    signing_payload = get_full_sync_signing_payload(payload)
+
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != sender_id:
+            plugin.log(
+                f"cl-hive: FULL_SYNC signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: FULL_SYNC signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify sender identity matches peer_id (prevent relay attacks)
+    if sender_id != peer_id:
+        plugin.log(
+            f"cl-hive: FULL_SYNC sender mismatch: claimed {sender_id[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # SECURITY: Verify states match the signed fleet_hash (prevent state injection)
+    states = payload.get("states", [])
+    fleet_hash = payload.get("fleet_hash", "")
+    if states and fleet_hash:
+        computed_hash = compute_states_hash(states)
+        if computed_hash != fleet_hash:
+            plugin.log(
+                f"cl-hive: FULL_SYNC states hash mismatch from {peer_id[:16]}...: "
+                f"computed={computed_hash[:16]}... expected={fleet_hash[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+
+    # SECURITY: Membership check to prevent state poisoning
     if database:
         member = database.get_member(peer_id)
         if not member:
@@ -1498,24 +1616,135 @@ def _create_membership_payload() -> list:
     ]
 
 
+def _create_signed_full_sync_msg() -> Optional[bytes]:
+    """
+    Create a signed FULL_SYNC message with membership.
+
+    SECURITY: All FULL_SYNC messages must be cryptographically signed
+    to prevent state poisoning attacks.
+
+    Returns:
+        Serialized and signed FULL_SYNC message, or None if signing fails
+    """
+    if not gossip_mgr or not safe_plugin or not our_pubkey:
+        return None
+
+    # Create base payload
+    full_sync_payload = gossip_mgr.create_full_sync_payload()
+    full_sync_payload["members"] = _create_membership_payload()
+
+    # Add sender identification
+    full_sync_payload["sender_id"] = our_pubkey
+    full_sync_payload["timestamp"] = int(time.time())
+
+    # Sign the payload
+    signing_payload = get_full_sync_signing_payload(full_sync_payload)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        full_sync_payload["signature"] = sig_result["zbase"]
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign FULL_SYNC: {e}", level='error')
+        return None
+
+    return serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+
+
+def _create_signed_state_hash_msg() -> Optional[bytes]:
+    """
+    Create a signed STATE_HASH message for anti-entropy sync.
+
+    SECURITY: All STATE_HASH messages must be cryptographically signed
+    to prevent hash manipulation attacks.
+
+    Returns:
+        Serialized and signed STATE_HASH message, or None if signing fails
+    """
+    if not gossip_mgr or not safe_plugin or not our_pubkey:
+        return None
+
+    # Create base payload
+    state_hash_payload = gossip_mgr.create_state_hash_payload()
+
+    # Add sender identification and timestamp
+    state_hash_payload["sender_id"] = our_pubkey
+    state_hash_payload["timestamp"] = int(time.time())
+
+    # Sign the payload
+    signing_payload = get_state_hash_signing_payload(state_hash_payload)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        state_hash_payload["signature"] = sig_result["zbase"]
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign STATE_HASH: {e}", level='error')
+        return None
+
+    return serialize(HiveMessageType.STATE_HASH, state_hash_payload)
+
+
+def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
+                               fee_policy: Dict, topology: list) -> Optional[bytes]:
+    """
+    Create a signed GOSSIP message for broadcast.
+
+    SECURITY: All GOSSIP messages must be cryptographically signed
+    to prevent data tampering attacks where attackers modify fee
+    policies, topology, or capacity data.
+
+    Args:
+        capacity_sats: Total Hive channel capacity
+        available_sats: Available outbound liquidity
+        fee_policy: Current fee policy dict
+        topology: List of external peer connections
+
+    Returns:
+        Serialized and signed GOSSIP message, or None if signing fails
+    """
+    if not gossip_mgr or not safe_plugin or not our_pubkey:
+        return None
+
+    # Create gossip payload using GossipManager
+    gossip_payload = gossip_mgr.create_gossip_payload(
+        our_pubkey=our_pubkey,
+        capacity_sats=capacity_sats,
+        available_sats=available_sats,
+        fee_policy=fee_policy,
+        topology=topology
+    )
+
+    # Add sender identification for signature verification
+    gossip_payload["sender_id"] = our_pubkey
+
+    # Sign the payload (includes data hash for integrity)
+    signing_payload = get_gossip_signing_payload(gossip_payload)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        gossip_payload["signature"] = sig_result["zbase"]
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign GOSSIP: {e}", level='error')
+        return None
+
+    return serialize(HiveMessageType.GOSSIP, gossip_payload)
+
+
 def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
     """
-    Broadcast FULL_SYNC with membership to all existing members.
+    Broadcast signed FULL_SYNC with membership to all existing members.
 
     Called after adding a new member to ensure all nodes sync.
+    SECURITY: All FULL_SYNC messages are cryptographically signed.
     """
     if not database or not gossip_mgr or not safe_plugin:
-        plugin.log(f"cl-hive: _broadcast_full_sync_to_members: missing deps - db={database is not None}, gossip={gossip_mgr is not None}, plugin={safe_plugin is not None}", level='debug')
+        plugin.log(f"cl-hive: _broadcast_full_sync_to_members: missing deps", level='debug')
         return
 
     members = database.get_all_members()
     plugin.log(f"cl-hive: Broadcasting membership to {len(members)} known members")
 
-    # Create FULL_SYNC payload with membership
-    full_sync_payload = gossip_mgr.create_full_sync_payload()
-    full_sync_payload["members"] = _create_membership_payload()
-
-    full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+    # Create signed FULL_SYNC payload with membership
+    full_sync_msg = _create_signed_full_sync_msg()
+    if not full_sync_msg:
+        plugin.log("cl-hive: Failed to create signed FULL_SYNC", level='error')
+        return
 
     sent_count = 0
     for member in members:
@@ -1576,18 +1805,17 @@ def on_peer_connected(**kwargs):
     if safe_plugin:
         safe_plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
 
-    # Send STATE_HASH for anti-entropy check
-    state_hash_payload = gossip_mgr.create_state_hash_payload()
-    state_hash_msg = serialize(HiveMessageType.STATE_HASH, state_hash_payload)
-
-    try:
-        safe_plugin.rpc.call("sendcustommsg", {
-            "node_id": peer_id,
-            "msg": state_hash_msg.hex()
-        })
-    except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
+    # Send signed STATE_HASH for anti-entropy check
+    state_hash_msg = _create_signed_state_hash_msg()
+    if state_hash_msg:
+        try:
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": peer_id,
+                "msg": state_hash_msg.hex()
+            })
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
 
 
 @plugin.subscribe("disconnect")
@@ -1694,49 +1922,92 @@ def handle_intent(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 def handle_intent_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle HIVE_INTENT_ABORT message (remote node yielding).
-    
+
     Update our record to show the remote node aborted their intent.
+
+    SECURITY: Requires cryptographic signature verification.
+    Only the intent owner can abort their own intent.
     """
     if not intent_mgr:
         return {"result": "continue"}
-    
+
+    # SECURITY: Validate payload structure including signature field
+    if not validate_intent_abort(payload):
+        plugin.log(
+            f"cl-hive: INTENT_ABORT rejected from {peer_id[:16]}...: invalid payload",
+            level='warn'
+        )
+        return {"result": "continue"}
+
     intent_type = payload.get('intent_type')
     target = payload.get('target')
     initiator = payload.get('initiator')
+    signature = payload.get('signature')
 
-    if not intent_type or not target or not initiator:
-        plugin.log(f"cl-hive: INTENT_ABORT from {peer_id[:16]}... missing fields", level='warn')
+    # SECURITY: Verify cryptographic signature
+    signing_payload = get_intent_abort_signing_payload(payload)
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != initiator:
+            plugin.log(
+                f"cl-hive: INTENT_ABORT signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: INTENT_ABORT signature check failed: {e}", level='warn')
         return {"result": "continue"}
-    
+
+    # SECURITY: Verify initiator matches peer_id (only abort your own intents)
+    if initiator != peer_id:
+        plugin.log(
+            f"cl-hive: INTENT_ABORT initiator mismatch: claimed {initiator[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
     intent_mgr.record_remote_abort(intent_type, target, initiator)
     plugin.log(f"cl-hive: INTENT_ABORT from {peer_id[:16]}... for {target[:16]}...")
-    
+
     return {"result": "continue"}
 
 
 def broadcast_intent_abort(target: str, intent_type: str) -> None:
     """
-    Broadcast HIVE_INTENT_ABORT to all Hive members.
-    
+    Broadcast signed HIVE_INTENT_ABORT to all Hive members.
+
     Called when we lose a tie-breaker and need to yield.
+
+    SECURITY: All INTENT_ABORT messages are cryptographically signed.
     """
     if not database or not safe_plugin or not intent_mgr:
         return
-    
+
     members = database.get_all_members()
     abort_payload = {
         'intent_type': intent_type,
         'target': target,
         'initiator': intent_mgr.our_pubkey,
+        'timestamp': int(time.time()),
         'reason': 'tie_breaker_loss'
     }
+
+    # Sign the payload
+    signing_payload = get_intent_abort_signing_payload(abort_payload)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        abort_payload['signature'] = sig_result['zbase']
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign INTENT_ABORT: {e}", level='error')
+        return
+
     abort_msg = serialize(HiveMessageType.INTENT_ABORT, abort_payload)
-    
+
     for member in members:
         member_id = member['peer_id']
         if member_id == intent_mgr.our_pubkey:
             continue  # Skip self
-        
+
         try:
             safe_plugin.rpc.call("sendcustommsg", {
                 "node_id": member_id,
@@ -1834,10 +2105,12 @@ def _sync_member_policies(plugin: Plugin) -> None:
 
 def _sync_membership_on_startup(plugin: Plugin) -> None:
     """
-    Broadcast membership list to all known peers on startup.
+    Broadcast signed membership list to all known peers on startup.
 
     This ensures all nodes converge to the same membership state
     when the plugin restarts.
+
+    SECURITY: All FULL_SYNC messages are cryptographically signed.
     """
     if not database or not gossip_mgr or not safe_plugin:
         return
@@ -1846,10 +2119,11 @@ def _sync_membership_on_startup(plugin: Plugin) -> None:
     if len(members) <= 1:
         return  # Just us, nothing to sync
 
-    # Create FULL_SYNC with membership
-    full_sync_payload = gossip_mgr.create_full_sync_payload()
-    full_sync_payload["members"] = _create_membership_payload()
-    full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+    # Create signed FULL_SYNC with membership
+    full_sync_msg = _create_signed_full_sync_msg()
+    if not full_sync_msg:
+        plugin.log("cl-hive: Failed to create signed FULL_SYNC for startup sync", level='error')
+        return
 
     sent_count = 0
     for member in members:
@@ -2352,12 +2626,39 @@ def handle_peer_available(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     Phase 6.1: ALL events are stored in peer_events table for topology intelligence.
     The receiving node uses this data to make informed expansion decisions.
+
+    SECURITY: Requires cryptographic signature verification.
     """
     if not config or not database:
         return {"result": "continue"}
 
     if not validate_peer_available(payload):
         plugin.log(f"cl-hive: PEER_AVAILABLE from {peer_id[:16]}... invalid payload", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify cryptographic signature
+    reporter_peer_id = payload.get("reporter_peer_id")
+    signature = payload.get("signature")
+    signing_payload = get_peer_available_signing_payload(payload)
+
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != reporter_peer_id:
+            plugin.log(
+                f"cl-hive: PEER_AVAILABLE signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: PEER_AVAILABLE signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify reporter matches peer_id (prevent relay attacks)
+    if reporter_peer_id != peer_id:
+        plugin.log(
+            f"cl-hive: PEER_AVAILABLE reporter mismatch: claimed {reporter_peer_id[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
         return {"result": "continue"}
 
     # Verify sender is a hive member and not banned
@@ -2594,7 +2895,9 @@ def broadcast_peer_available(target_peer_id: str, event_type: str,
                               their_funding_sats: int = 0,
                               opener: str = "") -> int:
     """
-    Broadcast PEER_AVAILABLE to all hive members.
+    Broadcast signed PEER_AVAILABLE to all hive members.
+
+    SECURITY: All PEER_AVAILABLE messages are cryptographically signed.
 
     Args:
         target_peer_id: The external peer involved
@@ -2624,12 +2927,32 @@ def broadcast_peer_available(target_peer_id: str, event_type: str,
     except Exception:
         return 0
 
-    import time
+    timestamp = int(time.time())
+
+    # Build payload for signing
+    signing_payload_dict = {
+        "target_peer_id": target_peer_id,
+        "reporter_peer_id": our_id,
+        "event_type": event_type,
+        "timestamp": timestamp,
+        "capacity_sats": capacity_sats,
+    }
+
+    # Sign the payload
+    signing_str = get_peer_available_signing_payload(signing_payload_dict)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_str)
+        signature = sig_result['zbase']
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign PEER_AVAILABLE: {e}", level='error')
+        return 0
+
     msg = create_peer_available(
         target_peer_id=target_peer_id,
         reporter_peer_id=our_id,
         event_type=event_type,
-        timestamp=int(time.time()),
+        timestamp=timestamp,
+        signature=signature,
         channel_id=channel_id,
         capacity_sats=capacity_sats,
         routing_score=routing_score,
@@ -4715,6 +5038,11 @@ def hive_approve_action(plugin: Plugin, action_id: int, amount_sats: int = None)
                 "broadcast_count": broadcast_count,
                 "sizing_reasoning": context.get('sizing_reasoning', 'N/A'),
             }
+            if channel_size_sats < proposed_size:
+                result["budget_reduced"] = True
+                result["reduction_reason"] = (
+                    f"Reduced from {proposed_size:,} to {channel_size_sats:,} sats due to budget constraints"
+                )
             if override_applied:
                 result["override_applied"] = True
                 result["override_amount"] = amount_sats
@@ -4729,15 +5057,24 @@ def hive_approve_action(plugin: Plugin, action_id: int, amount_sats: int = None)
             # Update action status to failed
             database.update_action_status(action_id, 'failed')
 
-            return {
+            result = {
                 "status": "failed",
                 "action_id": action_id,
                 "action_type": action_type,
                 "target": target,
                 "channel_size_sats": channel_size_sats,
+                "proposed_size_sats": proposed_size,
                 "error": error_msg,
                 "broadcast_count": broadcast_count,
             }
+            if channel_size_sats < proposed_size:
+                result["budget_reduced"] = True
+                result["reduction_reason"] = (
+                    f"Reduced from {proposed_size:,} to {channel_size_sats:,} sats due to budget constraints"
+                )
+            if budget_info:
+                result["budget_info"] = budget_info
+            return result
 
     else:
         # Unknown action type - just mark as approved
