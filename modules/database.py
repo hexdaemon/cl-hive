@@ -490,6 +490,35 @@ class HiveDatabase:
             "ON liquidity_needs(urgency)"
         )
 
+        # =====================================================================
+        # ROUTE PROBES TABLE (Phase 7.4 - Routing Intelligence)
+        # =====================================================================
+        # Stores route probe observations from hive members
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS route_probes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                path TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                latency_ms INTEGER DEFAULT 0,
+                failure_reason TEXT DEFAULT '',
+                failure_hop INTEGER DEFAULT -1,
+                estimated_capacity_sats INTEGER DEFAULT 0,
+                total_fee_ppm INTEGER DEFAULT 0,
+                amount_probed_sats INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_route_probes_destination "
+            "ON route_probes(destination)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_route_probes_timestamp "
+            "ON route_probes(timestamp)"
+        )
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -2453,5 +2482,200 @@ class HiveDatabase:
         cutoff = int(time.time()) - (max_age_hours * 3600)
         cursor = conn.execute("""
             DELETE FROM liquidity_needs WHERE timestamp < ?
+        """, (cutoff,))
+        return cursor.rowcount
+
+    # =========================================================================
+    # ROUTE PROBES OPERATIONS (Phase 7.4 - Routing Intelligence)
+    # =========================================================================
+
+    def store_route_probe(
+        self,
+        reporter_id: str,
+        destination: str,
+        path: List[str],
+        success: bool,
+        latency_ms: int = 0,
+        failure_reason: str = "",
+        failure_hop: int = -1,
+        estimated_capacity_sats: int = 0,
+        total_fee_ppm: int = 0,
+        amount_probed_sats: int = 0,
+        timestamp: Optional[int] = None
+    ):
+        """
+        Store a route probe observation.
+
+        Args:
+            reporter_id: Hive member reporting the probe
+            destination: Final destination pubkey
+            path: List of intermediate hop pubkeys
+            success: Whether probe succeeded
+            latency_ms: Round-trip latency
+            failure_reason: Reason for failure
+            failure_hop: Index of failing hop
+            estimated_capacity_sats: Estimated capacity
+            total_fee_ppm: Total route fees
+            amount_probed_sats: Amount probed
+            timestamp: When probe was performed
+        """
+        conn = self._get_connection()
+        now = timestamp or int(time.time())
+
+        # Store path as JSON string
+        import json
+        path_str = json.dumps(path)
+
+        conn.execute("""
+            INSERT INTO route_probes
+            (reporter_id, destination, path, timestamp, success, latency_ms,
+             failure_reason, failure_hop, estimated_capacity_sats, total_fee_ppm,
+             amount_probed_sats)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            reporter_id, destination, path_str, now,
+            1 if success else 0, latency_ms,
+            failure_reason, failure_hop, estimated_capacity_sats,
+            total_fee_ppm, amount_probed_sats
+        ))
+
+    def get_route_probes_for_destination(
+        self,
+        destination: str,
+        max_age_hours: int = 24
+    ) -> List[Dict[str, Any]]:
+        """
+        Get route probes for a specific destination.
+
+        Args:
+            destination: Destination pubkey
+            max_age_hours: Maximum age to include
+
+        Returns:
+            List of route probe dicts
+        """
+        import json
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+
+        rows = conn.execute("""
+            SELECT * FROM route_probes
+            WHERE destination = ? AND timestamp >= ?
+            ORDER BY timestamp DESC
+        """, (destination, cutoff)).fetchall()
+
+        results = []
+        for row in rows:
+            probe = dict(row)
+            # Parse path from JSON
+            try:
+                probe["path"] = json.loads(probe.get("path", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                probe["path"] = []
+            probe["success"] = bool(probe.get("success", 0))
+            results.append(probe)
+
+        return results
+
+    def get_all_route_probes(
+        self,
+        max_age_hours: int = 24
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all recent route probes.
+
+        Args:
+            max_age_hours: Maximum age to include
+
+        Returns:
+            List of route probe dicts
+        """
+        import json
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+
+        rows = conn.execute("""
+            SELECT * FROM route_probes
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC
+        """, (cutoff,)).fetchall()
+
+        results = []
+        for row in rows:
+            probe = dict(row)
+            try:
+                probe["path"] = json.loads(probe.get("path", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                probe["path"] = []
+            probe["success"] = bool(probe.get("success", 0))
+            results.append(probe)
+
+        return results
+
+    def get_route_probe_stats(
+        self,
+        destination: str
+    ) -> Dict[str, Any]:
+        """
+        Get aggregated statistics for routes to a destination.
+
+        Args:
+            destination: Destination pubkey
+
+        Returns:
+            Dict with route statistics
+        """
+        conn = self._get_connection()
+
+        row = conn.execute("""
+            SELECT
+                COUNT(*) as probe_count,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count,
+                AVG(CASE WHEN success = 1 THEN latency_ms ELSE NULL END) as avg_latency,
+                AVG(CASE WHEN success = 1 THEN total_fee_ppm ELSE NULL END) as avg_fee,
+                MAX(CASE WHEN success = 1 THEN timestamp ELSE 0 END) as last_success,
+                COUNT(DISTINCT reporter_id) as reporter_count
+            FROM route_probes
+            WHERE destination = ?
+        """, (destination,)).fetchone()
+
+        if not row:
+            return {
+                "probe_count": 0,
+                "success_count": 0,
+                "success_rate": 0.0,
+                "avg_latency_ms": 0,
+                "avg_fee_ppm": 0,
+                "last_success": 0,
+                "reporter_count": 0
+            }
+
+        probe_count = row["probe_count"] or 0
+        success_count = row["success_count"] or 0
+
+        return {
+            "probe_count": probe_count,
+            "success_count": success_count,
+            "success_rate": success_count / probe_count if probe_count > 0 else 0.0,
+            "avg_latency_ms": int(row["avg_latency"] or 0),
+            "avg_fee_ppm": int(row["avg_fee"] or 0),
+            "last_success": row["last_success"] or 0,
+            "reporter_count": row["reporter_count"] or 0
+        }
+
+    def cleanup_old_route_probes(self, max_age_hours: int = 168) -> int:
+        """
+        Remove old route probe records.
+
+        Args:
+            max_age_hours: Maximum age to keep (default 7 days)
+
+        Returns:
+            Number of records deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+        cursor = conn.execute("""
+            DELETE FROM route_probes WHERE timestamp < ?
         """, (cutoff,))
         return cursor.rowcount

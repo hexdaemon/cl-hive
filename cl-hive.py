@@ -71,6 +71,7 @@ from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
 from modules.fee_intelligence import FeeIntelligenceManager
 from modules.liquidity_coordinator import LiquidityCoordinator
+from modules.routing_intelligence import HiveRoutingMap
 
 # Initialize the plugin
 plugin = Plugin()
@@ -948,6 +949,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Liquidity coordinator initialized")
 
+    # Initialize Routing Map (Phase 7.4 - Routing Intelligence)
+    global routing_map
+    routing_map = HiveRoutingMap(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey
+    )
+    # Load existing probes from database
+    routing_map.aggregate_from_database()
+    plugin.log("cl-hive: Routing map initialized")
+
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
     peer_available_limiter = RateLimiter(max_per_minute=10, window_seconds=60)
@@ -1080,6 +1092,8 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_health_report(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.LIQUIDITY_NEED:
             return handle_liquidity_need(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.ROUTE_PROBE:
+            return handle_route_probe(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type (Phase 4+)
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -3150,6 +3164,38 @@ def handle_liquidity_need(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     return {"result": "continue"}
 
 
+def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle ROUTE_PROBE message from a hive member.
+
+    Used for collective routing intelligence.
+    """
+    if not routing_map or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: ROUTE_PROBE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to routing map
+    result = routing_map.handle_route_probe(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored route probe from {peer_id[:16]}...",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: ROUTE_PROBE rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
 # =============================================================================
 # PHASE 3: INTENT MONITOR BACKGROUND THREAD
 # =============================================================================
@@ -3409,6 +3455,26 @@ def fee_intelligence_loop():
                     )
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Liquidity needs cleanup error: {e}", level='warn')
+
+            # Step 8: Cleanup old route probes (Phase 7.4 - Routing Intelligence)
+            try:
+                if routing_map:
+                    # Clean database
+                    deleted_probes = database.cleanup_old_route_probes(max_age_hours=24)
+                    if deleted_probes > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {deleted_probes} old route probes from database",
+                            level='debug'
+                        )
+                    # Clean in-memory stats
+                    cleaned_paths = routing_map.cleanup_stale_data()
+                    if cleaned_paths > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_paths} stale paths from routing map",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Route probe cleanup error: {e}", level='warn')
 
         except Exception as e:
             if safe_plugin:

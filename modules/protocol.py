@@ -18,9 +18,10 @@ Message ID Range: 32769 - 33000 (Odd numbers for safe ignoring by non-Hive peers
 """
 
 import json
+import time
 from enum import IntEnum
-from typing import Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass, field
 
 
 # =============================================================================
@@ -88,6 +89,7 @@ class HiveMessageType(IntEnum):
     FEE_INTELLIGENCE = 32809    # Share fee observations with hive
     LIQUIDITY_NEED = 32811      # Broadcast rebalancing needs
     HEALTH_REPORT = 32813       # NNLB health status report
+    ROUTE_PROBE = 32815         # Share routing observations (Phase 4)
 
 
 # =============================================================================
@@ -234,6 +236,39 @@ class HealthReportPayload:
     assistance_budget_sats: int = 0
 
 
+@dataclass
+class RouteProbePayload:
+    """
+    ROUTE_PROBE message payload - Routing intelligence.
+
+    Share payment path quality observations to build collective
+    routing intelligence across the hive.
+    """
+    reporter_id: str
+    timestamp: int
+    signature: str
+
+    # Route definition
+    destination: str           # Final destination pubkey
+    path: List[str]            # Intermediate hops (pubkeys)
+
+    # Probe results
+    success: bool              # Did the probe succeed
+    latency_ms: int            # Round-trip time in milliseconds
+    failure_reason: str = ""   # If failed: 'temporary', 'permanent', 'capacity'
+    failure_hop: int = -1      # Which hop failed (0-indexed, -1 if success)
+
+    # Capacity observations
+    estimated_capacity_sats: int = 0  # Max amount that would succeed
+
+    # Fee observations
+    total_fee_ppm: int = 0     # Total fees for this route
+    per_hop_fees: List[int] = field(default_factory=list)  # Fee at each hop
+
+    # Amount probed
+    amount_probed_sats: int = 0
+
+
 # =============================================================================
 # PHASE 7 VALIDATION CONSTANTS
 # =============================================================================
@@ -258,6 +293,13 @@ MIN_HEALTH_SCORE = 0
 FEE_INTELLIGENCE_RATE_LIMIT = (10, 3600)    # 10 per hour per sender
 LIQUIDITY_NEED_RATE_LIMIT = (5, 3600)       # 5 per hour per sender
 HEALTH_REPORT_RATE_LIMIT = (1, 3600)        # 1 per hour per sender
+ROUTE_PROBE_RATE_LIMIT = (20, 3600)         # 20 per hour per sender
+
+# Route probe constants
+MAX_PATH_LENGTH = 20                        # Maximum hops in a path
+MAX_LATENCY_MS = 60000                      # 60 seconds max latency
+MAX_CAPACITY_SATS = 1_000_000_000           # 1 BTC max capacity per route
+VALID_FAILURE_REASONS = {"", "temporary", "permanent", "capacity", "unknown"}
 
 
 # =============================================================================
@@ -1233,6 +1275,179 @@ def validate_health_report_payload(payload: Dict[str, Any]) -> bool:
         return False
 
     return True
+
+
+def get_route_probe_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for ROUTE_PROBE messages.
+
+    Args:
+        payload: ROUTE_PROBE message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    # Sort path to make signing deterministic
+    path = payload.get("path", [])
+    path_str = ",".join(sorted(path)) if path else ""
+
+    return (
+        f"ROUTE_PROBE:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('destination', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{path_str}:"
+        f"{payload.get('success', False)}:"
+        f"{payload.get('latency_ms', 0)}:"
+        f"{payload.get('total_fee_ppm', 0)}"
+    )
+
+
+def validate_route_probe_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a ROUTE_PROBE payload.
+
+    Args:
+        payload: ROUTE_PROBE message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    # Required string fields
+    reporter_id = payload.get("reporter_id")
+    destination = payload.get("destination")
+    signature = payload.get("signature")
+
+    if not isinstance(reporter_id, str) or not reporter_id:
+        return False
+    if not isinstance(destination, str) or not destination:
+        return False
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    # Timestamp
+    timestamp = payload.get("timestamp", 0)
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # Path validation
+    path = payload.get("path", [])
+    if not isinstance(path, list):
+        return False
+    if len(path) > MAX_PATH_LENGTH:
+        return False
+    for hop in path:
+        if not isinstance(hop, str):
+            return False
+
+    # Success must be boolean
+    success = payload.get("success")
+    if not isinstance(success, bool):
+        return False
+
+    # Latency bounds
+    latency_ms = payload.get("latency_ms", 0)
+    if not isinstance(latency_ms, int) or not (0 <= latency_ms <= MAX_LATENCY_MS):
+        return False
+
+    # Failure reason validation
+    failure_reason = payload.get("failure_reason", "")
+    if failure_reason not in VALID_FAILURE_REASONS:
+        return False
+
+    # Failure hop must be valid index or -1
+    failure_hop = payload.get("failure_hop", -1)
+    if not isinstance(failure_hop, int):
+        return False
+    if failure_hop != -1 and (failure_hop < 0 or failure_hop >= len(path)):
+        return False
+
+    # Capacity bounds
+    estimated_capacity = payload.get("estimated_capacity_sats", 0)
+    if not isinstance(estimated_capacity, int) or not (0 <= estimated_capacity <= MAX_CAPACITY_SATS):
+        return False
+
+    # Fee bounds
+    total_fee_ppm = payload.get("total_fee_ppm", 0)
+    if not isinstance(total_fee_ppm, int) or not (0 <= total_fee_ppm <= MAX_FEE_PPM * MAX_PATH_LENGTH):
+        return False
+
+    # Per-hop fees validation
+    per_hop_fees = payload.get("per_hop_fees", [])
+    if not isinstance(per_hop_fees, list):
+        return False
+    for fee in per_hop_fees:
+        if not isinstance(fee, int) or fee < 0:
+            return False
+
+    # Amount probed bounds
+    amount_probed = payload.get("amount_probed_sats", 0)
+    if not isinstance(amount_probed, int) or amount_probed < 0:
+        return False
+
+    return True
+
+
+def create_route_probe(
+    reporter_id: str,
+    destination: str,
+    path: List[str],
+    success: bool,
+    latency_ms: int,
+    rpc,
+    failure_reason: str = "",
+    failure_hop: int = -1,
+    estimated_capacity_sats: int = 0,
+    total_fee_ppm: int = 0,
+    per_hop_fees: List[int] = None,
+    amount_probed_sats: int = 0
+) -> Optional[bytes]:
+    """
+    Create a signed ROUTE_PROBE message.
+
+    Args:
+        reporter_id: Hive member reporting this probe
+        destination: Final destination pubkey
+        path: List of intermediate hop pubkeys
+        success: Whether probe succeeded
+        latency_ms: Round-trip time in milliseconds
+        rpc: RPC interface for signing
+        failure_reason: Reason for failure (if any)
+        failure_hop: Index of failing hop (if any)
+        estimated_capacity_sats: Estimated route capacity
+        total_fee_ppm: Total fees for route
+        per_hop_fees: Fee at each hop
+        amount_probed_sats: Amount that was probed
+
+    Returns:
+        Serialized and signed ROUTE_PROBE message, or None on error
+    """
+    timestamp = int(time.time())
+
+    payload = {
+        "reporter_id": reporter_id,
+        "destination": destination,
+        "timestamp": timestamp,
+        "path": path,
+        "success": success,
+        "latency_ms": latency_ms,
+        "failure_reason": failure_reason,
+        "failure_hop": failure_hop,
+        "estimated_capacity_sats": estimated_capacity_sats,
+        "total_fee_ppm": total_fee_ppm,
+        "per_hop_fees": per_hop_fees or [],
+        "amount_probed_sats": amount_probed_sats,
+    }
+
+    # Sign the payload
+    signing_message = get_route_probe_signing_payload(payload)
+    try:
+        sig_result = rpc.signmessage(signing_message)
+        payload["signature"] = sig_result["zbase"]
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.ROUTE_PROBE, payload)
 
 
 def create_fee_intelligence(
