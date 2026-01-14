@@ -63,19 +63,31 @@ Never trust self-reported data. All classifications based on:
 - Third-party corroboration
 - Economic incentive analysis
 
-### 2.2 Assume Hostility by Default
+### 2.2 Assume Predatory Until Proven Otherwise
 
-New hives start at `unknown` with restricted policies. Trust is earned through consistent positive interactions, never granted.
+**All detected hives start at `predatory` classification.** They are competing for the same ecological niche (routing fees, liquidity, market position). Trust is earned through sustained positive interactions over extended periods, never granted or assumed.
+
+**Rationale**: In a competitive network:
+- Resources (routing flows, liquidity corridors) are finite
+- Every hive is incentivized to maximize their share
+- Cooperation must be economically rational for both parties
+- The cost of trusting a predator exceeds the cost of slowly verifying a friend
 
 ### 2.3 Gradual Trust Building
 
 ```
-unknown → observed → neutral → cooperative → federated
-    ↓         ↓          ↓           ↓
-  hostile  predatory  competitive  [revoked]
+detected → predatory → competitive → neutral → cooperative → federated
+              ↓            ↓           ↓            ↓
+           hostile     parasitic   [downgrade]  [revoked]
 ```
 
-Trust increases slowly, decreases quickly.
+**Trust progression requirements**:
+- predatory → competitive: 60 days observation, no hostile actions, balanced economic relationship
+- competitive → neutral: 90 days, positive behavior score, reciprocal value exchange
+- neutral → cooperative: 180 days, high reliability, verified reciprocity
+- cooperative → federated: 365 days, formal agreement, mutual stake
+
+Trust increases **very slowly**, decreases **immediately**.
 
 ### 2.4 Reciprocity Required
 
@@ -84,6 +96,32 @@ Relationships must be mutually beneficial. One-sided value extraction triggers a
 ### 2.5 Isolation by Default
 
 Hive internal information is never shared with external hives unless explicitly federated and verified.
+
+### 2.6 Stealth Operations First
+
+**Never reveal hive membership when detecting or interacting with unknown hives.**
+
+Our strategy:
+1. **Detect silently**: Use passive observation and normal routing behavior
+2. **Build reputation first**: Establish ourselves as reliable routing nodes before any hive revelation
+3. **Gather intelligence**: Learn their behavior, capacity, and intentions through routing
+4. **Reveal strategically**: Only disclose hive membership when economically advantageous
+
+**Why stealth matters**:
+- Revealing hive status invites targeted competition
+- Predatory hives may specifically target known hive members
+- Intelligence gathering is more effective when undetected
+- Reputation earned "anonymously" is more trustworthy
+
+### 2.7 Normal Routing as Cover
+
+All intelligence gathering and reputation building should be indistinguishable from normal Lightning Network activity:
+- Route payments through suspected hive members
+- Accept their routing requests
+- Open channels that make economic sense anyway
+- Set fees based on normal revenue optimization
+
+**No hive-specific protocol messages until trust is established.**
 
 ---
 
@@ -197,12 +235,14 @@ CREATE TABLE detected_hives (
     hive_id TEXT PRIMARY KEY,
     members TEXT NOT NULL,          -- JSON array of pubkeys
     confidence REAL NOT NULL,
-    classification TEXT DEFAULT 'unknown',
+    classification TEXT DEFAULT 'predatory',  -- All hives start as predatory
     reputation_score REAL DEFAULT 0.0,
     first_detected INTEGER NOT NULL,
     last_updated INTEGER NOT NULL,
     detection_evidence TEXT,        -- JSON
-    policy_id INTEGER REFERENCES hive_policies(id)
+    policy_id INTEGER REFERENCES hive_policies(id),
+    our_revelation_status TEXT DEFAULT 'hidden',  -- hidden, partial, revealed
+    their_awareness TEXT DEFAULT 'unknown'        -- unknown, suspects, knows
 );
 
 CREATE TABLE hive_members (
@@ -212,6 +252,1127 @@ CREATE TABLE hive_members (
     first_seen INTEGER NOT NULL,
     last_confirmed INTEGER NOT NULL
 );
+
+-- Track our routing reputation with each detected hive
+CREATE TABLE hive_reputation_building (
+    hive_id TEXT PRIMARY KEY,
+    payments_routed_through INTEGER DEFAULT 0,
+    payments_routed_for INTEGER DEFAULT 0,
+    volume_routed_through_sats INTEGER DEFAULT 0,
+    volume_routed_for_sats INTEGER DEFAULT 0,
+    fees_earned_sats INTEGER DEFAULT 0,
+    fees_paid_sats INTEGER DEFAULT 0,
+    channels_with_members INTEGER DEFAULT 0,
+    avg_success_rate REAL DEFAULT 0.0,
+    first_interaction INTEGER,
+    last_interaction INTEGER,
+    reputation_score REAL DEFAULT 0.0,
+    ready_for_revelation BOOLEAN DEFAULT FALSE,
+
+    FOREIGN KEY (hive_id) REFERENCES detected_hives(hive_id)
+);
+```
+
+---
+
+## 3.5 Stealth-First Detection Strategy
+
+### 3.5.1 Core Principle: Detect Without Revealing
+
+When discovering and analyzing other hives, **never use hive-specific protocol messages**. All detection and initial reputation building must be done through normal Lightning Network activity.
+
+```python
+class StealthHiveDetector:
+    """Detect hives without revealing our own hive membership."""
+
+    def detect_silently(self) -> List[HiveSignature]:
+        """Detect hives using only passive observation and normal routing."""
+
+        methods = [
+            # Passive methods - no interaction required
+            self.analyze_gossip_patterns,       # Fee changes, channel opens
+            self.analyze_graph_topology,        # Clustering analysis
+            self.analyze_historical_data,       # Past routing patterns
+
+            # Active but indistinguishable from normal behavior
+            self.probe_via_normal_payments,     # Real payments, realistic amounts
+            self.observe_routing_behavior,      # How they route our payments
+        ]
+
+        # NEVER USE:
+        # - Hive-specific TLV messages
+        # - "Are you a hive?" queries
+        # - Any custom protocol that reveals hive awareness
+
+        candidates = []
+        for method in methods:
+            detected = method()
+            candidates.extend(detected)
+
+        return self.deduplicate_and_rank(candidates)
+
+    def probe_via_normal_payments(self) -> List[HiveSignature]:
+        """Probe using payments that look like normal traffic."""
+
+        # Use economically rational payments
+        # - Real payment amounts (not probe-like round numbers)
+        # - To destinations we have reason to pay
+        # - Through routes that make economic sense
+
+        # Record which nodes cluster together based on:
+        # - Internal routing costs
+        # - Success rates
+        # - Timing patterns
+
+        pass  # Implementation details in stealth probing section
+```
+
+### 3.5.2 Information Asymmetry Advantage
+
+**Goal**: Know more about them than they know about us.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    INFORMATION ASYMMETRY MATRIX                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  THEY DON'T KNOW:           │  WE KNOW:                            │
+│  • We are a hive            │  • They are a hive                   │
+│  • We detected them         │  • Their suspected members           │
+│  • We're building rep       │  • Their routing patterns            │
+│  • Our hive members         │  • Their fee strategies              │
+│  • Our coordinated strategy │  • Their liquidity distribution      │
+│                             │  • Their response to market changes  │
+│                                                                     │
+│  MAINTAIN THIS ADVANTAGE AS LONG AS POSSIBLE                        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.5.3 Pre-Revelation Reputation Building
+
+Before revealing hive membership, build a solid routing reputation through normal activity.
+
+```python
+class PreRevelationReputationBuilder:
+    """Build reputation with detected hives before revealing ourselves."""
+
+    # Thresholds for "ready to reveal"
+    MIN_ROUTING_DAYS = 90
+    MIN_PAYMENTS_ROUTED = 100
+    MIN_VOLUME_SATS = 10_000_000
+    MIN_SUCCESS_RATE = 0.95
+    MIN_CHANNEL_INTERACTIONS = 3
+
+    def build_reputation_silently(self, hive_id: str):
+        """Build reputation through normal routing behavior."""
+
+        hive_members = self.get_hive_members(hive_id)
+
+        # Strategy 1: Be a reliable routing partner
+        # - Accept their HTLCs promptly
+        # - Maintain good liquidity on channels with them
+        # - Set competitive (but not suspicious) fees
+
+        # Strategy 2: Route payments through them
+        # - Use them for legitimate routing when economical
+        # - Builds mutual familiarity
+        # - Reveals their reliability to us
+
+        # Strategy 3: Open strategic channels
+        # - To members that make economic sense anyway
+        # - Don't open to all members (obvious coordination)
+        # - Stagger opens over weeks/months
+
+        for member in hive_members[:3]:  # Start with 1-3 members
+            if self.channel_makes_economic_sense(member):
+                # Open channel through normal process
+                # cl-revenue-ops will set fees normally
+                self.schedule_organic_channel_open(member)
+
+    def check_ready_for_revelation(self, hive_id: str) -> RevelationReadiness:
+        """Check if we've built sufficient reputation to reveal."""
+
+        stats = self.get_reputation_stats(hive_id)
+
+        checks = {
+            "sufficient_time": stats.days_interacting >= self.MIN_ROUTING_DAYS,
+            "sufficient_volume": stats.volume_routed_sats >= self.MIN_VOLUME_SATS,
+            "sufficient_payments": stats.payments_routed >= self.MIN_PAYMENTS_ROUTED,
+            "good_success_rate": stats.success_rate >= self.MIN_SUCCESS_RATE,
+            "multiple_touchpoints": stats.channel_interactions >= self.MIN_CHANNEL_INTERACTIONS,
+        }
+
+        ready = all(checks.values())
+
+        # Additional check: Is revelation economically rational?
+        revelation_benefit = self.estimate_revelation_benefit(hive_id)
+        checks["positive_ev"] = revelation_benefit > 0
+
+        return RevelationReadiness(
+            hive_id=hive_id,
+            ready=ready and checks["positive_ev"],
+            checks=checks,
+            stats=stats,
+            estimated_benefit=revelation_benefit,
+            recommendation=self.get_revelation_recommendation(checks)
+        )
+
+    def estimate_revelation_benefit(self, hive_id: str) -> int:
+        """Estimate sats benefit/cost of revealing hive membership."""
+
+        benefits = 0
+        costs = 0
+
+        # Potential benefits:
+        # - Reduced fees from cooperative relationship
+        # - Better routing priority
+        # - Intelligence sharing
+        # - Coordinated defense
+
+        # Potential costs:
+        # - Targeted competition
+        # - Loss of information asymmetry
+        # - Federation obligations
+
+        hive = self.get_hive(hive_id)
+
+        if hive.classification in ["hostile", "parasitic"]:
+            # Never reveal to hostile hives
+            return -float('inf')
+
+        if hive.classification == "predatory":
+            # Too early, keep building reputation
+            return -1_000_000
+
+        # For competitive/neutral hives, calculate based on potential
+        if hive.classification in ["competitive", "neutral"]:
+            potential_fee_savings = self.estimate_fee_savings(hive_id)
+            potential_volume_increase = self.estimate_volume_increase(hive_id)
+            competition_risk = self.estimate_competition_risk(hive_id)
+
+            benefits = potential_fee_savings + potential_volume_increase
+            costs = competition_risk
+
+        return benefits - costs
+```
+
+### 3.5.4 Graduated Revelation Protocol
+
+When ready to reveal, do so gradually:
+
+```python
+class GraduatedRevelation:
+    """Reveal hive membership in controlled stages."""
+
+    REVELATION_STAGES = [
+        "hidden",           # No indication we're a hive
+        "hinted",           # Subtle signals (e.g., coordinated but deniable)
+        "acknowledged",     # Respond to their query but don't initiate
+        "partial_reveal",   # Reveal some members, not all
+        "full_reveal",      # Complete hive disclosure
+    ]
+
+    def execute_graduated_revelation(
+        self,
+        hive_id: str,
+        target_stage: str
+    ) -> RevelationResult:
+        """Execute revelation to specified stage."""
+
+        current_stage = self.get_current_revelation_stage(hive_id)
+
+        if self.REVELATION_STAGES.index(target_stage) <= \
+           self.REVELATION_STAGES.index(current_stage):
+            return RevelationResult(success=False, reason="cannot_de-escalate")
+
+        # Execute stage-appropriate revelation
+        if target_stage == "hinted":
+            # Allow some coordination to be visible
+            # But maintain plausible deniability
+            self.allow_visible_coordination(hive_id)
+
+        elif target_stage == "acknowledged":
+            # If they query us, acknowledge
+            # But don't initiate contact
+            self.set_acknowledgment_policy(hive_id, respond_only=True)
+
+        elif target_stage == "partial_reveal":
+            # Reveal 1-2 members as "contacts"
+            # Keep rest of hive hidden
+            contacts = self.select_contact_nodes(count=2)
+            self.reveal_as_contacts(hive_id, contacts)
+
+        elif target_stage == "full_reveal":
+            # Full hive introduction
+            # Only after extensive reputation building
+            if not self.check_ready_for_revelation(hive_id).ready:
+                return RevelationResult(success=False, reason="not_ready")
+
+            self.initiate_full_introduction(hive_id)
+
+        self.update_revelation_status(hive_id, target_stage)
+        return RevelationResult(success=True, new_stage=target_stage)
+
+    def respond_to_their_query(
+        self,
+        from_node: str,
+        query_type: str
+    ) -> Optional[Response]:
+        """Respond to their hive query based on our policy."""
+
+        their_hive = self.get_hive_for_node(from_node)
+
+        if their_hive is None:
+            # Unknown node asking - be cautious
+            return self.deny_hive_membership()
+
+        our_policy = self.get_revelation_stage(their_hive.hive_id)
+
+        if our_policy == "hidden":
+            # Deny everything
+            return Response(
+                is_hive_member=False,
+                reason="We are independent nodes"
+            )
+
+        elif our_policy == "acknowledged":
+            # Acknowledge but minimal info
+            return Response(
+                is_hive_member=True,
+                hive_id=None,  # Don't reveal hive ID yet
+                member_count=None,
+                contact_node=self.our_primary_contact()
+            )
+
+        elif our_policy in ["partial_reveal", "full_reveal"]:
+            # Provide appropriate level of detail
+            return self.generate_appropriate_response(their_hive, our_policy)
+
+        return self.deny_hive_membership()
+```
+
+### 3.5.5 When to Reveal (Decision Framework)
+
+```python
+def should_reveal_to_hive(self, hive_id: str) -> RevelationDecision:
+    """Decide whether to reveal hive membership."""
+
+    hive = self.get_hive(hive_id)
+    our_rep = self.get_our_reputation_with(hive_id)
+
+    # NEVER reveal to:
+    if hive.classification in ["hostile", "parasitic"]:
+        return RevelationDecision(
+            reveal=False,
+            reason="hostile_classification",
+            recommendation="maintain_hidden_indefinitely"
+        )
+
+    # NOT YET - keep building reputation:
+    if hive.classification == "predatory":
+        return RevelationDecision(
+            reveal=False,
+            reason="still_predatory_classification",
+            recommendation="continue_silent_reputation_building"
+        )
+
+    # CONSIDER revealing if:
+    if hive.classification == "competitive":
+        if our_rep.days_interacting >= 90 and our_rep.success_rate >= 0.95:
+            return RevelationDecision(
+                reveal=True,
+                reason="sufficient_competitive_reputation",
+                recommendation="graduated_reveal_to_acknowledged",
+                target_stage="acknowledged"
+            )
+
+    # LIKELY reveal if:
+    if hive.classification == "neutral":
+        if our_rep.ready_for_revelation:
+            return RevelationDecision(
+                reveal=True,
+                reason="ready_for_cooperative_relationship",
+                recommendation="graduated_reveal_to_partial",
+                target_stage="partial_reveal"
+            )
+
+    # DEFINITELY reveal if:
+    if hive.classification == "cooperative":
+        # They've proven themselves, full reveal makes sense
+        return RevelationDecision(
+            reveal=True,
+            reason="cooperative_relationship_established",
+            recommendation="proceed_to_full_reveal",
+            target_stage="full_reveal"
+        )
+
+    return RevelationDecision(
+        reveal=False,
+        reason="default_caution",
+        recommendation="continue_observation"
+    )
+```
+
+---
+
+## 3.6 Stealth Strategy Security Hardening
+
+The stealth-first approach has critical vulnerabilities. This section addresses them.
+
+### 3.6.1 Core Assumption: Mutual Detection
+
+**CRITICAL**: Stealth is a **bonus**, not a security mechanism. Always assume sophisticated hives have already detected us.
+
+```python
+class MutualDetectionAssumption:
+    """
+    Security model: Assume they know about us.
+
+    Why:
+    - They're running the same detection algorithms we are
+    - Our hive behavior (zero-fee internal, coordinated actions) is visible in gossip
+    - Any sophisticated attacker will detect us before we detect them
+    - Relying on stealth creates dangerous overconfidence
+
+    Implication:
+    - Stealth operations are for intelligence gathering, not security
+    - All defenses must assume we are already known
+    - Information asymmetry is hoped for, never relied upon
+    """
+
+    SECURITY_POSTURE = "assume_detected"
+
+    def plan_defense(self, threat: str) -> DefensePlan:
+        """Plan defense assuming they know about us."""
+
+        # WRONG: "They don't know we're a hive, so we're safe"
+        # RIGHT: "They probably know, so we must be prepared"
+
+        return DefensePlan(
+            assume_detected=True,
+            prepare_for_targeted_attack=True,
+            dont_rely_on_stealth_for_security=True
+        )
+```
+
+### 3.6.2 Remove Detectable Fee Discrimination
+
+**Problem**: Charging predatory hives 1.5x fees reveals our awareness of them.
+
+**Fix**: Use identical fees for all hives, differentiate through limits and monitoring only.
+
+```python
+# BEFORE (Detectable):
+DEFAULT_POLICIES = {
+    "predatory": HivePolicy(fee_multiplier=1.5),  # They can detect this!
+    "competitive": HivePolicy(fee_multiplier=1.2),
+    "neutral": HivePolicy(fee_multiplier=1.0),
+}
+
+# AFTER (Undetectable):
+DEFAULT_POLICIES = {
+    "predatory": HivePolicy(
+        fee_multiplier=1.0,              # Same fees as everyone
+        max_htlc_exposure_sats=2_000_000, # Limit exposure instead
+        enhanced_monitoring=True,         # Watch closely
+        internal_risk_score=0.8,          # Track risk internally
+    ),
+    "competitive": HivePolicy(
+        fee_multiplier=1.0,              # Same fees
+        max_htlc_exposure_sats=5_000_000,
+        enhanced_monitoring=True,
+        internal_risk_score=0.5,
+    ),
+    "neutral": HivePolicy(
+        fee_multiplier=1.0,
+        max_htlc_exposure_sats=10_000_000,
+        enhanced_monitoring=False,
+        internal_risk_score=0.2,
+    ),
+}
+
+class UndetectableDifferentiation:
+    """Differentiate treatment without revealing awareness."""
+
+    # What they CAN'T detect (safe to differentiate):
+    UNDETECTABLE_MEASURES = [
+        "max_htlc_exposure",        # Internal limit, invisible to them
+        "internal_risk_scoring",    # Our internal tracking
+        "monitoring_intensity",     # How closely we watch
+        "rebalancing_priority",     # Which channels we prioritize
+        "channel_acceptance_delay", # Slightly slower acceptance
+    ]
+
+    # What they CAN detect (must be uniform):
+    DETECTABLE_MEASURES = [
+        "fee_rates",               # Visible in gossip and routing
+        "base_fees",               # Visible in gossip
+        "channel_acceptance",      # Pattern of accepts/rejects
+        "htlc_response_time",      # Must be consistent
+        "routing_availability",    # Must route for them
+    ]
+```
+
+### 3.6.3 Consistent Denial Policy
+
+**Problem**: Differential responses to hive queries reveal our classification system.
+
+**Fix**: Always deny initially, regardless of our internal classification.
+
+```python
+class ConsistentDenialPolicy:
+    """Respond identically to all hive queries until WE initiate revelation."""
+
+    def respond_to_hive_query(self, from_node: str, query: HiveQuery) -> Response:
+        """
+        CRITICAL: Response must be identical regardless of:
+        - Who is asking
+        - What we know about them
+        - Our internal classification of them
+
+        Differential responses reveal our intelligence.
+        """
+
+        their_hive = self.get_hive_for_node(from_node)  # We know this
+        our_classification = their_hive.classification if their_hive else None
+
+        # WRONG: Different responses based on classification
+        # if our_classification == "hostile":
+        #     return deny_completely()
+        # elif our_classification == "cooperative":
+        #     return acknowledge()
+
+        # RIGHT: Identical response to everyone
+        # Until WE decide to initiate revelation
+
+        if not self.have_we_initiated_revelation(their_hive):
+            # We haven't revealed to them yet - deny uniformly
+            return Response(
+                is_hive_member=False,
+                message="We operate as independent nodes",
+                # Identical response regardless of who asks
+            )
+        else:
+            # We previously initiated revelation to this hive
+            return self.get_appropriate_response_for_stage(their_hive)
+
+    def initiate_revelation(self, hive_id: str, stage: str) -> bool:
+        """
+        WE control when revelation happens.
+        They cannot trigger revelation by querying us.
+        """
+
+        # Only reveal when we decide to, not when they ask
+        if not self.revelation_conditions_met(hive_id):
+            return False
+
+        # Record that we initiated
+        self.record_revelation_initiated(hive_id, stage)
+
+        # Now send revelation message (we initiate, not respond)
+        self.send_revelation_message(hive_id, stage)
+
+        return True
+```
+
+### 3.6.4 Anti-Gaming: Randomized Upgrade Criteria
+
+**Problem**: Published, deterministic criteria let attackers game the classification system.
+
+**Fix**: Add randomization and hidden factors to upgrade requirements.
+
+```python
+class AntiGamingClassification:
+    """Make classification gaming impractical."""
+
+    # Base requirements (public knowledge)
+    BASE_REQUIREMENTS = {
+        "predatory_to_competitive": {
+            "min_days": 60,
+            "no_hostile_acts": True,
+            "balanced_economics": True,
+        },
+        "competitive_to_neutral": {
+            "min_days": 90,
+            "positive_score_min": 5.0,
+        },
+    }
+
+    # Hidden randomization (attacker can't know)
+    RANDOMIZATION = {
+        "day_variance": 0.3,        # ±30% on day requirements
+        "score_variance": 0.2,      # ±20% on score requirements
+        "random_delay_days": (0, 30),  # 0-30 day random delay after meeting criteria
+    }
+
+    def check_upgrade_eligible(
+        self,
+        hive_id: str,
+        from_class: str,
+        to_class: str
+    ) -> UpgradeEligibility:
+        """Check if upgrade is allowed with randomization."""
+
+        base_req = self.BASE_REQUIREMENTS.get(f"{from_class}_to_{to_class}")
+        hive = self.get_hive(hive_id)
+
+        # Apply randomization (seeded per-hive for consistency)
+        random.seed(hash(hive_id + self.secret_salt))
+
+        actual_min_days = base_req["min_days"] * (1 + random.uniform(
+            -self.RANDOMIZATION["day_variance"],
+            self.RANDOMIZATION["day_variance"]
+        ))
+
+        random_delay = random.randint(*self.RANDOMIZATION["random_delay_days"])
+
+        # Check base criteria
+        days_observed = self.days_since_detection(hive_id)
+
+        if days_observed < actual_min_days:
+            return UpgradeEligibility(
+                eligible=False,
+                reason="insufficient_observation_time",
+                # Don't reveal actual requirement
+                message="Continue demonstrating positive behavior"
+            )
+
+        # Add random delay even after criteria met
+        if not self.random_delay_passed(hive_id, random_delay):
+            return UpgradeEligibility(
+                eligible=False,
+                reason="additional_observation_required",
+                message="Continue demonstrating positive behavior"
+            )
+
+        # Check ungameable factors
+        ungameable = self.check_ungameable_factors(hive_id)
+        if not ungameable.passed:
+            return UpgradeEligibility(
+                eligible=False,
+                reason=ungameable.reason,
+                message="Classification requirements not met"
+            )
+
+        return UpgradeEligibility(eligible=True)
+
+    def check_ungameable_factors(self, hive_id: str) -> UngameableCheck:
+        """Check factors that attackers cannot easily game."""
+
+        checks = {}
+
+        # Factor 1: Network-wide reputation (requires community trust)
+        # Attacker would need to deceive entire network, not just us
+        network_rep = self.get_network_wide_reputation(hive_id)
+        checks["network_reputation"] = network_rep > 0.5
+
+        # Factor 2: Third-party attestations (from our federated hives)
+        # Attacker would need to deceive multiple independent hives
+        attestations = self.get_federated_attestations(hive_id)
+        checks["third_party_trust"] = len(attestations) >= 1
+
+        # Factor 3: Historical consistency (can't fake history)
+        # Nodes must have existed for extended period
+        avg_node_age = self.get_avg_member_age_days(hive_id)
+        checks["historical_presence"] = avg_node_age > 180
+
+        # Factor 4: Economic skin in the game (costly to fake)
+        # Must have significant real routing volume with diverse parties
+        routing_stats = self.get_routing_statistics(hive_id)
+        checks["economic_activity"] = (
+            routing_stats.total_volume > 100_000_000 and
+            routing_stats.unique_counterparties > 50
+        )
+
+        # Factor 5: Behavioral consistency (hard to maintain fake persona)
+        # Must not show suspicious behavior variance
+        behavior_variance = self.calculate_behavior_variance(hive_id)
+        checks["behavioral_consistency"] = behavior_variance < 0.3
+
+        passed = all(checks.values())
+
+        return UngameableCheck(
+            passed=passed,
+            checks=checks,
+            reason=None if passed else self.get_failure_reason(checks)
+        )
+```
+
+### 3.6.5 Deadlock-Breaking Mechanism
+
+**Problem**: Two hives using identical stealth strategies create permanent deadlock.
+
+**Fix**: Automatic deadlock detection and resolution protocol.
+
+```python
+class DeadlockBreaker:
+    """Detect and break mutual-predatory deadlocks."""
+
+    # Deadlock detection thresholds
+    DEADLOCK_INDICATORS = {
+        "mutual_predatory_days": 90,      # Both predatory for 90+ days
+        "no_hostile_acts_days": 60,        # Neither acted hostile
+        "positive_routing_history": True,  # Route each other's payments fine
+        "economic_balance_ok": True,       # No extraction pattern
+    }
+
+    def detect_deadlock(self, hive_id: str) -> Optional[Deadlock]:
+        """Detect if we're in a mutual-predatory deadlock."""
+
+        hive = self.get_hive(hive_id)
+
+        # Only check hives we've classified as predatory for a while
+        if hive.classification != "predatory":
+            return None
+
+        days_as_predatory = self.days_at_classification(hive_id, "predatory")
+        if days_as_predatory < self.DEADLOCK_INDICATORS["mutual_predatory_days"]:
+            return None
+
+        # Check if this looks like a deadlock (good behavior, no progress)
+        indicators = {
+            "long_duration": days_as_predatory >= 90,
+            "no_hostile_acts": self.count_hostile_acts(hive_id, days=60) == 0,
+            "positive_routing": self.routing_success_rate(hive_id) > 0.9,
+            "economic_balance": self.is_economically_balanced(hive_id),
+        }
+
+        if all(indicators.values()):
+            return Deadlock(
+                hive_id=hive_id,
+                duration_days=days_as_predatory,
+                indicators=indicators,
+                likely_cause="mutual_stealth_strategy"
+            )
+
+        return None
+
+    def break_deadlock(self, deadlock: Deadlock) -> DeadlockResolution:
+        """Attempt to break a detected deadlock."""
+
+        hive_id = deadlock.hive_id
+
+        # Option 1: Unilateral upgrade with caution
+        # We take the risk of upgrading first
+        resolution_strategy = self.select_resolution_strategy(deadlock)
+
+        if resolution_strategy == "cautious_upgrade":
+            return self.execute_cautious_upgrade(hive_id)
+
+        elif resolution_strategy == "probe_their_stance":
+            return self.execute_stance_probe(hive_id)
+
+        elif resolution_strategy == "third_party_introduction":
+            return self.request_third_party_intro(hive_id)
+
+        elif resolution_strategy == "economic_signal":
+            return self.send_economic_signal(hive_id)
+
+    def execute_cautious_upgrade(self, hive_id: str) -> DeadlockResolution:
+        """Upgrade classification with enhanced monitoring."""
+
+        # Upgrade from predatory to competitive
+        # But with extra safeguards
+
+        self.upgrade_classification(
+            hive_id=hive_id,
+            new_classification="competitive",
+            reason="deadlock_break_attempt",
+            safeguards={
+                "enhanced_monitoring": True,
+                "instant_downgrade_on_hostile": True,
+                "economic_trip_wire": 0.7,  # Downgrade if balance drops below 0.7
+                "review_after_days": 30,
+            }
+        )
+
+        return DeadlockResolution(
+            strategy="cautious_upgrade",
+            action_taken="upgraded_to_competitive",
+            safeguards_enabled=True
+        )
+
+    def execute_stance_probe(self, hive_id: str) -> DeadlockResolution:
+        """
+        Probe their classification of us without revealing ours.
+
+        Method: Subtle behavioral changes that a friendly hive would respond to.
+        """
+
+        # Signal 1: Slightly improve routing priority for their payments
+        # A friendly hive monitoring us would notice
+
+        # Signal 2: Open a small channel to one of their peripheral members
+        # Could be interpreted as normal business OR as outreach
+
+        # Signal 3: Route a slightly larger payment through them
+        # Tests their treatment of us
+
+        self.execute_stance_probe_signals(hive_id)
+
+        # Monitor for response over 14 days
+        self.schedule_probe_response_check(hive_id, days=14)
+
+        return DeadlockResolution(
+            strategy="stance_probe",
+            action_taken="probe_signals_sent",
+            monitoring_period_days=14
+        )
+
+    def send_economic_signal(self, hive_id: str) -> DeadlockResolution:
+        """
+        Send economic signal that demonstrates goodwill.
+
+        More costly than words, but not a full revelation.
+        """
+
+        # Deliberately route profitable payments through them
+        # This costs us fees but signals cooperative intent
+
+        signal_budget = 10000  # sats we're willing to "spend" on signaling
+
+        self.route_goodwill_payments(
+            through_hive=hive_id,
+            budget_sats=signal_budget,
+            duration_days=7
+        )
+
+        return DeadlockResolution(
+            strategy="economic_signal",
+            action_taken="goodwill_payments_routed",
+            cost_sats=signal_budget
+        )
+
+    def request_third_party_intro(self, hive_id: str) -> DeadlockResolution:
+        """Request introduction through a mutually trusted third party."""
+
+        # Find federated hives that might know both of us
+        our_federates = self.get_federated_hives()
+
+        potential_introducers = []
+        for federate in our_federates:
+            # Ask federate if they have relationship with target
+            if self.federate_knows_hive(federate, hive_id):
+                potential_introducers.append(federate)
+
+        if potential_introducers:
+            # Request introduction through most trusted introducer
+            introducer = self.select_best_introducer(potential_introducers)
+            self.request_introduction(introducer, hive_id)
+
+            return DeadlockResolution(
+                strategy="third_party_introduction",
+                action_taken="introduction_requested",
+                introducer=introducer.hive_id
+            )
+
+        return DeadlockResolution(
+            strategy="third_party_introduction",
+            action_taken="no_introducer_available",
+            fallback="try_economic_signal"
+        )
+```
+
+### 3.6.6 Limit Intelligence Leakage
+
+**Problem**: Routing through predatory hives for "intelligence" gives them intelligence about us.
+
+**Fix**: Minimize direct interaction, use passive observation instead.
+
+```python
+class MinimalInteractionPolicy:
+    """Minimize intelligence leakage during observation phase."""
+
+    def get_observation_policy(self, classification: str) -> ObservationPolicy:
+        """Get observation policy that minimizes our exposure."""
+
+        if classification == "predatory":
+            return ObservationPolicy(
+                # DON'T actively probe
+                active_probing=False,
+
+                # DON'T route through them for intelligence
+                route_through_for_intel=False,
+
+                # DON'T open channels to them
+                initiate_channels=False,
+
+                # DO observe passively
+                passive_observation=True,
+
+                # DO monitor gossip for their behavior
+                gossip_monitoring=True,
+
+                # DO accept their routing (earn fees, observe)
+                accept_their_routing=True,
+
+                # DO accept channel opens (with limits)
+                accept_channel_opens=True,
+                accept_channel_max_size=5_000_000,
+
+                # Use third-party observation when possible
+                use_third_party_observation=True,
+            )
+
+        elif classification == "competitive":
+            return ObservationPolicy(
+                active_probing=False,          # Still don't probe
+                route_through_for_intel=False, # Don't route for intel
+                initiate_channels=True,        # Can initiate if economic
+                passive_observation=True,
+                gossip_monitoring=True,
+                accept_their_routing=True,
+                accept_channel_opens=True,
+                accept_channel_max_size=20_000_000,
+                use_third_party_observation=True,
+            )
+
+        # For neutral and above, normal interaction is fine
+        return ObservationPolicy.default()
+
+    def observe_via_third_party(self, hive_id: str) -> ThirdPartyObservation:
+        """
+        Observe hive behavior through third parties.
+
+        Less intelligence leakage than direct interaction.
+        """
+
+        # Ask federated hives about their experience
+        federate_reports = []
+        for federate in self.get_federated_hives():
+            if self.federate_interacts_with(federate, hive_id):
+                report = self.request_hive_report(federate, hive_id)
+                federate_reports.append(report)
+
+        # Analyze network-wide reputation data
+        network_data = self.get_network_reputation_data(hive_id)
+
+        # Monitor their behavior toward neutral third parties
+        third_party_observations = self.observe_their_third_party_behavior(hive_id)
+
+        return ThirdPartyObservation(
+            federate_reports=federate_reports,
+            network_reputation=network_data,
+            third_party_behavior=third_party_observations,
+            # We learned about them without them learning about us
+            our_exposure="minimal"
+        )
+```
+
+### 3.6.7 Economic Trip Wires
+
+**Problem**: During reputation building, they can extract value while we wait.
+
+**Fix**: Automatic defensive triggers if economic extraction detected.
+
+```python
+class EconomicTripWires:
+    """Automatic defense triggers during observation period."""
+
+    # Trip wire thresholds
+    TRIP_WIRES = {
+        # If they're taking more than 3x what they give, something's wrong
+        "revenue_imbalance_ratio": 3.0,
+
+        # If we're losing money on the relationship
+        "net_loss_threshold_sats": -50_000,
+
+        # If they're draining our channels without reciprocal flow
+        "liquidity_drain_pct": 0.7,  # 70% drain without return
+
+        # If they're probing us extensively
+        "probe_count_threshold": 20,  # per week
+
+        # If they're jamming our channels
+        "htlc_failure_rate_threshold": 0.3,  # 30% failure rate
+    }
+
+    def check_trip_wires(self, hive_id: str) -> List[TripWireAlert]:
+        """Check if any economic trip wires have been triggered."""
+
+        alerts = []
+
+        # Check revenue imbalance
+        revenue_to_them = self.get_revenue_to_hive(hive_id, days=30)
+        revenue_from_them = self.get_revenue_from_hive(hive_id, days=30)
+
+        if revenue_from_them > 0:
+            ratio = revenue_to_them / revenue_from_them
+            if ratio > self.TRIP_WIRES["revenue_imbalance_ratio"]:
+                alerts.append(TripWireAlert(
+                    type="revenue_imbalance",
+                    severity="warning",
+                    details=f"Revenue ratio {ratio:.1f}:1 in their favor",
+                    action="increase_monitoring"
+                ))
+
+        # Check net position
+        net_position = revenue_from_them - revenue_to_them
+        if net_position < self.TRIP_WIRES["net_loss_threshold_sats"]:
+            alerts.append(TripWireAlert(
+                type="net_loss",
+                severity="critical",
+                details=f"Net loss of {abs(net_position)} sats",
+                action="reduce_exposure"
+            ))
+
+        # Check liquidity drain
+        liquidity_stats = self.get_liquidity_flow(hive_id, days=30)
+        if liquidity_stats.drain_ratio > self.TRIP_WIRES["liquidity_drain_pct"]:
+            alerts.append(TripWireAlert(
+                type="liquidity_drain",
+                severity="critical",
+                details=f"Channel drain at {liquidity_stats.drain_ratio:.0%}",
+                action="close_channels"
+            ))
+
+        # Check for excessive probing
+        probe_count = self.count_likely_probes(hive_id, days=7)
+        if probe_count > self.TRIP_WIRES["probe_count_threshold"]:
+            alerts.append(TripWireAlert(
+                type="excessive_probing",
+                severity="warning",
+                details=f"{probe_count} likely probes in 7 days",
+                action="flag_as_suspicious"
+            ))
+
+        return alerts
+
+    def handle_trip_wire_alert(self, alert: TripWireAlert, hive_id: str):
+        """Handle a triggered trip wire."""
+
+        if alert.severity == "critical":
+            # Immediate defensive action
+            if alert.action == "reduce_exposure":
+                self.reduce_htlc_limits(hive_id)
+                self.pause_channel_accepts(hive_id)
+
+            elif alert.action == "close_channels":
+                self.schedule_graceful_channel_closure(hive_id)
+
+            # Reset classification timer
+            self.reset_classification_progress(hive_id)
+
+            # Log for pattern analysis
+            self.log_trip_wire_event(hive_id, alert)
+
+        elif alert.severity == "warning":
+            # Increased monitoring
+            self.increase_monitoring(hive_id)
+            self.extend_observation_period(hive_id, days=30)
+```
+
+### 3.6.8 Defense Posture: Always Prepared
+
+**Problem**: Stealth creates false confidence; we're unprepared when detected.
+
+**Fix**: Maintain defensive posture regardless of stealth status.
+
+```python
+class DefensivePosture:
+    """
+    Maintain defenses assuming we are detected.
+
+    Stealth is a bonus for intelligence gathering.
+    Security comes from defensive preparation, not hiding.
+    """
+
+    def get_defensive_readiness(self) -> DefensiveReadiness:
+        """Assess our defensive readiness assuming we're known."""
+
+        return DefensiveReadiness(
+            # Can we withstand coordinated fee attack?
+            fee_attack_resilience=self.assess_fee_attack_resilience(),
+
+            # Can we withstand liquidity drain?
+            liquidity_drain_resilience=self.assess_liquidity_resilience(),
+
+            # Can we withstand channel jamming?
+            jamming_resilience=self.assess_jamming_resilience(),
+
+            # Do we have defensive alliances?
+            alliance_strength=self.assess_alliance_strength(),
+
+            # Can we respond quickly to attacks?
+            response_capability=self.assess_response_capability(),
+        )
+
+    def prepare_for_being_known(self, detected_hive_id: str):
+        """
+        Prepare defenses as if this hive knows about us.
+
+        Called for every detected hive, regardless of our stealth status.
+        """
+
+        hive = self.get_hive(detected_hive_id)
+
+        # Assess threat level
+        threat = self.assess_threat_if_they_know(hive)
+
+        # Prepare proportional defenses
+        if threat.level == "high":
+            self.prepare_high_threat_defenses(hive)
+        elif threat.level == "medium":
+            self.prepare_medium_threat_defenses(hive)
+        else:
+            self.prepare_basic_defenses(hive)
+
+    def prepare_high_threat_defenses(self, hive: DetectedHive):
+        """Prepare for high-threat hive that knows about us."""
+
+        defenses = [
+            # Limit exposure to their nodes
+            self.set_htlc_limits_for_hive(hive.hive_id, max_sats=1_000_000),
+
+            # Prepare coordinated response with allies
+            self.alert_federated_hives(hive.hive_id, threat_level="elevated"),
+
+            # Prepare fee response strategy
+            self.prepare_fee_response_plan(hive.hive_id),
+
+            # Prepare channel closure strategy
+            self.prepare_graceful_exit_plan(hive.hive_id),
+
+            # Monitor for attack patterns
+            self.enable_attack_pattern_detection(hive.hive_id),
+        ]
+
+        return defenses
+```
+
+### 3.6.9 Summary: Hardened Stealth Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    HARDENED STEALTH STRATEGY                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  CORE PRINCIPLE:                                                        │
+│  Stealth is for intelligence. Security is from preparation.             │
+│                                                                         │
+│  KEY CHANGES:                                                           │
+│  ✓ Assume mutual detection - don't rely on stealth for safety          │
+│  ✓ No detectable fee discrimination - same fees, different limits       │
+│  ✓ Consistent denial - same response regardless of who asks             │
+│  ✓ Randomized criteria - attackers can't game deterministic rules       │
+│  ✓ Deadlock breaking - automatic resolution of mutual-predatory         │
+│  ✓ Minimal interaction - observe passively, don't leak intelligence     │
+│  ✓ Economic trip wires - automatic defense on extraction patterns       │
+│  ✓ Always prepared - defenses ready regardless of stealth status        │
+│                                                                         │
+│  STEALTH PROVIDES:                                                      │
+│  • Intelligence advantage (maybe)                                       │
+│  • First-mover advantage (maybe)                                        │
+│  • Nothing else - don't rely on it                                      │
+│                                                                         │
+│  SECURITY PROVIDES:                                                     │
+│  • Resilience to attack                                                 │
+│  • Rapid response capability                                            │
+│  • Allied coordination                                                  │
+│  • Economic trip wires                                                  │
+│  • Everything we actually need                                          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -220,17 +1381,20 @@ CREATE TABLE hive_members (
 
 ### 4.1 Classification Categories
 
-| Category | Description | Default Policy |
-|----------|-------------|----------------|
-| `unknown` | Newly detected, insufficient data | Restricted |
-| `observed` | Under active monitoring | Cautious |
-| `neutral` | No positive or negative relationship | Standard |
-| `competitive` | Competing for same corridors, fair play | Standard |
-| `cooperative` | Mutually beneficial interactions | Favorable |
-| `federated` | Formal alliance with verified trust | Allied |
-| `hostile` | Actively harmful behavior detected | Defensive |
-| `predatory` | Extracting value without reciprocity | Restricted |
-| `parasitic` | Free-riding on infrastructure | Blocked |
+| Category | Description | Default Policy | Starting Point |
+|----------|-------------|----------------|----------------|
+| `predatory` | **Default for all detected hives** - Assumed competing for resources | Restricted | Yes |
+| `competitive` | Competing for same corridors, demonstrated fair play | Cautious | No |
+| `neutral` | Balanced relationship, no positive or negative bias | Standard | No |
+| `cooperative` | Mutually beneficial interactions verified | Favorable | No |
+| `federated` | Formal alliance with verified trust + stakes | Allied | No |
+| `hostile` | Actively harmful behavior confirmed | Defensive | No |
+| `parasitic` | Free-riding on infrastructure without reciprocity | Blocked | No |
+
+**Key Change**: There is no "unknown" or "observed" category. All hives are immediately classified as `predatory` upon detection. This forces us to:
+- Never extend trust prematurely
+- Treat every new hive as a competitor
+- Require proof of good behavior before upgrading
 
 ### 4.2 Classification Criteria
 
@@ -314,38 +1478,70 @@ def analyze_economic_relationship(self, hive_id: str) -> EconomicProfile:
 ### 4.3 Classification State Machine
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │                                     │
-                    ▼                                     │
-┌─────────┐    ┌──────────┐    ┌─────────┐    ┌────────────────┐
-│ unknown │───▶│ observed │───▶│ neutral │───▶│  cooperative   │
-└─────────┘    └──────────┘    └─────────┘    └────────────────┘
-     │              │               │                  │
-     │              │               │                  │
-     │              ▼               ▼                  ▼
-     │         ┌─────────┐    ┌───────────┐    ┌────────────┐
-     │         │ hostile │    │competitive│    │ federated  │
-     │         └─────────┘    └───────────┘    └────────────┘
-     │              │
-     │              ▼
-     │         ┌──────────┐    ┌───────────┐
-     └────────▶│predatory │───▶│ parasitic │
-               └──────────┘    └───────────┘
+                    DETECTED
+                        │
+                        ▼
+                 ┌──────────────┐
+                 │  PREDATORY   │◄────────────────────────────┐
+                 │  (default)   │                             │
+                 └──────┬───────┘                             │
+                        │                                     │
+           60 days, no hostile acts,                    downgrade
+           balanced economics                                 │
+                        │                                     │
+                        ▼                                     │
+                 ┌──────────────┐                      ┌──────┴───────┐
+                 │ COMPETITIVE  │                      │   HOSTILE    │
+                 │ (fair rival) │                      │  (confirmed  │
+                 └──────┬───────┘                      │   attacks)   │
+                        │                              └──────────────┘
+           90 days, positive score,                           ▲
+           reciprocal value                                   │
+                        │                              immediate on
+                        ▼                              attack detection
+                 ┌──────────────┐                             │
+                 │   NEUTRAL    │─────────────────────────────┤
+                 │ (balanced)   │                             │
+                 └──────┬───────┘                             │
+                        │                                     │
+           180 days, high reliability,                        │
+           verified reciprocity                               │
+                        │                                     │
+                        ▼                                     │
+                 ┌──────────────┐                             │
+                 │ COOPERATIVE  │─────────────────────────────┤
+                 │  (mutual)    │                             │
+                 └──────┬───────┘                             │
+                        │                                     │
+           365 days, formal agreement,                        │
+           mutual stake in escrow                             │
+                        │                              ┌──────┴───────┐
+                        ▼                              │  PARASITIC   │
+                 ┌──────────────┐                      │ (free-rider) │
+                 │  FEDERATED   │                      └──────────────┘
+                 │  (allied)    │                             ▲
+                 └──────────────┘                             │
+                                                     extraction without
+                                                       reciprocity
 ```
 
 **Transition Rules**:
 
-| From | To | Trigger |
-|------|-----|---------|
-| unknown | observed | Detection confidence > 0.7 |
-| observed | neutral | 30 days observation, no negative signals |
-| observed | hostile | Negative behavior score < -5.0 |
-| neutral | cooperative | Positive score > 10.0 over 60 days |
-| neutral | competitive | Competing for same targets, fair play |
-| cooperative | federated | Formal handshake + 90 days trust |
-| any | hostile | Confirmed attack or malicious behavior |
-| any | predatory | Economic analysis shows extraction |
-| predatory | parasitic | Continued extraction after warning |
+| From | To | Trigger | Minimum Time |
+|------|-----|---------|--------------|
+| predatory | competitive | No hostile acts, balanced economics, positive interactions | 60 days |
+| predatory | hostile | Confirmed attack or malicious behavior | Immediate |
+| predatory | parasitic | Continued extraction, no reciprocity | 30 days |
+| competitive | neutral | Positive behavior score > 5.0, reciprocal value exchange | 90 days |
+| competitive | predatory | Economic imbalance detected | Immediate |
+| neutral | cooperative | High reliability, verified reciprocity, score > 15.0 | 180 days |
+| neutral | predatory | Negative behavior or economic extraction | Immediate |
+| cooperative | federated | Formal handshake, mutual stake in escrow | 365 days |
+| cooperative | predatory | Breach of informal agreement | Immediate |
+| federated | cooperative | Minor terms violation, reduced trust | After review |
+| federated | hostile | Federation betrayal | Immediate |
+| any | hostile | Confirmed attack or malicious behavior | Immediate |
+| hostile | predatory | 180 days no hostile acts, economic rebalance | 180 days |
 
 ### 4.4 Classification Confidence
 
@@ -600,50 +1796,61 @@ class HivePolicy:
 
 ### 6.2 Default Policies by Classification
 
+**Note**: All newly detected hives start at `predatory`. There are no "unknown" or "observed" states - assume competition until proven otherwise.
+
+**CRITICAL**: All policies use `fee_multiplier=1.0` to avoid detectable discrimination. Differentiation is done through HTLC limits and internal risk scoring only. See Section 3.6.2.
+
 ```python
 DEFAULT_POLICIES = {
-    "unknown": HivePolicy(
-        name="Unknown Hive - Restricted",
-        classification="unknown",
-        fee_multiplier=1.5,
-        min_fee_ppm=50,
-        max_fee_ppm=2000,
-        accept_channel_opens=False,
-        initiate_channel_opens=False,
-        max_channels_per_member=0,
-        min_channel_size_sats=0,
-        max_channel_size_sats=0,
-        route_through=True,
-        route_to=True,
-        max_htlc_exposure_sats=1_000_000,
-        share_fee_intelligence=False,
-        share_hive_detection=False,
-        share_reputation_data=False,
-        enhanced_monitoring=True,
-        log_all_interactions=True,
-    ),
-
-    "observed": HivePolicy(
-        name="Observed Hive - Cautious",
-        classification="observed",
-        fee_multiplier=1.2,
-        min_fee_ppm=25,
-        max_fee_ppm=3000,
-        accept_channel_opens=True,
-        initiate_channel_opens=False,
-        max_channels_per_member=1,
-        min_channel_size_sats=1_000_000,
+    # DEFAULT for all newly detected hives
+    "predatory": HivePolicy(
+        name="Predatory Hive - Restricted (DEFAULT)",
+        classification="predatory",
+        fee_multiplier=1.0,              # SAME AS EVERYONE - no detectable discrimination
+        min_fee_ppm=10,                  # Normal fee bounds
+        max_fee_ppm=5000,
+        accept_channel_opens=True,       # Accept to build rep, but cautiously
+        initiate_channel_opens=False,    # Don't initiate - let them come to us
+        max_channels_per_member=1,       # Limit exposure
+        min_channel_size_sats=2_000_000, # Only larger channels
         max_channel_size_sats=10_000_000,
-        route_through=True,
+        route_through=True,              # Route to earn fees and observe
         route_to=True,
-        max_htlc_exposure_sats=5_000_000,
+        max_htlc_exposure_sats=2_000_000, # KEY DIFFERENTIATOR - internal limit
         share_fee_intelligence=False,
         share_hive_detection=False,
         share_reputation_data=False,
         enhanced_monitoring=True,
         log_all_interactions=True,
+        reveal_hive_status=False,        # NEVER reveal to predatory hives
+        internal_risk_score=0.8,         # Internal tracking only
     ),
 
+    # After 60+ days of fair behavior
+    "competitive": HivePolicy(
+        name="Competitive Hive - Cautious Rival",
+        classification="competitive",
+        fee_multiplier=1.0,              # SAME AS EVERYONE
+        min_fee_ppm=10,
+        max_fee_ppm=5000,
+        accept_channel_opens=True,
+        initiate_channel_opens=True,     # Can initiate if makes economic sense
+        max_channels_per_member=2,
+        min_channel_size_sats=1_000_000,
+        max_channel_size_sats=20_000_000,
+        route_through=True,
+        route_to=True,
+        max_htlc_exposure_sats=5_000_000, # Higher limit than predatory
+        share_fee_intelligence=False,
+        share_hive_detection=False,
+        share_reputation_data=False,
+        enhanced_monitoring=True,        # Still monitor
+        log_all_interactions=True,
+        reveal_hive_status=False,        # Don't reveal yet
+        internal_risk_score=0.5,
+    ),
+
+    # After 90+ days of positive behavior
     "neutral": HivePolicy(
         name="Neutral Hive - Standard",
         classification="neutral",
@@ -718,7 +1925,7 @@ DEFAULT_POLICIES = {
         max_channels_per_member=0,
         min_channel_size_sats=0,
         max_channel_size_sats=0,
-        route_through=True,           # Still route (earn fees)
+        route_through=True,           # Still route (earn fees from them)
         route_to=True,
         max_htlc_exposure_sats=500_000,
         share_fee_intelligence=False,
@@ -726,28 +1933,10 @@ DEFAULT_POLICIES = {
         share_reputation_data=False,
         enhanced_monitoring=True,
         log_all_interactions=True,
+        reveal_hive_status=False,     # NEVER reveal to hostile
     ),
 
-    "predatory": HivePolicy(
-        name="Predatory Hive - Restricted",
-        classification="predatory",
-        fee_multiplier=2.0,
-        min_fee_ppm=200,
-        max_fee_ppm=5000,
-        accept_channel_opens=False,
-        initiate_channel_opens=False,
-        max_channels_per_member=0,
-        min_channel_size_sats=0,
-        max_channel_size_sats=0,
-        route_through=True,
-        route_to=True,
-        max_htlc_exposure_sats=1_000_000,
-        share_fee_intelligence=False,
-        share_hive_detection=False,
-        share_reputation_data=False,
-        enhanced_monitoring=True,
-        log_all_interactions=True,
-    ),
+    # Note: "predatory" is defined at the top as the DEFAULT entry point
 
     "parasitic": HivePolicy(
         name="Parasitic Hive - Blocked",
@@ -783,7 +1972,7 @@ class HivePolicyEngine:
         hive = self.get_hive_for_node(node_id)
 
         if hive is None:
-            return DEFAULT_POLICIES["neutral"]  # Non-hive node
+            return DEFAULT_POLICIES["neutral"]  # Non-hive independent node
 
         # Get hive classification
         classification = hive.classification
@@ -793,7 +1982,8 @@ class HivePolicyEngine:
         if override:
             return override
 
-        return DEFAULT_POLICIES.get(classification, DEFAULT_POLICIES["unknown"])
+        # Default to "predatory" policy if classification unknown
+        return DEFAULT_POLICIES.get(classification, DEFAULT_POLICIES["predatory"])
 
     def should_accept_channel(self, node_id: str, amount_sats: int) -> Tuple[bool, str]:
         """Determine if we should accept a channel open."""
@@ -1375,4 +2565,44 @@ hive_interactions      -- Interaction history for analysis
 
 ## Changelog
 
+- **0.3.0-draft** (2025-01-14): Stealth strategy security hardening
+  - Added Section 3.6: Stealth Strategy Security Hardening
+  - Core assumption change: Assume mutual detection, stealth is bonus not security
+  - Removed fee discrimination: All hives get same fees (1.0x multiplier)
+    - Differentiation via HTLC limits and internal risk scoring only
+    - Fee discrimination was detectable and revealed our awareness
+  - Added consistent denial policy: Same response regardless of who asks
+    - We control when revelation happens, not them
+  - Added anti-gaming measures for classification upgrades
+    - Randomized day requirements (±30%)
+    - Random delays (0-30 days) after criteria met
+    - Ungameable factors: network reputation, third-party attestations, historical presence
+  - Added deadlock-breaking mechanism
+    - Automatic detection of mutual-predatory stalemates
+    - Resolution strategies: cautious upgrade, stance probe, economic signal, third-party intro
+  - Added minimal interaction policy for predatory hives
+    - No active probing, no routing for intelligence
+    - Passive observation and third-party reports instead
+  - Added economic trip wires
+    - Automatic defense on revenue imbalance (>3:1), net loss, liquidity drain
+    - Trip wire triggers reset classification progress
+  - Added defensive posture requirement
+    - Prepare defenses assuming detection regardless of stealth status
+- **0.2.0-draft** (2025-01-14): Predatory-first strategy overhaul
+  - Changed default classification from "unknown" to "predatory" for all detected hives
+  - Added stealth-first detection strategy (Section 3.5)
+    - Detect hives without revealing our own hive membership
+    - Information asymmetry advantage concept
+  - Added pre-revelation reputation building protocol
+    - 90+ days interaction before considering revelation
+    - Economic benefit calculation for revelation decisions
+  - Added graduated revelation protocol
+    - Stages: hidden → hinted → acknowledged → partial → full
+    - Never reveal to hostile/parasitic hives
+  - Removed "unknown" and "observed" classification categories
+  - Added "competitive" classification between predatory and neutral
+  - Updated trust progression timelines (60/90/180/365 days)
+  - Updated default policies to support stealth operations
+  - Added `reveal_hive_status` flag to all policies
+  - Added `hive_reputation_building` table for tracking pre-revelation reputation
 - **0.1.0-draft** (2025-01-14): Initial specification draft

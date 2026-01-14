@@ -136,19 +136,75 @@ All inter-hive messages are sent via keysend with custom TLV:
 | defense_alert | 0 sats | 50,000 sats | Yes |
 | reputation_query | 100 sats | No | Yes |
 
-### 3.3 Reply Mechanism
+### 3.3 Reply Mechanism (Privacy-Preserving)
 
-Messages include a `reply_invoice` for responses:
+**Problem**: BOLT11 invoices leak sender information:
+- Node ID embedded in invoice
+- Route hints reveal channel structure
+- Payment hash allows correlation
+
+**Solution**: Use keysend-based replies with encrypted reply tokens.
 
 ```python
-def send_hive_message(self, target: str, msg_type: str, payload: dict) -> str:
-    """Send payment-based hive message."""
+class PrivacyPreservingReply:
+    """Reply mechanism that doesn't leak sender identity."""
 
-    # Create invoice for reply
-    reply_invoice = self.create_invoice(
-        amount_msat=MESSAGE_FEES[msg_type] * 1000,
-        description=f"hive_reply:{msg_type}",
-        expiry=3600
+    def __init__(self):
+        # Rotate reply encryption key daily
+        self.reply_key = self.derive_daily_reply_key()
+        self.pending_replies = {}  # reply_token -> callback
+
+    def create_reply_token(self, msg_type: str, correlation_id: str) -> str:
+        """Create encrypted reply token that only we can decode."""
+
+        # Token contains: timestamp, msg_type, correlation_id
+        token_data = {
+            "ts": int(time.time()),
+            "msg": msg_type,
+            "cid": correlation_id
+        }
+
+        # Encrypt with our reply key (AES-GCM or ChaCha20-Poly1305)
+        # Only we can decrypt this token
+        plaintext = json.dumps(token_data).encode()
+        nonce = os.urandom(12)
+
+        # Use CLN's HSM for encryption if available, else local key
+        ciphertext = self.encrypt_with_reply_key(plaintext, nonce)
+
+        # Base64 encode for transport
+        return base64.b64encode(nonce + ciphertext).decode()
+
+    def decode_reply_token(self, token: str) -> Optional[dict]:
+        """Decode a reply token we previously created."""
+
+        try:
+            raw = base64.b64decode(token)
+            nonce = raw[:12]
+            ciphertext = raw[12:]
+
+            plaintext = self.decrypt_with_reply_key(ciphertext, nonce)
+            token_data = json.loads(plaintext)
+
+            # Verify token isn't expired (max 24 hours)
+            if time.time() - token_data["ts"] > 86400:
+                return None
+
+            return token_data
+
+        except Exception:
+            return None
+
+def send_hive_message(self, target: str, msg_type: str, payload: dict) -> str:
+    """Send payment-based hive message with privacy-preserving reply."""
+
+    # Create correlation ID for this message
+    correlation_id = generate_id()
+
+    # Create encrypted reply token (instead of invoice)
+    reply_token = self.reply_handler.create_reply_token(
+        msg_type=msg_type,
+        correlation_id=correlation_id
     )
 
     # Calculate total amount
@@ -156,13 +212,13 @@ def send_hive_message(self, target: str, msg_type: str, payload: dict) -> str:
     if msg_type in STAKE_REQUIRED:
         amount += STAKE_REQUIRED[msg_type]
 
-    # Build TLV payload
+    # Build TLV payload - NO invoice, just reply token
     tlv_payload = {
         "protocol": "hive_inter",
         "version": 1,
         "msg_type": msg_type,
         "payload": payload,
-        "reply_invoice": reply_invoice,
+        "reply_token": reply_token,  # Encrypted token, not invoice
         "stake_hash": self.create_stake_hash() if msg_type in STAKE_REQUIRED else None,
         "sender_hive": self.our_hive_id
     }
@@ -177,8 +233,77 @@ def send_hive_message(self, target: str, msg_type: str, payload: dict) -> str:
         }
     )
 
-    return reply_invoice
+    # Store pending reply callback
+    self.reply_handler.pending_replies[correlation_id] = {
+        "target": target,
+        "msg_type": msg_type,
+        "sent_at": time.time()
+    }
+
+    return correlation_id
+
+def send_reply(self, original_sender: str, reply_token: str, response: dict) -> bool:
+    """Send reply via keysend (not invoice payment)."""
+
+    # We know the sender's node ID from the keysend we received
+    # Send reply directly via keysend with the reply token
+
+    reply_payload = {
+        "protocol": "hive_inter",
+        "version": 1,
+        "msg_type": response["msg_type"],
+        "payload": response["payload"],
+        "in_reply_to": reply_token  # Include their token for correlation
+    }
+
+    result = self.keysend(
+        destination=original_sender,
+        amount_msat=MESSAGE_FEES.get(response["msg_type"], 100) * 1000,
+        tlv_records={
+            5482373484: os.urandom(32),
+            48495645: json.dumps(reply_payload).encode()
+        }
+    )
+
+    return result.success
+
+def handle_reply(self, payment: Payment) -> Optional[dict]:
+    """Handle incoming reply to our message."""
+
+    msg = self.extract_hive_message(payment)
+    if not msg or "in_reply_to" not in msg:
+        return None
+
+    # Decode the reply token to find our original message
+    token_data = self.reply_handler.decode_reply_token(msg["in_reply_to"])
+    if not token_data:
+        return None  # Invalid or expired token
+
+    # Match to pending reply
+    correlation_id = token_data["cid"]
+    pending = self.reply_handler.pending_replies.get(correlation_id)
+
+    if pending:
+        # Valid reply to our message
+        del self.reply_handler.pending_replies[correlation_id]
+        return {
+            "original_msg_type": token_data["msg"],
+            "correlation_id": correlation_id,
+            "response": msg["payload"]
+        }
+
+    return None
 ```
+
+**Why This Is More Private:**
+
+| Aspect | BOLT11 Invoice | Reply Token |
+|--------|---------------|-------------|
+| Reveals node ID | Yes | No |
+| Reveals route hints | Yes | No |
+| Correlatable payment hash | Yes | No (keysend uses random preimage) |
+| Replayable | Yes (same invoice) | No (token expires, single use) |
+| Third-party observable | Invoice can be shared | Token only meaningful to creator |
 
 ### 3.4 Payment Verification
 
@@ -209,20 +334,17 @@ def verify_message_payment(self, payment: Payment) -> MessageVerification:
     if payment.amount_msat < (required_fee + required_stake) * 1000:
         return MessageVerification(valid=False, reason="insufficient_payment")
 
-    # Verify sender can be reached (they included reply invoice)
-    if msg.get("reply_invoice"):
-        # Decode and verify invoice is from sender
-        invoice = self.decode_invoice(msg["reply_invoice"])
-        # Route hint should lead back to sender
+    # Reply token is encrypted and doesn't leak info - just store it
+    # We'll use it when sending our reply via keysend
 
     return MessageVerification(
         valid=True,
         msg_type=msg["msg_type"],
         payload=msg["payload"],
-        sender=payment.sender,
+        sender=payment.sender,  # Known from keysend routing
         sender_hive=msg.get("sender_hive"),
         stake_amount=required_stake,
-        reply_invoice=msg.get("reply_invoice")
+        reply_token=msg.get("reply_token")  # Encrypted, privacy-preserving
     )
 ```
 
@@ -427,8 +549,173 @@ Sophisticated hives may hide their coordination:
 - Stagger actions over days
 - Avoid naming patterns
 - Use diverse external peers
+- **Detect and evade probes by temporarily changing behavior**
 
-### 5.2 Payment-Based Probing
+### 5.2 Anti-Evasion Probe Design
+
+**Problem**: If probes are detectable, hives can evade by changing behavior during probing.
+
+**Detection Signatures to Avoid**:
+- Round payment amounts (10,000 sats)
+- Systematic node pair coverage
+- Rapid sequential payments
+- Payments from known "probe" nodes
+- Unusual payment patterns (small amounts, no invoice)
+
+**Stealthy Probing Principles**:
+
+```python
+class StealthyProber:
+    """Probe design that resists detection and evasion."""
+
+    def design_stealth_probe(self, target: str) -> ProbeDesign:
+        """Design a probe that looks like normal traffic."""
+
+        return ProbeDesign(
+            # Use realistic amounts (from actual payment distribution)
+            amount=self.sample_realistic_amount(),
+
+            # Random timing (not systematic)
+            delay=random.expovariate(1/3600),  # Exponential, avg 1 hour
+
+            # Use rotating source nodes
+            source=self.select_probe_source(),
+
+            # Include plausible payment context
+            payment_context="invoice",  # Not keysend
+
+            # Add noise payments that aren't probes
+            include_decoys=True
+        )
+
+    def sample_realistic_amount(self) -> int:
+        """Sample from real payment amount distribution."""
+        # Based on network payment statistics
+        # Avoid round numbers
+        base_amounts = [
+            1_000, 2_500, 5_000, 7_500, 10_000, 15_000,
+            25_000, 50_000, 100_000, 250_000, 500_000
+        ]
+        base = random.choice(base_amounts)
+        # Add random noise: ±10%
+        noise = random.uniform(-0.1, 0.1)
+        return int(base * (1 + noise))
+
+    def select_probe_source(self) -> str:
+        """Select source node for probe to avoid fingerprinting."""
+        # Rotate through multiple source nodes
+        # Don't always probe from our hive's nodes
+        # Use "neutral" nodes when possible
+        sources = self.get_available_probe_sources()
+        return random.choice(sources)
+```
+
+**Extended Observation Window**:
+
+```python
+class ExtendedProbeWindow:
+    """Probe over extended periods to defeat temporary evasion."""
+
+    # Minimum observation period
+    MIN_OBSERVATION_DAYS = 30
+
+    # Probes per node pair
+    PROBES_PER_PAIR = 50
+
+    def schedule_extended_probes(
+        self,
+        nodes: List[str],
+        days: int = 30
+    ) -> ProbeSchedule:
+        """Schedule probes over extended period."""
+
+        schedule = []
+
+        for src, dst in permutations(nodes, 2):
+            # Distribute probes randomly over the period
+            for _ in range(self.PROBES_PER_PAIR):
+                # Random time within observation window
+                probe_time = time.time() + random.uniform(0, days * 86400)
+
+                schedule.append(ProbeTask(
+                    source=src,
+                    destination=dst,
+                    scheduled_time=probe_time,
+                    probe_design=self.design_stealth_probe(dst)
+                ))
+
+        # Randomize order to prevent pattern detection
+        random.shuffle(schedule)
+
+        return ProbeSchedule(tasks=schedule, duration_days=days)
+
+    def analyze_extended_results(
+        self,
+        results: List[ProbeResult]
+    ) -> ExtendedAnalysis:
+        """Analyze results from extended probing."""
+
+        # Group by time period to detect evasion attempts
+        daily_results = self.group_by_day(results)
+
+        # Check for inconsistent behavior (evasion signature)
+        consistency_scores = []
+        for day1, day2 in combinations(daily_results.keys(), 2):
+            r1 = daily_results[day1]
+            r2 = daily_results[day2]
+            consistency = self.compare_day_results(r1, r2)
+            consistency_scores.append(consistency)
+
+        # Low consistency = possible evasion attempts
+        avg_consistency = np.mean(consistency_scores)
+
+        if avg_consistency < 0.7:
+            return ExtendedAnalysis(
+                verdict="evasion_suspected",
+                confidence=0.8,
+                reason="Inconsistent behavior across observation period",
+                recommendation="Classify as suspicious, increase monitoring"
+            )
+
+        # Analyze aggregated results
+        return self.analyze_aggregated(results)
+```
+
+**Parallel Multi-Source Probing**:
+
+```python
+def parallel_probe_from_multiple_sources(
+    self,
+    target_cluster: List[str]
+) -> MultiSourceResults:
+    """Probe from multiple independent sources simultaneously."""
+
+    # Use probes from:
+    # 1. Our own hive nodes
+    # 2. Federated hive nodes (with permission)
+    # 3. Neutral routing nodes we have channels with
+
+    probe_sources = {
+        "own": self.get_own_probe_nodes(),
+        "federated": self.get_federated_probe_nodes(),
+        "neutral": self.get_neutral_probe_nodes()
+    }
+
+    results_by_source = {}
+
+    for source_type, sources in probe_sources.items():
+        results_by_source[source_type] = []
+        for source in sources:
+            for target in target_cluster:
+                result = self.probe_route(source, target)
+                results_by_source[source_type].append(result)
+
+    # Compare results across sources
+    # If target cluster treats different sources differently = intelligence
+    return self.compare_multi_source_results(results_by_source)
+```
+
+### 5.3 Payment-Based Probing
 
 **Payments reveal what messages cannot:**
 
@@ -701,11 +988,22 @@ class ReputationGate:
 
 ### 6.2 Reputation Earning Through Payments
 
-Reputation is earned through successful payment interactions:
+Reputation is earned through successful payment interactions with **diverse, independent counterparties**.
+
+**Anti-Gaming Measures:**
+- Circular payments detected and excluded
+- Counterparty diversity required
+- Only third-party routed payments count toward volume
+- Self-referential paths discounted
 
 ```python
 class PaymentReputation:
-    """Build reputation through payment history."""
+    """Build reputation through payment history with anti-gaming."""
+
+    # Minimum counterparties for reputation
+    MIN_COUNTERPARTIES = 10
+    # Maximum volume credit from single counterparty
+    MAX_SINGLE_COUNTERPARTY_PCT = 0.20  # 20%
 
     def record_payment_interaction(
         self,
@@ -713,60 +1011,161 @@ class PaymentReputation:
         direction: str,  # "sent" or "received"
         amount_sats: int,
         success: bool,
-        context: str  # "routing", "direct", "hive_message"
+        context: str,  # "routing", "direct", "hive_message"
+        route_hops: int,  # Number of hops in route
+        route_nodes: List[str]  # Nodes in route (for circular detection)
     ):
         """Record a payment interaction for reputation."""
 
+        # Detect circular payment (sender in route)
+        is_circular = self.detect_circular_payment(counterparty, route_nodes)
+
         self.db.execute("""
             INSERT INTO payment_interactions
-            (counterparty, direction, amount_sats, success, context, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (counterparty, direction, amount_sats, success, context, time.time()))
+            (counterparty, direction, amount_sats, success, context,
+             route_hops, is_circular, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (counterparty, direction, amount_sats, success, context,
+              route_hops, is_circular, time.time()))
 
         # Update reputation score
         self.update_reputation(counterparty)
 
+    def detect_circular_payment(
+        self,
+        counterparty: str,
+        route_nodes: List[str]
+    ) -> bool:
+        """Detect if payment is circular (wash trading)."""
+
+        # Check if counterparty appears in route (excluding endpoints)
+        if counterparty in route_nodes[1:-1]:
+            return True
+
+        # Check if we've seen rapid back-and-forth with this counterparty
+        recent = self.get_recent_interactions(counterparty, minutes=60)
+        if len(recent) > 10:
+            # More than 10 interactions in an hour = suspicious
+            return True
+
+        # Check if counterparty is in our "suspected circular" list
+        if self.is_suspected_circular_partner(counterparty):
+            return True
+
+        return False
+
+    def calculate_counterparty_diversity(
+        self,
+        interactions: List[Interaction]
+    ) -> float:
+        """Calculate diversity of counterparties (0-1 scale)."""
+
+        if not interactions:
+            return 0.0
+
+        # Count unique counterparties
+        counterparties = set(i.counterparty for i in interactions)
+        unique_count = len(counterparties)
+
+        # Calculate volume concentration (Herfindahl index)
+        total_volume = sum(i.amount_sats for i in interactions)
+        if total_volume == 0:
+            return 0.0
+
+        volume_by_counterparty = {}
+        for i in interactions:
+            volume_by_counterparty[i.counterparty] = \
+                volume_by_counterparty.get(i.counterparty, 0) + i.amount_sats
+
+        # Herfindahl index: sum of squared market shares
+        hhi = sum(
+            (vol / total_volume) ** 2
+            for vol in volume_by_counterparty.values()
+        )
+
+        # Convert to diversity score (1 - HHI, normalized)
+        # HHI of 1.0 = all volume with one counterparty = 0 diversity
+        # HHI of 1/N = equal distribution = high diversity
+        diversity_score = 1.0 - hhi
+
+        # Also require minimum unique counterparties
+        counterparty_score = min(unique_count / self.MIN_COUNTERPARTIES, 1.0)
+
+        return (diversity_score * 0.6 + counterparty_score * 0.4)
+
     def calculate_payment_reputation(self, node: str) -> PaymentReputationScore:
-        """Calculate reputation from payment history."""
+        """Calculate reputation from payment history with anti-gaming."""
 
         interactions = self.get_interactions(node, days=90)
 
-        if len(interactions) < 10:
+        # Exclude circular payments
+        valid_interactions = [i for i in interactions if not i.is_circular]
+
+        if len(valid_interactions) < 10:
             return PaymentReputationScore(
                 score=0.0,
                 confidence=0.1,
-                reason="insufficient_history"
+                reason="insufficient_valid_history"
             )
 
-        # Metrics
-        total_volume = sum(i.amount_sats for i in interactions)
-        success_rate = sum(1 for i in interactions if i.success) / len(interactions)
+        # Check counterparty diversity
+        diversity = self.calculate_counterparty_diversity(valid_interactions)
 
-        # Directional balance (should be roughly equal)
-        sent = sum(i.amount_sats for i in interactions if i.direction == "sent")
-        received = sum(i.amount_sats for i in interactions if i.direction == "received")
+        if diversity < 0.3:
+            return PaymentReputationScore(
+                score=0.0,
+                confidence=0.2,
+                reason="insufficient_counterparty_diversity"
+            )
+
+        # Cap volume credit per counterparty
+        volume_by_cp = {}
+        for i in valid_interactions:
+            volume_by_cp[i.counterparty] = \
+                volume_by_cp.get(i.counterparty, 0) + i.amount_sats
+
+        total_raw_volume = sum(volume_by_cp.values())
+        max_per_cp = total_raw_volume * self.MAX_SINGLE_COUNTERPARTY_PCT
+
+        # Capped volume (no single counterparty > 20% of total)
+        capped_volume = sum(min(vol, max_per_cp) for vol in volume_by_cp.values())
+
+        # Only count multi-hop payments toward routing reputation
+        routed_interactions = [i for i in valid_interactions if i.route_hops >= 2]
+        routing_volume = sum(i.amount_sats for i in routed_interactions)
+
+        # Metrics
+        success_rate = sum(1 for i in valid_interactions if i.success) / len(valid_interactions)
+
+        # Directional balance
+        sent = sum(i.amount_sats for i in valid_interactions if i.direction == "sent")
+        received = sum(i.amount_sats for i in valid_interactions if i.direction == "received")
         balance_ratio = min(sent, received) / max(sent, received, 1)
 
-        # Consistency (regular interactions better than sporadic)
-        consistency = self.calculate_interaction_consistency(interactions)
+        # Consistency
+        consistency = self.calculate_interaction_consistency(valid_interactions)
 
-        # Calculate score
+        # Calculate score with diversity as major factor
         score = (
-            0.3 * success_rate +
-            0.3 * min(total_volume / 10_000_000, 1.0) +  # Cap at 10M sats
-            0.2 * balance_ratio +
-            0.2 * consistency
+            0.25 * success_rate +
+            0.20 * min(capped_volume / 10_000_000, 1.0) +
+            0.15 * balance_ratio +
+            0.15 * consistency +
+            0.25 * diversity  # Diversity is now 25% of score
         )
 
-        confidence = min(len(interactions) / 100, 1.0)
+        confidence = min(len(valid_interactions) / 100, 1.0) * diversity
 
         return PaymentReputationScore(
             score=score,
             confidence=confidence,
-            total_volume=total_volume,
+            total_volume=capped_volume,
+            routing_volume=routing_volume,
             success_rate=success_rate,
             balance_ratio=balance_ratio,
-            interaction_count=len(interactions)
+            diversity_score=diversity,
+            interaction_count=len(valid_interactions),
+            excluded_circular=len(interactions) - len(valid_interactions)
         )
 ```
 
@@ -1080,11 +1479,11 @@ def handle_verification_failure(
 ```python
 STAKE_SCHEDULE = {
     # Relationship establishment
-    "hive_introduction": 10_000,           # 10k sats
-    "federation_request_level_1": 100_000,  # 100k sats
-    "federation_request_level_2": 1_000_000,  # 1M sats
-    "federation_request_level_3": 10_000_000,  # 10M sats
-    "federation_request_level_4": 50_000_000,  # 50M sats
+    "hive_introduction": 10_000,           # 10k sats (Lightning)
+    "federation_request_level_1": 100_000,  # 100k sats (Lightning or on-chain)
+    "federation_request_level_2": 1_000_000,  # 1M sats (on-chain required)
+    "federation_request_level_3": 10_000_000,  # 10M sats (on-chain required)
+    "federation_request_level_4": 50_000_000,  # 50M sats (on-chain required)
 
     # Message stakes (for high-trust messages)
     "defense_alert": 50_000,               # Must have skin in game for alerts
@@ -1095,8 +1494,11 @@ STAKE_SCHEDULE = {
     "membership_voucher_request": 5_000,    # Verify membership
 }
 
+# Stakes >= 1M sats MUST use on-chain Bitcoin escrow
+ON_CHAIN_THRESHOLD = 1_000_000
+
 STAKE_VESTING = {
-    # How long until stake is returned
+    # How long until stake is returned (in days)
     "federation_level_1": 180,   # 6 months
     "federation_level_2": 365,   # 1 year
     "federation_level_3": 730,   # 2 years
@@ -1112,6 +1514,459 @@ STAKE_FORFEIT_TRIGGERS = [
     "verification_fraud",
 ]
 ```
+
+### 8.2.1 Bitcoin Timelock Escrow for High-Value Stakes
+
+**Problem with Lightning-Based Stakes:**
+- Lightning payments are immediate and irreversible
+- 2-of-2 multisig can result in "stake hostage" where one party refuses to cooperate
+- No on-chain enforcement of vesting periods
+- Counterparty can disappear with stake
+
+**Solution**: Use Bitcoin Script with timelocks for high-value federation stakes.
+
+#### Escrow Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    BITCOIN TIMELOCK ESCROW                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Staker (Alice)              Recipient (Bob)                        │
+│       │                           │                                 │
+│       │ 1. Create escrow tx      │                                 │
+│       │    with timelock script  │                                 │
+│       │ ─────────────────────►   │                                 │
+│       │                          │                                 │
+│       │        On-chain UTXO     │                                 │
+│       │    ┌─────────────────┐   │                                 │
+│       │    │ Script Options: │   │                                 │
+│       │    │ A) Bob + Alice  │   │ (cooperative release)           │
+│       │    │ B) Bob + proof  │   │ (unilateral claim with evidence)│
+│       │    │ C) Alice after  │   │ (timeout refund)                │
+│       │    │    timelock     │   │                                 │
+│       │    └─────────────────┘   │                                 │
+│       │                          │                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Bitcoin Script for Escrow
+
+```python
+class BitcoinTimelockEscrow:
+    """On-chain escrow using Bitcoin Script timelocks."""
+
+    # Script template:
+    # OP_IF
+    #     # Path A: Cooperative release (2-of-2)
+    #     <alice_pubkey> OP_CHECKSIGVERIFY
+    #     <bob_pubkey> OP_CHECKSIG
+    # OP_ELSE
+    #     OP_IF
+    #         # Path B: Bob claims with forfeit proof
+    #         OP_SHA256 <forfeit_proof_hash> OP_EQUALVERIFY
+    #         <bob_pubkey> OP_CHECKSIG
+    #     OP_ELSE
+    #         # Path C: Alice refund after timelock
+    #         <timelock_blocks> OP_CHECKSEQUENCEVERIFY OP_DROP
+    #         <alice_pubkey> OP_CHECKSIG
+    #     OP_ENDIF
+    # OP_ENDIF
+
+    def create_escrow_script(
+        self,
+        staker_pubkey: bytes,
+        recipient_pubkey: bytes,
+        forfeit_proof_hash: bytes,
+        timelock_blocks: int
+    ) -> bytes:
+        """Create escrow script with three spending paths."""
+
+        script = CScript([
+            # Path A: Cooperative 2-of-2
+            OP_IF,
+                staker_pubkey, OP_CHECKSIGVERIFY,
+                recipient_pubkey, OP_CHECKSIG,
+            OP_ELSE,
+                OP_IF,
+                    # Path B: Recipient claims with proof of violation
+                    OP_SHA256, forfeit_proof_hash, OP_EQUALVERIFY,
+                    recipient_pubkey, OP_CHECKSIG,
+                OP_ELSE,
+                    # Path C: Staker refund after timelock
+                    timelock_blocks, OP_CHECKSEQUENCEVERIFY, OP_DROP,
+                    staker_pubkey, OP_CHECKSIG,
+                OP_ENDIF,
+            OP_ENDIF
+        ])
+
+        return script
+
+    def create_escrow_address(
+        self,
+        staker_pubkey: bytes,
+        recipient_pubkey: bytes,
+        forfeit_conditions: List[str],
+        vesting_days: int
+    ) -> EscrowAddress:
+        """Create P2WSH escrow address."""
+
+        # Calculate timelock in blocks (~144 blocks/day)
+        timelock_blocks = vesting_days * 144
+
+        # Create forfeit proof hash (hash of known forfeit conditions)
+        forfeit_proof_hash = self.create_forfeit_proof_hash(forfeit_conditions)
+
+        # Build script
+        script = self.create_escrow_script(
+            staker_pubkey=staker_pubkey,
+            recipient_pubkey=recipient_pubkey,
+            forfeit_proof_hash=forfeit_proof_hash,
+            timelock_blocks=timelock_blocks
+        )
+
+        # Create P2WSH address
+        script_hash = sha256(script)
+        address = bech32_encode("bc", 0, script_hash)
+
+        return EscrowAddress(
+            address=address,
+            script=script.hex(),
+            staker_pubkey=staker_pubkey.hex(),
+            recipient_pubkey=recipient_pubkey.hex(),
+            timelock_blocks=timelock_blocks,
+            forfeit_proof_hash=forfeit_proof_hash.hex()
+        )
+```
+
+#### Forfeit Proof System
+
+```python
+class ForfeitProofSystem:
+    """Generate and verify proofs of stake forfeit conditions."""
+
+    # Forfeit conditions must be cryptographically provable
+    PROVABLE_FORFEIT_CONDITIONS = {
+        "hostile_action_detected": {
+            "proof_type": "signed_evidence",
+            "required_signatures": 1,  # Any hive admin
+            "evidence_schema": {
+                "action_type": str,
+                "timestamp": int,
+                "evidence_data": str,
+                "witness_signatures": List[str]
+            }
+        },
+        "federation_terms_violation": {
+            "proof_type": "signed_evidence",
+            "required_signatures": 2,  # Multiple witnesses
+            "evidence_schema": {
+                "violation_type": str,
+                "federation_id": str,
+                "term_violated": str,
+                "evidence_data": str,
+                "witness_signatures": List[str]
+            }
+        },
+        "false_intel_provided": {
+            "proof_type": "contradiction_proof",
+            "required": ["original_intel", "contradicting_evidence"],
+            "evidence_schema": {
+                "intel_hash": str,
+                "intel_timestamp": int,
+                "contradicting_data": str,
+                "contradiction_timestamp": int
+            }
+        },
+        "verification_fraud": {
+            "proof_type": "cryptographic_proof",
+            "required": ["claimed_data", "actual_data", "signature"],
+            "evidence_schema": {
+                "claimed_value": str,
+                "actual_value": str,
+                "signed_claim": str,  # Their signature on false claim
+            }
+        }
+    }
+
+    def create_forfeit_proof_hash(
+        self,
+        forfeit_conditions: List[str]
+    ) -> bytes:
+        """Create hash commitment of acceptable forfeit proofs."""
+
+        # Hash each condition type
+        condition_hashes = []
+        for condition in forfeit_conditions:
+            if condition not in self.PROVABLE_FORFEIT_CONDITIONS:
+                raise ValueError(f"Non-provable condition: {condition}")
+
+            # Create deterministic hash of condition schema
+            schema = self.PROVABLE_FORFEIT_CONDITIONS[condition]
+            condition_hash = sha256(
+                json.dumps(schema, sort_keys=True).encode()
+            )
+            condition_hashes.append(condition_hash)
+
+        # Merkle root of condition hashes
+        return self.merkle_root(condition_hashes)
+
+    def create_forfeit_proof(
+        self,
+        condition: str,
+        evidence: dict
+    ) -> ForfeitProof:
+        """Create a proof that can unlock escrow via Path B."""
+
+        config = self.PROVABLE_FORFEIT_CONDITIONS[condition]
+
+        # Validate evidence matches schema
+        self.validate_evidence(evidence, config["evidence_schema"])
+
+        # Collect required signatures
+        if config["proof_type"] == "signed_evidence":
+            if len(evidence.get("witness_signatures", [])) < config["required_signatures"]:
+                raise ValueError("Insufficient witness signatures")
+
+        # Create proof that matches forfeit_proof_hash
+        proof_data = {
+            "condition": condition,
+            "evidence": evidence,
+            "timestamp": int(time.time())
+        }
+
+        # The preimage that hashes to forfeit_proof_hash
+        proof_preimage = self.compute_proof_preimage(condition, proof_data)
+
+        return ForfeitProof(
+            condition=condition,
+            evidence=evidence,
+            preimage=proof_preimage
+        )
+
+    def verify_forfeit_proof(
+        self,
+        proof: ForfeitProof,
+        expected_hash: bytes
+    ) -> bool:
+        """Verify a forfeit proof can unlock the escrow."""
+
+        # Hash the preimage
+        actual_hash = sha256(proof.preimage)
+
+        if actual_hash != expected_hash:
+            return False
+
+        # Verify evidence is valid
+        config = self.PROVABLE_FORFEIT_CONDITIONS[proof.condition]
+        return self.validate_evidence(proof.evidence, config["evidence_schema"])
+```
+
+#### Escrow Lifecycle
+
+```python
+class EscrowLifecycle:
+    """Manage the lifecycle of Bitcoin timelock escrows."""
+
+    def initiate_federation_escrow(
+        self,
+        their_hive_id: str,
+        federation_level: int,
+        our_pubkey: bytes
+    ) -> EscrowInitiation:
+        """Initiate escrow for federation stake."""
+
+        stake_amount = STAKE_SCHEDULE[f"federation_request_level_{federation_level}"]
+        vesting_days = STAKE_VESTING[f"federation_level_{federation_level}"]
+
+        # Get their pubkey from their admin node
+        their_pubkey = self.request_escrow_pubkey(their_hive_id)
+
+        # Define forfeit conditions for this level
+        forfeit_conditions = [
+            "hostile_action_detected",
+            "federation_terms_violation",
+            "verification_fraud"
+        ]
+
+        # Create escrow address
+        escrow = self.escrow_system.create_escrow_address(
+            staker_pubkey=our_pubkey,
+            recipient_pubkey=their_pubkey,
+            forfeit_conditions=forfeit_conditions,
+            vesting_days=vesting_days
+        )
+
+        # Create and broadcast funding transaction
+        funding_tx = self.create_funding_tx(
+            escrow_address=escrow.address,
+            amount_sats=stake_amount
+        )
+
+        # Record escrow
+        self.db.execute("""
+            INSERT INTO bitcoin_escrows
+            (escrow_id, counterparty_hive, federation_level, amount_sats,
+             escrow_address, script_hex, our_pubkey, their_pubkey,
+             timelock_blocks, forfeit_proof_hash, funding_txid,
+             status, created_at, vests_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'funded', ?, ?)
+        """, (
+            generate_id(),
+            their_hive_id,
+            federation_level,
+            stake_amount,
+            escrow.address,
+            escrow.script,
+            our_pubkey.hex(),
+            their_pubkey.hex(),
+            escrow.timelock_blocks,
+            escrow.forfeit_proof_hash,
+            funding_tx.txid,
+            int(time.time()),
+            int(time.time()) + (vesting_days * 86400)
+        ))
+
+        return EscrowInitiation(
+            escrow_id=escrow.address,
+            funding_txid=funding_tx.txid,
+            amount_sats=stake_amount,
+            vests_at=int(time.time()) + (vesting_days * 86400),
+            escrow_details=escrow
+        )
+
+    def release_escrow_cooperative(
+        self,
+        escrow_id: str,
+        their_signature: bytes
+    ) -> str:
+        """Release escrow via Path A (cooperative 2-of-2)."""
+
+        escrow = self.get_escrow(escrow_id)
+
+        # Create spending transaction to staker (us)
+        spend_tx = self.create_cooperative_release_tx(
+            escrow=escrow,
+            their_signature=their_signature
+        )
+
+        # Sign with our key
+        our_signature = self.sign_tx(spend_tx, escrow)
+
+        # Broadcast
+        txid = self.broadcast_tx(spend_tx)
+
+        # Update status
+        self.update_escrow_status(escrow_id, "released_cooperative", txid)
+
+        return txid
+
+    def claim_escrow_with_proof(
+        self,
+        escrow_id: str,
+        forfeit_proof: ForfeitProof
+    ) -> str:
+        """Claim escrow via Path B (forfeit proof)."""
+
+        escrow = self.get_escrow(escrow_id)
+
+        # Verify the forfeit proof
+        if not self.forfeit_system.verify_forfeit_proof(
+            proof=forfeit_proof,
+            expected_hash=bytes.fromhex(escrow.forfeit_proof_hash)
+        ):
+            raise ValueError("Invalid forfeit proof")
+
+        # Create spending transaction with forfeit proof
+        spend_tx = self.create_forfeit_claim_tx(
+            escrow=escrow,
+            forfeit_proof=forfeit_proof
+        )
+
+        # Broadcast
+        txid = self.broadcast_tx(spend_tx)
+
+        # Update status
+        self.update_escrow_status(escrow_id, "forfeited", txid)
+
+        return txid
+
+    def reclaim_escrow_after_timeout(
+        self,
+        escrow_id: str
+    ) -> str:
+        """Reclaim escrow via Path C (timelock expiry)."""
+
+        escrow = self.get_escrow(escrow_id)
+
+        # Check timelock has expired
+        current_height = self.get_block_height()
+        funding_height = self.get_tx_height(escrow.funding_txid)
+
+        if current_height < funding_height + escrow.timelock_blocks:
+            blocks_remaining = (funding_height + escrow.timelock_blocks) - current_height
+            raise ValueError(f"Timelock not expired: {blocks_remaining} blocks remaining")
+
+        # Create spending transaction (no signature needed from counterparty)
+        spend_tx = self.create_timeout_refund_tx(escrow=escrow)
+
+        # Broadcast
+        txid = self.broadcast_tx(spend_tx)
+
+        # Update status
+        self.update_escrow_status(escrow_id, "refunded_timeout", txid)
+
+        return txid
+```
+
+#### Database Schema for Escrows
+
+```sql
+-- Bitcoin escrow tracking
+CREATE TABLE bitcoin_escrows (
+    escrow_id TEXT PRIMARY KEY,
+    counterparty_hive TEXT NOT NULL,
+    federation_level INTEGER,
+    amount_sats INTEGER NOT NULL,
+    escrow_address TEXT NOT NULL,
+    script_hex TEXT NOT NULL,
+    our_pubkey TEXT NOT NULL,
+    their_pubkey TEXT NOT NULL,
+    timelock_blocks INTEGER NOT NULL,
+    forfeit_proof_hash TEXT NOT NULL,
+    funding_txid TEXT,
+    spending_txid TEXT,
+    status TEXT DEFAULT 'pending',  -- pending, funded, released_cooperative, forfeited, refunded_timeout
+    forfeit_reason TEXT,
+    created_at INTEGER NOT NULL,
+    vests_at INTEGER NOT NULL,
+    resolved_at INTEGER
+);
+
+CREATE INDEX idx_escrows_counterparty ON bitcoin_escrows(counterparty_hive);
+CREATE INDEX idx_escrows_status ON bitcoin_escrows(status);
+CREATE INDEX idx_escrows_vests ON bitcoin_escrows(vests_at);
+```
+
+#### Security Properties
+
+| Property | How Achieved |
+|----------|--------------|
+| No stake hostage | Timelock Path C: staker can always reclaim after timeout |
+| Provable forfeit | Path B requires cryptographic proof of violation |
+| No trusted third party | Pure Bitcoin Script, no arbiters needed |
+| Cooperative efficiency | Path A allows instant release with both signatures |
+| Transparent vesting | Timelock visible on-chain |
+| Dispute resolution | Evidence-based forfeit proofs, verifiable by anyone |
+
+#### When to Use Each Stake Type
+
+| Stake Amount | Method | Reason |
+|--------------|--------|--------|
+| < 100k sats | Lightning payment | Low cost, fast, acceptable risk |
+| 100k - 1M sats | Lightning or on-chain | Optionally use on-chain for more security |
+| > 1M sats | On-chain required | Stake hostage risk too high for Lightning |
+| Federation L3+ | On-chain required | Multi-year commitment needs on-chain enforcement |
 
 ### 8.3 Payment Flow Tracking
 
@@ -1248,8 +2103,9 @@ See Appendix A for full JSON schemas for each message type.
 | cl-hive | Required | Base coordination |
 | Keysend support | Required | For payment-based messages |
 | Custom TLV support | Required | For message payloads |
-| Invoice creation | Required | For reply routing |
 | Route probing | Required | For hidden hive detection |
+| On-chain wallet | Required | For Bitcoin timelock escrows |
+| HSM signing | Required | For escrow transactions |
 
 ### 10.2 New RPC Commands
 
@@ -1288,7 +2144,8 @@ CREATE TABLE hive_messages (
     payment_amount_sats INTEGER,
     stake_amount_sats INTEGER,
     payload TEXT,                      -- JSON
-    reply_invoice TEXT,
+    reply_token TEXT,                  -- Encrypted reply token (privacy-preserving)
+    correlation_id TEXT,              -- For matching replies
     status TEXT,                       -- 'sent', 'delivered', 'replied', 'failed'
     timestamp INTEGER NOT NULL
 );
@@ -1339,7 +2196,10 @@ CREATE TABLE active_stakes (
         "our_hive_id": {"type": "string"}
       }
     },
-    "reply_invoice": {"type": "string"}
+    "reply_token": {
+      "type": "string",
+      "description": "Encrypted token for privacy-preserving keysend reply"
+    }
   }
 }
 ```
@@ -1377,7 +2237,14 @@ CREATE TABLE active_stakes (
       }
     },
     "stake_hash": {"type": "string"},
-    "reply_invoice": {"type": "string"}
+    "reply_token": {
+      "type": "string",
+      "description": "Encrypted token for privacy-preserving keysend reply"
+    },
+    "escrow_pubkey": {
+      "type": "string",
+      "description": "Public key for Bitcoin timelock escrow (if stake >= 1M sats)"
+    }
   }
 }
 ```
@@ -1386,4 +2253,11 @@ CREATE TABLE active_stakes (
 
 ## Changelog
 
+- **0.1.1-draft** (2025-01-14): Security hardening
+  - Fixed circular payment reputation farming with diversity requirements and wash trading detection
+  - Fixed probe evasion via stealth probing and extended observation windows
+  - Fixed reply invoice information leakage with privacy-preserving keysend reply tokens
+  - Added Bitcoin timelock escrow for high-value stakes (>= 1M sats)
+  - Added forfeit proof system for cryptographically provable violations
+  - Added escrow lifecycle management (cooperative release, forfeit claim, timeout refund)
 - **0.1.0-draft** (2025-01-14): Initial specification draft
