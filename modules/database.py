@@ -1430,6 +1430,9 @@ class HiveDatabase:
         )
         return result.rowcount
 
+    # Maximum pending actions to scan (CLAUDE.md: "Bound everything")
+    MAX_PENDING_ACTIONS_SCAN = 100
+
     def has_pending_action_for_target(self, target: str) -> bool:
         """
         Check if there's a pending action for the given target.
@@ -1439,15 +1442,21 @@ class HiveDatabase:
 
         Returns:
             True if a pending action exists for this target
+
+        Note:
+            Scans at most MAX_PENDING_ACTIONS_SCAN rows to bound query time.
         """
         conn = self._get_connection()
         now = int(time.time())
 
-        # Get all pending actions and check payload for target
+        # Use LIKE for initial filtering, then parse JSON to confirm
+        # This is more efficient than scanning all rows
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE status = 'pending' AND expires_at > ?
-        """, (now,)).fetchall()
+            AND payload LIKE ?
+            LIMIT ?
+        """, (now, f'%{target}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         for row in rows:
             try:
@@ -1472,16 +1481,21 @@ class HiveDatabase:
 
         Returns:
             True if the target was rejected within the cooldown period
+
+        Note:
+            Scans at most MAX_PENDING_ACTIONS_SCAN rows to bound query time.
         """
         conn = self._get_connection()
         now = int(time.time())
         cutoff = now - cooldown_seconds
 
-        # Get rejected actions since cutoff and check payload for target
+        # Use LIKE for initial filtering, then parse JSON to confirm
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE status = 'rejected' AND proposed_at > ?
-        """, (cutoff,)).fetchall()
+            AND payload LIKE ?
+            LIMIT ?
+        """, (cutoff, f'%{target}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         for row in rows:
             try:
@@ -1502,16 +1516,22 @@ class HiveDatabase:
             days: Look-back period in days
 
         Returns:
-            Number of rejections for this target
+            Number of rejections for this target (capped at MAX_PENDING_ACTIONS_SCAN)
+
+        Note:
+            Scans at most MAX_PENDING_ACTIONS_SCAN rows to bound query time.
         """
         conn = self._get_connection()
         now = int(time.time())
         cutoff = now - (days * 86400)
 
+        # Use LIKE for initial filtering, then parse JSON to confirm
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE status = 'rejected' AND proposed_at > ?
-        """, (cutoff,)).fetchall()
+            AND payload LIKE ?
+            LIMIT ?
+        """, (cutoff, f'%{target}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         count = 0
         for row in rows:

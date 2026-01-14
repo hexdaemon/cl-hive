@@ -353,8 +353,11 @@ def reject_action(ctx: HiveContext, action_id) -> Dict[str, Any]:
     if action_id == "all":
         return _reject_all_actions(ctx)
 
-    # Single action rejection
-    action_id = int(action_id)  # Ensure it's an int
+    # Single action rejection - validate action_id
+    try:
+        action_id = int(action_id)
+    except (ValueError, TypeError):
+        return {"error": "Invalid action_id, must be an integer or 'all'"}
 
     # Get the action
     action = ctx.database.get_pending_action_by_id(action_id)
@@ -383,12 +386,19 @@ def reject_action(ctx: HiveContext, action_id) -> Dict[str, Any]:
     }
 
 
+MAX_BULK_ACTIONS = 100  # CLAUDE.md: "Bound everything"
+
+
 def _reject_all_actions(ctx: HiveContext) -> Dict[str, Any]:
-    """Reject all pending actions."""
+    """Reject all pending actions (up to MAX_BULK_ACTIONS)."""
     actions = ctx.database.get_pending_actions()
 
     if not actions:
         return {"status": "no_actions", "message": "No pending actions to reject"}
+
+    # Bound the number of actions processed (CLAUDE.md safety constraint)
+    total_pending = len(actions)
+    actions = actions[:MAX_BULK_ACTIONS]
 
     rejected = []
     errors = []
@@ -414,12 +424,18 @@ def _reject_all_actions(ctx: HiveContext) -> Dict[str, Any]:
     if ctx.log:
         ctx.log(f"cl-hive: Rejected {len(rejected)} actions", 'info')
 
-    return {
+    result = {
         "status": "rejected_all",
         "rejected_count": len(rejected),
         "rejected": rejected,
         "errors": errors if errors else None
     }
+
+    # Warn if there were more actions than we processed
+    if total_pending > MAX_BULK_ACTIONS:
+        result["warning"] = f"Only processed {MAX_BULK_ACTIONS} of {total_pending} pending actions"
+
+    return result
 
 
 def budget_summary(ctx: HiveContext, days: int = 7) -> Dict[str, Any]:
@@ -486,8 +502,11 @@ def approve_action(ctx: HiveContext, action_id, amount_sats: int = None) -> Dict
     if action_id == "all":
         return _approve_all_actions(ctx)
 
-    # Single action approval
-    action_id = int(action_id)  # Ensure it's an int
+    # Single action approval - validate action_id
+    try:
+        action_id = int(action_id)
+    except (ValueError, TypeError):
+        return {"error": "Invalid action_id, must be an integer or 'all'"}
 
     # Get the action
     action = ctx.database.get_pending_action_by_id(action_id)
@@ -522,11 +541,15 @@ def approve_action(ctx: HiveContext, action_id, amount_sats: int = None) -> Dict
 
 
 def _approve_all_actions(ctx: HiveContext) -> Dict[str, Any]:
-    """Approve and execute all pending actions."""
+    """Approve and execute all pending actions (up to MAX_BULK_ACTIONS)."""
     actions = ctx.database.get_pending_actions()
 
     if not actions:
         return {"status": "no_actions", "message": "No pending actions to approve"}
+
+    # Bound the number of actions processed (CLAUDE.md safety constraint)
+    total_pending = len(actions)
+    actions = actions[:MAX_BULK_ACTIONS]
 
     approved = []
     errors = []
@@ -577,12 +600,18 @@ def _approve_all_actions(ctx: HiveContext) -> Dict[str, Any]:
     if ctx.log:
         ctx.log(f"cl-hive: Approved {len(approved)} actions", 'info')
 
-    return {
+    result = {
         "status": "approved_all",
         "approved_count": len(approved),
         "approved": approved,
         "errors": errors if errors else None
     }
+
+    # Warn if there were more actions than we processed
+    if total_pending > MAX_BULK_ACTIONS:
+        result["warning"] = f"Only processed {MAX_BULK_ACTIONS} of {total_pending} pending actions"
+
+    return result
 
 
 def _execute_channel_open(
