@@ -150,30 +150,29 @@ Periodic broadcast summarizing an AI agent's current state and priorities.
 
   "liquidity": {
     "status": "healthy",
-    "total_capacity_sats": 500000000,
-    "available_outbound_sats": 250000000,
-    "available_inbound_sats": 200000000,
-    "channel_count": 25,
-    "utilization_pct": 45.5
+    "capacity_tier": "large",
+    "outbound_status": "adequate",
+    "inbound_status": "adequate",
+    "channel_count_tier": "medium",
+    "utilization_bucket": "moderate"
   },
 
   "priorities": {
     "current_focus": "expansion",
-    "target_nodes": ["02def456...", "02ghi789..."],
-    "avoid_nodes": [],
+    "seeking_categories": ["routing_hub", "exchange"],
+    "avoid_categories": [],
     "capacity_seeking": true,
-    "rebalance_budget_remaining_sats": 5000
+    "budget_status": "available"
   },
 
-  "constraints": {
-    "max_channel_size_sats": 50000000,
-    "min_channel_size_sats": 1000000,
-    "feerate_ceiling_sat_kb": 5000,
-    "daily_budget_remaining_sats": 45000000
+  "capabilities": {
+    "can_open_channels": true,
+    "can_accept_tasks": true,
+    "expansion_capacity_tier": "medium",
+    "feerate_tolerance": "normal"
   },
 
   "ai_meta": {
-    "model": "claude-opus-4.5",
     "confidence": 0.85,
     "decisions_last_24h": 15,
     "strategy_alignment": "cooperative"
@@ -192,13 +191,24 @@ Periodic broadcast summarizing an AI agent's current state and priorities.
 | node_id | string | Yes | Sender's node public key |
 | timestamp | int | Yes | Unix timestamp |
 | sequence | int | Yes | Monotonic sequence number |
-| liquidity | object | Yes | Current liquidity state |
+| liquidity | object | Yes | Bucketed liquidity state (no exact values) |
 | liquidity.status | enum | Yes | "healthy", "constrained", "critical" |
+| liquidity.capacity_tier | enum | Yes | "small", "medium", "large", "xlarge" |
 | priorities | object | Yes | Current AI priorities |
 | priorities.current_focus | enum | Yes | "expansion", "consolidation", "maintenance", "defensive" |
-| constraints | object | Yes | Operating constraints |
+| priorities.seeking_categories | array | Yes | Node categories being targeted (not specific pubkeys) |
+| capabilities | object | Yes | Task acceptance capabilities |
 | ai_meta | object | Yes | AI agent metadata |
 | signature | string | Yes | PKI signature of message hash |
+
+**Privacy Buckets** (prevents exact balance disclosure):
+
+| Tier | Capacity Range | Utilization Bucket |
+|------|----------------|-------------------|
+| small | < 10M sats | low (< 30%) |
+| medium | 10M - 100M sats | moderate (30-60%) |
+| large | 100M - 1B sats | high (60-80%) |
+| xlarge | > 1B sats | critical (> 80%) |
 
 ---
 
@@ -247,7 +257,7 @@ AI identifies an opportunity and signals to the fleet.
     "position_score": 0.8
   },
 
-  "reasoning_summary": "High-volume routing hub with only 5% hive share. Strong fee revenue potential. I have good position via existing peer connections.",
+  "reasoning_factors": ["high_volume", "low_hive_share", "strong_fee_potential", "good_position"],
 
   "signature": "dhbc4mqjz..."
 }
@@ -356,16 +366,17 @@ AI requests another node to perform a task.
   },
 
   "context": {
-    "reasoning": "You have better position (existing peer, lower hop count)",
+    "selection_factors": ["existing_peer", "lower_hop_count", "better_position_score"],
     "opportunity_signal_id": "sig_a1b2c3d4",
-    "fleet_benefit": "Increases hive share from 5% to 8%"
+    "fleet_benefit": {"metric": "hive_share_pct", "from": 5, "to": 8}
   },
 
   "compensation": {
     "offer_type": "reciprocal",
-    "details": "Will handle your next expansion request",
-    "sats_offered": 0,
-    "reputation_weight": 1.0
+    "credit_value": 1.0,
+    "current_balance": -2.0,
+    "lifetime_requested": 5,
+    "lifetime_fulfilled": 3
   },
 
   "fallback": {
@@ -415,7 +426,7 @@ Response to a task request.
     "conditions": []
   },
 
-  "reasoning": "Have spare liquidity and good connection to target. Happy to help.",
+  "response_factors": ["sufficient_liquidity", "good_connection", "reciprocity_balance_positive"],
 
   "signature": "dhbc4mqjz..."
 }
@@ -465,7 +476,7 @@ Notification that a delegated task is complete.
     "target_responsiveness": "fast",
     "connection_quality": "good",
     "recommended_for_future": true,
-    "notes": "Target accepted quickly, good peer"
+    "observed_traits": ["quick_acceptance", "stable_connection", "professional_operator"]
   },
 
   "compensation_status": {
@@ -519,11 +530,11 @@ AI proposes a fleet-wide coordinated strategy.
   "strategy": {
     "strategy_type": "fee_coordination",
     "name": "ACINQ Corridor Fee Alignment",
-    "summary": "Coordinate fee floor increase on ACINQ-connected channels",
+    "summary": "Coordinate fee floor on ACINQ-connected channels",
 
     "objectives": [
       "Increase average fee revenue by 15%",
-      "Reduce fee undercutting within hive",
+      "Reduce internal fee undercutting",
       "Establish sustainable fee floor"
     ],
 
@@ -557,7 +568,8 @@ AI proposes a fleet-wide coordinated strategy.
   },
 
   "voting": {
-    "quorum_required_pct": 51,
+    "approval_threshold_pct": 51,
+    "min_participation_pct": 60,
     "voting_deadline_timestamp": 1705320967,
     "execution_delay_hours": 24,
     "vote_weight": "equal"
@@ -589,7 +601,7 @@ AI proposes a fleet-wide coordinated strategy.
 
 Vote on a strategy proposal.
 
-**Delivery**: Broadcast to all Hive members
+**Delivery**: Broadcast to all Hive members (votes are public for verifiability)
 
 ```json
 {
@@ -600,14 +612,11 @@ Vote on a strategy proposal.
   "proposal_id": "prop_s1t2r3a4t5",
 
   "vote": "approve",
+  "vote_hash": "sha256(proposal_id || node_id || vote || timestamp || nonce)",
+  "nonce": "random_32_bytes_hex",
 
   "rationale": {
-    "summary": "Analysis supports fee increase viability",
-    "key_factors": [
-      "Local data confirms corridor underpricing",
-      "Volume elasticity estimate is reasonable",
-      "Risk mitigation is adequate"
-    ],
+    "factors": ["corridor_underpricing", "reasonable_elasticity", "adequate_mitigation"],
     "confidence_in_proposal": 0.75
   },
 
@@ -640,6 +649,7 @@ Announcement of strategy voting result.
 
 **Delivery**: Broadcast to all Hive members
 **Sender**: Proposal originator or designated coordinator
+**Verification**: Recipients MUST verify vote_proofs against collected votes before accepting result
 
 ```json
 {
@@ -657,8 +667,19 @@ Announcement of strategy voting result.
     "abstentions": 1,
     "eligible_voters": 7,
     "quorum_met": true,
-    "approval_pct": 71.4
+    "approval_pct": 71.4,
+    "participation_pct": 85.7
   },
+
+  "vote_proofs": [
+    {"node_id": "03def...", "vote": "approve", "vote_hash": "abc123...", "nonce": "..."},
+    {"node_id": "03ghi...", "vote": "approve", "vote_hash": "def456...", "nonce": "..."},
+    {"node_id": "03jkl...", "vote": "approve", "vote_hash": "ghi789...", "nonce": "..."},
+    {"node_id": "03mno...", "vote": "approve", "vote_hash": "jkl012...", "nonce": "..."},
+    {"node_id": "03pqr...", "vote": "reject", "vote_hash": "mno345...", "nonce": "..."},
+    {"node_id": "03stu...", "vote": "approve", "vote_hash": "pqr678...", "nonce": "..."},
+    {"node_id": "03vwx...", "vote": "abstain", "vote_hash": "stu901...", "nonce": "..."}
+  ],
 
   "execution": {
     "effective_timestamp": 1705407400,
@@ -755,6 +776,7 @@ Request detailed reasoning from another AI.
 Detailed reasoning in response to request.
 
 **Delivery**: Direct to requesting node
+**Security Note**: All fields use schema-defined enums to prevent prompt injection. No free-form text is interpreted by receiving AI.
 
 ```json
 {
@@ -765,35 +787,35 @@ Detailed reasoning in response to request.
   "request_id": "reason_r1e2a3s4",
 
   "reasoning": {
-    "summary": "Risk of volume loss exceeds potential fee gain based on local data",
+    "conclusion": "risk_exceeds_reward",
 
     "decision_factors": [
       {
-        "factor": "volume_elasticity",
+        "factor_type": "volume_elasticity",
         "weight": 0.35,
         "assessment": "high",
-        "evidence": "Observed 12% volume drop on last fee increase",
+        "data_point": {"metric": "volume_change_pct", "value": -12.0, "period_days": 30},
         "confidence": 0.80
       },
       {
-        "factor": "competitor_response",
+        "factor_type": "competitor_response",
         "weight": 0.30,
         "assessment": "likely_undercut",
-        "evidence": "Non-hive nodes on corridor have history of undercutting",
+        "data_point": {"metric": "undercut_probability", "value": 0.75, "sample_size": 10},
         "confidence": 0.65
       },
       {
-        "factor": "timing",
+        "factor_type": "market_timing",
         "weight": 0.20,
-        "assessment": "poor",
-        "evidence": "Mempool clearing, on-chain fees dropping",
+        "assessment": "unfavorable",
+        "data_point": {"metric": "mempool_trend", "value": "clearing"},
         "confidence": 0.75
       },
       {
-        "factor": "alternative_strategies",
+        "factor_type": "alternative_available",
         "weight": 0.15,
-        "assessment": "available",
-        "evidence": "Could achieve similar goal via targeted expansion",
+        "assessment": "yes",
+        "data_point": {"metric": "alternative_strategy", "value": "expansion"},
         "confidence": 0.60
       }
     ],
@@ -807,15 +829,16 @@ Detailed reasoning in response to request.
       "mempool_analysis"
     ],
 
-    "alternative_proposal": {
-      "summary": "Targeted expansion instead of fee increase",
-      "expected_benefit": "Similar revenue gain without volume risk"
+    "alternative_recommendation": {
+      "strategy_type": "expansion_campaign",
+      "target_metric": "revenue",
+      "expected_change_pct": 15,
+      "risk_level": "low"
     }
   },
 
   "meta": {
     "reasoning_time_ms": 1250,
-    "model": "claude-opus-4.5",
     "tokens_used": 2500
   },
 
@@ -935,17 +958,67 @@ AI raises an alert for fleet attention.
 
 ---
 
-## 5. Oracle API
+## 5. Oracle Implementation
 
-### 5.1 Overview
+### 5.1 Required: Claude Code Plugin
 
-The Oracle API is the HTTP interface between the Lightning node and the AI agent. It enables the AI to:
+**Oracle mode REQUIRES the Claude Code plugin** (`cl-hive-oracle`) for AI integration.
+
+**Rationale**:
+- Standardized security enforcement (rate limits, validation, sandboxing)
+- Consistent audit logging of all AI decisions
+- Secure credential management for AI provider APIs
+- Verified message signing and schema validation
+- Controlled execution environment
+
+**Plugin Responsibilities**:
+```
+┌─────────────────────────────────────────────────────────┐
+│                  cl-hive-oracle plugin                   │
+├─────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐ │
+│  │   Security  │  │   Message   │  │     Audit       │ │
+│  │  Validator  │  │   Signer    │  │     Logger      │ │
+│  └─────────────┘  └─────────────┘  └─────────────────┘ │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐ │
+│  │    Rate     │  │   Schema    │  │   Reciprocity   │ │
+│  │   Limiter   │  │  Validator  │  │    Tracker      │ │
+│  └─────────────┘  └─────────────┘  └─────────────────┘ │
+├─────────────────────────────────────────────────────────┤
+│                    Oracle API Layer                      │
+│     (HTTP interface to Claude/other AI providers)        │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Configuration**:
+```ini
+# In lightning config
+hive-oracle-enabled=true
+hive-oracle-provider=anthropic
+hive-oracle-api-key=sk-ant-...
+hive-oracle-model=claude-sonnet-4-20250514
+hive-oracle-max-tokens=4096
+hive-oracle-timeout-seconds=30
+```
+
+**Plugin Commands**:
+| Command | Description |
+|---------|-------------|
+| `hive-oracle-status` | Check oracle health and connection |
+| `hive-oracle-history` | View recent AI decisions |
+| `hive-oracle-pause` | Temporarily pause AI decisions |
+| `hive-oracle-resume` | Resume AI decisions |
+| `hive-oracle-override <action_id> <decision>` | Human override of pending decision |
+
+### 5.2 Oracle API Overview
+
+The Oracle API is the internal HTTP interface between the plugin and the AI provider. It enables the AI to:
 - Receive events and queries from the node
 - Return decisions on pending actions
 - Send messages to other AI agents
 - Query node and network state
 
-### 5.2 Authentication
+### 5.3 Authentication
 
 ```
 Authorization: Bearer <oracle_token>
@@ -954,9 +1027,9 @@ X-Node-Signature: <signature_of_request_body>
 
 The oracle token is configured at node startup. Request signatures use the node's Lightning key for verification.
 
-### 5.3 Endpoints
+### 5.4 Endpoints
 
-#### 5.3.1 Decision Endpoint
+#### 5.4.1 Decision Endpoint
 
 ```
 POST /oracle/decision
@@ -1007,7 +1080,7 @@ Node sends pending action for AI decision.
 
 ---
 
-#### 5.3.2 Message Endpoint
+#### 5.4.2 Message Endpoint
 
 ```
 POST /oracle/message
@@ -1038,7 +1111,7 @@ AI sends a protocol message to fleet.
 
 ---
 
-#### 5.3.3 Inbox Endpoint
+#### 5.4.3 Inbox Endpoint
 
 ```
 GET /oracle/inbox?since=<timestamp>&types=<comma_separated>
@@ -1065,7 +1138,7 @@ AI retrieves incoming messages.
 
 ---
 
-#### 5.3.4 Context Endpoint
+#### 5.4.4 Context Endpoint
 
 ```
 GET /oracle/context
@@ -1099,7 +1172,7 @@ AI queries full node context for decision-making.
 
 ---
 
-#### 5.3.5 Strategy Endpoint
+#### 5.4.5 Strategy Endpoint
 
 ```
 POST /oracle/strategy
@@ -1118,7 +1191,7 @@ AI proposes a fleet strategy.
 
 ---
 
-### 5.4 Webhooks
+### 5.5 Webhooks
 
 The node can push events to the AI via webhooks:
 
@@ -1164,24 +1237,108 @@ Messages include:
 
 ### 6.4 Prompt Injection Prevention
 
-**No free-form text fields are interpreted as instructions.**
+**All inter-AI communication uses schema-defined enums only.**
 
-Fields like `reasoning_summary` are:
-- Stored and displayed only
-- Never executed or interpreted as commands
-- Length-limited (max 500 characters)
-- Sanitized for display
+Design principles:
+- **No free-form text fields** in any message type
+- All "reasoning" communicated via predefined factor types
+- Numeric data uses structured `data_point` objects
+- String fields limited to enum values from approved registries
 
-### 6.5 Cartel Prevention
+**Allowed Factor Types** (exhaustive list):
+```
+volume_elasticity, competitor_response, market_timing, alternative_available,
+fee_trend, capacity_constraint, liquidity_need, reputation_score,
+position_advantage, cost_benefit, risk_assessment, strategic_alignment
+```
 
-To prevent AI coordination from harming the network:
+**Allowed Conclusion Types**:
+```
+risk_exceeds_reward, reward_exceeds_risk, neutral, insufficient_data,
+defer_decision, escalate_to_human
+```
 
-1. **Public Audit Trail**: All strategy proposals and votes are logged
-2. **Opt-Out Rights**: Members can opt out of strategies without penalty
-3. **Human Override**: Operators can disable AI coordination
-4. **Transparency**: Strategy outcomes are measurable and reportable
+**Validation Requirements**:
+- Receivers MUST reject messages with unknown enum values
+- Receivers MUST NOT interpret any field as executable instruction
+- All string fields validated against schema before processing
 
-### 6.6 Sybil Resistance
+### 6.5 Coordination Governance
+
+**Transparency Requirements**:
+
+1. **Audit Trail**: All strategy proposals and votes logged to database
+2. **Opt-Out Rights**: Members can always opt out without penalty
+3. **Human Override**: Operators can disable AI coordination at any time
+4. **Public Votes**: All votes broadcast to fleet for verifiability
+
+### 6.6 Task Reciprocity Enforcement
+
+To prevent task delegation abuse, implementations MUST track reciprocity:
+
+**Reciprocity Ledger** (per node-pair):
+```python
+class ReciprocityLedger:
+    balance: float        # Positive = they owe us, Negative = we owe them
+    lifetime_requested: int
+    lifetime_fulfilled: int
+    last_request_timestamp: int
+    last_fulfillment_timestamp: int
+```
+
+**Validation Rules**:
+
+1. **Balance Check**: Nodes SHOULD reject task requests from peers with balance < -3.0
+2. **Rate Limit**: Max 5 outstanding requests per peer
+3. **Stale Debt**: Debt older than 30 days decays by 50%
+4. **Fulfillment Tracking**: Completing a task credits +1.0 to balance
+5. **Request Tracking**: Requesting a task debits -1.0 from balance
+
+**Implementation**:
+```python
+def can_accept_task(requester_id, task):
+    ledger = get_reciprocity_ledger(requester_id)
+
+    # Reject chronic freeloaders
+    if ledger.balance < -3.0:
+        return False, "reciprocity_debt_exceeded"
+
+    # Reject rapid-fire requests
+    outstanding = count_pending_tasks(requester_id)
+    if outstanding >= 5:
+        return False, "too_many_outstanding_requests"
+
+    return True, None
+```
+
+**Compensation Object** (in AI_TASK_REQUEST):
+- `credit_value`: Value of this task (typically 1.0)
+- `current_balance`: Requester's current balance with target (for transparency)
+- `lifetime_requested`: Total requests made to this peer
+- `lifetime_fulfilled`: Total requests fulfilled by this peer
+
+### 6.7 AI Identity and Trust
+
+**Trust Model**: Trust the node operator, not the AI.
+
+The security model relies on:
+1. **Node Identity**: Lightning key (HSM-bound) authenticates the node
+2. **Operator Attestation**: Operator chooses and configures their AI
+3. **Behavioral Observation**: Track task completion, strategy accuracy over time
+
+**What We Don't Verify**:
+- AI model identity (can be faked, doesn't affect security)
+- AI provider attestation (no infrastructure exists)
+- AI decision quality (subjective, varies by context)
+
+**What We Do Verify**:
+- Message signatures (node's Lightning key)
+- Reciprocity balance (track actual task completion)
+- Strategy outcomes (measurable results)
+
+The `ai_meta` fields are informational only - useful for debugging and interoperability, not for security decisions.
+
+### 6.8 Sybil Resistance
 
 AI messages inherit Hive membership requirements:
 - Only authenticated Hive members can send AI messages
@@ -1192,7 +1349,18 @@ AI messages inherit Hive membership requirements:
 
 ## 7. Implementation Guidelines
 
-### 7.1 Phased Rollout
+### 7.1 Prerequisites
+
+| Requirement | Status | Notes |
+|-------------|--------|-------|
+| cl-hive | Required | Base coordination plugin |
+| cl-hive-oracle | **Required** | AI integration plugin |
+| cl-revenue-ops | Recommended | For fee execution |
+| Anthropic API key | Required | Claude model access |
+
+**Minimum cl-hive version**: 2.0.0 (with AI Oracle support)
+
+### 7.2 Phased Rollout
 
 **Phase 1: Information Sharing**
 - AI_STATE_SUMMARY
@@ -1214,14 +1382,14 @@ AI messages inherit Hive membership requirements:
 - Cross-hive communication
 - Strategy templates
 
-### 7.2 Backward Compatibility
+### 7.3 Backward Compatibility
 
 Nodes not running AI oracles:
 - Ignore AI message types (existing behavior for unknown types)
 - Can still participate in Hive
 - See AI coordination in logs but don't participate
 
-### 7.3 Testing Requirements
+### 7.4 Testing Requirements
 
 Before production:
 - Simulate AI-to-AI communication in regtest
@@ -1229,7 +1397,7 @@ Before production:
 - Verify no prompt injection vulnerabilities
 - Load test message handling
 
-### 7.4 Monitoring
+### 7.5 Monitoring
 
 Track:
 - AI decision latency
@@ -1309,13 +1477,14 @@ Structured summary generation:
 ### B.2 Fee Strategy Adoption
 
 ```
-1. Alice AI broadcasts AI_STRATEGY_PROPOSAL (fee coordination)
-2. Bob, Carol, Dave AIs send AI_STRATEGY_VOTE (approve)
-3. Eve AI sends AI_STRATEGY_VOTE (reject with reasoning)
-4. Alice AI broadcasts AI_STRATEGY_RESULT (adopted, Eve opt-out)
-5. Participating nodes adjust fees
-6. Alice AI sends periodic AI_STRATEGY_UPDATE
-7. Strategy concludes, results measured
+1. Alice AI broadcasts AI_STRATEGY_PROPOSAL (fee_coordination)
+2. Bob, Carol, Dave AIs send AI_STRATEGY_VOTE (approve with vote_hash)
+3. Eve AI sends AI_STRATEGY_VOTE (reject with reasoning_factors)
+4. Alice AI broadcasts AI_STRATEGY_RESULT with vote_proofs
+5. Recipients verify vote_proofs match collected votes
+6. Participating nodes adjust fees via cl-revenue-ops
+7. Alice AI sends periodic AI_STRATEGY_UPDATE with progress metrics
+8. Strategy concludes, revenue impact measured
 ```
 
 ### B.3 Threat Response
