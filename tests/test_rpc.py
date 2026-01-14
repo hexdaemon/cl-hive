@@ -45,7 +45,7 @@ def mock_rpc():
     """Create a mock RPC interface."""
     rpc = MagicMock()
     rpc.getinfo.return_value = {'id': '02' + 'a' * 64}
-    rpc.signmessage.return_value = {'signature': 'test_signature_base64'}
+    rpc.signmessage.return_value = {'zbase': 'test_signature_zbase'}
     rpc.checkmessage.return_value = {'verified': True, 'pubkey': '02' + 'a' * 64}
     return rpc
 

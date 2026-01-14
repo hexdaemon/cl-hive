@@ -38,7 +38,10 @@ def mock_rpc():
     """Mock RPC interface."""
     rpc = MagicMock()
     rpc.listchannels.return_value = {'channels': []}
-    rpc.listfunds.return_value = {'outputs': []}
+    # Return enough funds for expansion (10M sats confirmed)
+    rpc.listfunds.return_value = {
+        'outputs': [{'status': 'confirmed', 'amount_msat': 10_000_000_000}]
+    }
     return rpc
 
 
@@ -57,6 +60,24 @@ def mock_database():
     db.get_all_members.return_value = []
     db.get_pending_intents.return_value = []
     db.create_intent.return_value = 1
+    # Mock peer event summary for quality scorer (neutral values)
+    db.get_peer_event_summary.return_value = {
+        "peer_id": "",
+        "event_count": 0,
+        "open_count": 0,
+        "close_count": 0,
+        "remote_close_count": 0,
+        "local_close_count": 0,
+        "mutual_close_count": 0,
+        "total_revenue_sats": 0,
+        "total_rebalance_cost_sats": 0,
+        "total_net_pnl_sats": 0,
+        "total_forward_count": 0,
+        "avg_routing_score": 0.5,
+        "avg_profitability_score": 0.5,
+        "avg_duration_days": 0,
+        "reporters": []
+    }
     return db
 
 
@@ -93,6 +114,10 @@ def mock_config():
     cfg.market_share_cap_pct = 0.20
     cfg.governance_mode = 'autonomous'
     cfg.planner_enable_expansions = True
+    # Channel size options
+    cfg.planner_min_channel_sats = 1_000_000  # 1M sats
+    cfg.planner_max_channel_sats = 50_000_000  # 50M sats
+    cfg.planner_default_channel_sats = 5_000_000  # 5M sats
     return cfg
 
 
@@ -295,9 +320,9 @@ class TestTheStalemate:
         )
 
         # Both planners identify the same underserved target
-        # Mock listfunds for sufficient balance
+        # Mock listfunds for sufficient balance (need 2x min_channel_sats = 2M sats)
         mock_plugin.rpc.listfunds.return_value = {
-            'outputs': [{'status': 'confirmed', 'amount_msat': 1000000000}]
+            'outputs': [{'status': 'confirmed', 'amount_msat': 5_000_000_000}]  # 5M sats
         }
 
         # Mock get_underserved_targets for both
@@ -468,8 +493,9 @@ class TestTheFlap:
             unignore_count += 1
             return True
 
-        mock_clboss_bridge.ignore_peer.side_effect = count_ignore
-        mock_clboss_bridge.unignore_peer.side_effect = count_unignore
+        # Modern API methods (unmanage_open/manage_open)
+        mock_clboss_bridge.unmanage_open.side_effect = count_ignore
+        mock_clboss_bridge.manage_open.side_effect = count_unignore
 
         # Simulate 10 cycles oscillating between 19% and 21%
         for i in range(10):

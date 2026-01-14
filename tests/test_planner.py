@@ -45,6 +45,24 @@ def mock_database():
     db = MagicMock()
     db.get_all_members.return_value = []
     db.log_planner_action = MagicMock()
+    # Mock peer event summary for quality scorer (neutral values)
+    db.get_peer_event_summary.return_value = {
+        "peer_id": "",
+        "event_count": 0,
+        "open_count": 0,
+        "close_count": 0,
+        "remote_close_count": 0,
+        "local_close_count": 0,
+        "mutual_close_count": 0,
+        "total_revenue_sats": 0,
+        "total_rebalance_cost_sats": 0,
+        "total_net_pnl_sats": 0,
+        "total_forward_count": 0,
+        "avg_routing_score": 0.5,
+        "avg_profitability_score": 0.5,
+        "avg_duration_days": 0,
+        "reporters": []
+    }
     return db
 
 
@@ -59,6 +77,10 @@ def mock_clboss_bridge():
     """Create a mock CLBossBridge."""
     clboss = MagicMock()
     clboss._available = True
+    # Modern API methods
+    clboss.unmanage_open.return_value = True
+    clboss.manage_open.return_value = True
+    # Legacy aliases (deprecated but may still be used in tests)
     clboss.ignore_peer.return_value = True
     clboss.unignore_peer.return_value = True
     return clboss
@@ -355,8 +377,8 @@ class TestGuardMechanism:
 
             decisions = planner._enforce_saturation(mock_config, 'test-run-1')
 
-        # Should have called ignore_peer
-        mock_clboss_bridge.ignore_peer.assert_called_once_with(target)
+        # Should have called unmanage_open (modern API)
+        mock_clboss_bridge.unmanage_open.assert_called_once_with(target)
         assert target in planner._ignored_peers
 
     def test_max_ignores_per_cycle_limit(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
@@ -564,8 +586,8 @@ class TestSaturationRelease:
 
             decisions = planner._release_saturation(mock_config, 'test-release')
 
-        # Should have called unignore
-        mock_clboss_bridge.unignore_peer.assert_called_once_with(target)
+        # Should have called manage_open (modern API)
+        mock_clboss_bridge.manage_open.assert_called_once_with(target)
         assert target not in planner._ignored_peers
 
 

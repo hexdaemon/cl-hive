@@ -218,6 +218,7 @@ class HandshakeManager:
             "requirements": Requirements.NONE,
             "issued_at": now,
             "expires_at": now + (365 * 24 * 3600),  # 1 year validity
+            "initial_tier": "neophyte",  # Must be in signed data for verification
         }
         
         # Sign the ticket
