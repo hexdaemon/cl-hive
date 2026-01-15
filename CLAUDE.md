@@ -84,8 +84,8 @@ Core Lightning
 
 | Mode | Behavior |
 |------|----------|
-| `advisor` | Log decisions, queue to pending_actions, no auto-execution |
-| `autonomous` | Execute within safety limits (budget cap, rate limit) |
+| `advisor` | **Primary mode** - Queue to pending_actions for AI/human approval via MCP server |
+| `failsafe` | Emergency mode - Auto-execute only critical safety actions (bans) within strict limits |
 
 ### Database Tables
 
@@ -178,7 +178,7 @@ cl-hive/
 │   ├── membership.py       # Member management
 │   ├── contribution.py     # Contribution tracking
 │   ├── planner.py          # Topology planner
-│   ├── governance.py       # Decision engine (advisor/autonomous)
+│   ├── governance.py       # Decision engine (advisor/failsafe)
 │   ├── config.py           # Configuration
 │   └── database.py         # Database layer
 ├── tools/

@@ -459,7 +459,7 @@ plugin.add_option(
 plugin.add_option(
     name='hive-governance-mode',
     default='advisor',
-    description='Governance mode: advisor (human approval), autonomous (auto-execute)',
+    description='Governance mode: advisor (AI/human approval), failsafe (emergency auto-execute)',
     dynamic=True
 )
 
@@ -598,9 +598,9 @@ plugin.add_option(
 
 # Budget Options (Phase 7 - Governance)
 plugin.add_option(
-    name='hive-autonomous-budget-per-day',
-    default='10000000',
-    description='Daily budget for autonomous channel opens in sats (default: 10M)',
+    name='hive-failsafe-budget-per-day',
+    default='1000000',
+    description='Daily budget for failsafe mode actions in sats (default: 1M)',
     dynamic=True
 )
 
@@ -688,8 +688,8 @@ OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
     'hive-planner-min-channel-sats': ('planner_min_channel_sats', int),
     'hive-planner-max-channel-sats': ('planner_max_channel_sats', int),
     'hive-planner-default-channel-sats': ('planner_default_channel_sats', int),
-    # Budget options
-    'hive-autonomous-budget-per-day': ('autonomous_budget_per_day', int),
+    # Budget options (failsafe mode)
+    'hive-failsafe-budget-per-day': ('failsafe_budget_per_day', int),
     'hive-budget-reserve-pct': ('budget_reserve_pct', float),
     'hive-budget-max-per-channel-pct': ('budget_max_per_channel_pct', float),
     # Feerate gate
@@ -859,8 +859,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_min_channel_sats=int(options.get('hive-planner-min-channel-sats', '1000000')),
         planner_max_channel_sats=int(options.get('hive-planner-max-channel-sats', '50000000')),
         planner_default_channel_sats=int(options.get('hive-planner-default-channel-sats', '5000000')),
-        # Budget options
-        autonomous_budget_per_day=int(options.get('hive-autonomous-budget-per-day', '10000000')),
+        # Budget options (failsafe mode)
+        failsafe_budget_per_day=int(options.get('hive-failsafe-budget-per-day', '1000000')),
         budget_reserve_pct=float(options.get('hive-budget-reserve-pct', '0.20')),
         budget_max_per_channel_pct=float(options.get('hive-budget-max-per-channel-pct', '0.50')),
         max_expansion_feerate_perkb=int(options.get('hive-max-expansion-feerate', '5000')),
@@ -3056,8 +3056,8 @@ def handle_peer_available(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                 level='debug'
             )
     else:
-        # Fallback: In autonomous mode, create a pending action for channel opening
-        if cfg.governance_mode == 'autonomous':
+        # Fallback: Store pending action for review
+        if cfg.governance_mode in ('advisor', 'failsafe'):
             _store_peer_available_action(target_peer_id, reporter_peer_id, event_type,
                                          capacity_sats, routing_score, reason)
             plugin.log(
@@ -3804,7 +3804,9 @@ def process_ready_intents():
 
         # SECURITY (Issue #12): Check governance mode BEFORE committing
         # to prevent state inconsistency where intents are COMMITTED but never executed
-        if config.governance_mode != "autonomous":
+        # In advisor mode, intents wait for AI/human approval
+        # In failsafe mode, only emergency actions auto-execute (not intents)
+        if config.governance_mode != "failsafe":
             if safe_plugin:
                 safe_plugin.log(
                     f"cl-hive: Intent {intent_id} ready but not committing "
@@ -3813,7 +3815,7 @@ def process_ready_intents():
                 )
             continue
 
-        # Commit the intent (only in autonomous mode)
+        # Commit the intent (only in failsafe mode for backwards compatibility)
         if intent_mgr.commit_intent(intent_id):
             if safe_plugin:
                 safe_plugin.log(f"cl-hive: Committed intent {intent_id}: {intent_type} -> {target[:16]}...")
@@ -4998,8 +5000,8 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
         onchain_balance = cfg.planner_default_channel_sats * 10  # Assume adequate
 
     # Get available budget (considering all constraints)
-    daily_remaining = database.get_available_budget(cfg.autonomous_budget_per_day)
-    max_per_channel = int(cfg.autonomous_budget_per_day * cfg.budget_max_per_channel_pct)
+    daily_remaining = database.get_available_budget(cfg.failsafe_budget_per_day)
+    max_per_channel = int(cfg.failsafe_budget_per_day * cfg.budget_max_per_channel_pct)
     spendable_onchain = int(onchain_balance * (1.0 - cfg.budget_reserve_pct))
     available_budget = min(daily_remaining, max_per_channel, spendable_onchain)
 
@@ -5022,7 +5024,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
     )
 
     # Get budget summary
-    budget_info = database.get_budget_summary(cfg.autonomous_budget_per_day, days=1)
+    budget_info = database.get_budget_summary(cfg.failsafe_budget_per_day, days=1)
 
     return {
         "peer_id": peer_id,
@@ -5037,7 +5039,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
             "onchain_balance_sats": onchain_balance,
         },
         "budget": {
-            "daily_budget_sats": cfg.autonomous_budget_per_day,
+            "daily_budget_sats": cfg.failsafe_budget_per_day,
             "spent_today_sats": budget_info['today']['spent_sats'],
             "daily_remaining_sats": daily_remaining,
             "max_per_channel_sats": max_per_channel,

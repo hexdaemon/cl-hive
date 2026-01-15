@@ -408,7 +408,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="hive_governance_mode",
-            description="Get or set the governance mode for a node (advisor, autonomous).",
+            description="Get or set the governance mode for a node (advisor, failsafe). Advisor is the primary AI-driven mode; failsafe is for emergencies when AI is unavailable.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -418,8 +418,8 @@ async def list_tools() -> List[Tool]:
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["advisor", "autonomous"],
-                        "description": "New mode to set (optional, omit to just get current mode)"
+                        "enum": ["advisor", "failsafe"],
+                        "description": "New mode to set (optional, omit to just get current mode). 'advisor' = AI-driven decisions, 'failsafe' = emergency auto-execute"
                     }
                 },
                 "required": ["node"]

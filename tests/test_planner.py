@@ -642,7 +642,7 @@ class TestExpansionLogic:
     def test_expansion_proposes_to_underserved_target(self, planner, mock_config, mock_plugin, mock_database):
         """Should propose expansion to underserved target when all conditions are met."""
         mock_config.planner_enable_expansions = True
-        mock_config.governance_mode = 'autonomous'
+        mock_config.governance_mode = 'advisor'
 
         target = '02' + 'u' * 64
 
@@ -870,12 +870,12 @@ class TestExpansionLogic:
 class TestPlannerGovernanceIntegration:
     """Test Planner-Governance integration (Issue #14)."""
 
-    def test_expansion_with_decision_engine_autonomous(self, mock_config, mock_plugin, mock_database, mock_state_manager, mock_clboss_bridge):
-        """Planner should use DecisionEngine for governance in autonomous mode."""
+    def test_expansion_with_decision_engine_advisor(self, mock_config, mock_plugin, mock_database, mock_state_manager, mock_clboss_bridge):
+        """Planner should use DecisionEngine for governance in advisor mode."""
         from modules.governance import DecisionEngine, DecisionResult
 
         mock_config.planner_enable_expansions = True
-        mock_config.governance_mode = 'autonomous'
+        mock_config.governance_mode = 'advisor'
 
         # Create mock decision engine
         mock_decision_engine = MagicMock(spec=DecisionEngine)

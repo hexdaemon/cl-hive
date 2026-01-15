@@ -299,10 +299,10 @@ class TestSetModeRPC:
         config.governance_mode = 'advisor'
         assert config.governance_mode == 'advisor'
 
-    def test_set_mode_autonomous(self, config):
-        """Setting mode to autonomous should work."""
-        config.governance_mode = 'autonomous'
-        assert config.governance_mode == 'autonomous'
+    def test_set_mode_failsafe(self, config):
+        """Setting mode to failsafe should work."""
+        config.governance_mode = 'failsafe'
+        assert config.governance_mode == 'failsafe'
 
 
 # =============================================================================

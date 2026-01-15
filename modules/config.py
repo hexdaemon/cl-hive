@@ -43,9 +43,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_min_channel_sats': int,
     'planner_max_channel_sats': int,
     'planner_default_channel_sats': int,
-    # Governance (Phase 7)
-    'autonomous_budget_per_day': int,
-    'autonomous_actions_per_hour': int,
+    # Governance (Phase 7) - Failsafe mode limits
+    'failsafe_budget_per_day': int,
+    'failsafe_actions_per_hour': int,
     'budget_reserve_pct': float,
     'budget_max_per_channel_pct': float,
     # Feerate gate
@@ -69,9 +69,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_channel_sats': (100_000, 100_000_000),  # 100k to 100M sats
     'planner_max_channel_sats': (1_000_000, 1_000_000_000),  # 1M to 1B sats (10 BTC)
     'planner_default_channel_sats': (100_000, 500_000_000),  # 100k to 500M sats (5 BTC)
-    # Governance (Phase 7)
-    'autonomous_budget_per_day': (100_000, 100_000_000),  # 100k to 100M sats
-    'autonomous_actions_per_hour': (1, 10),  # 1 to 10 actions per hour
+    # Governance (Phase 7) - Failsafe mode limits (tighter than old autonomous)
+    'failsafe_budget_per_day': (100_000, 10_000_000),  # 100k to 10M sats (reduced max)
+    'failsafe_actions_per_hour': (1, 5),  # 1 to 5 actions per hour (reduced max)
     'budget_reserve_pct': (0.05, 0.50),  # 5% to 50% reserve
     'budget_max_per_channel_pct': (0.10, 1.0),  # 10% to 100% of daily budget per channel
     # Feerate gate for expansions
@@ -79,7 +79,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 }
 
 # Valid governance modes
-VALID_GOVERNANCE_MODES = {'advisor', 'autonomous'}
+# - advisor: Primary mode - AI (via MCP server) reviews pending_actions
+# - failsafe: Emergency mode - auto-execute critical safety actions when AI unavailable
+VALID_GOVERNANCE_MODES = {'advisor', 'failsafe'}
 
 
 @dataclass
@@ -93,8 +95,8 @@ class HiveConfig:
     # Database path
     db_path: str = '~/.lightning/cl_hive.db'
     
-    # Governance Mode
-    governance_mode: str = 'advisor'  # 'advisor', 'autonomous'
+    # Governance Mode (advisor is primary, failsafe is emergency backup)
+    governance_mode: str = 'advisor'  # 'advisor' (AI-driven), 'failsafe' (emergency)
 
     # Phase 5 safety knobs
     membership_enabled: bool = True
@@ -130,9 +132,9 @@ class HiveConfig:
     planner_max_channel_sats: int = 50_000_000  # 50M sats maximum channel size
     planner_default_channel_sats: int = 5_000_000  # 5M sats default channel size
 
-    # Governance (Phase 7)
-    autonomous_budget_per_day: int = 10_000_000  # 10M sats daily budget
-    autonomous_actions_per_hour: int = 2         # Max 2 actions per hour
+    # Governance (Phase 7) - Failsafe mode limits
+    failsafe_budget_per_day: int = 1_000_000     # 1M sats daily budget (conservative)
+    failsafe_actions_per_hour: int = 2           # Max 2 emergency actions per hour
     budget_reserve_pct: float = 0.20             # Reserve 20% of onchain for future expansion
     budget_max_per_channel_pct: float = 0.50     # Max 50% of daily budget per single channel
 
@@ -203,9 +205,9 @@ class HiveConfigSnapshot:
     planner_min_channel_sats: int
     planner_max_channel_sats: int
     planner_default_channel_sats: int
-    # Governance (Phase 7)
-    autonomous_budget_per_day: int
-    autonomous_actions_per_hour: int
+    # Governance (Phase 7) - Failsafe mode limits
+    failsafe_budget_per_day: int
+    failsafe_actions_per_hour: int
     budget_reserve_pct: float
     budget_max_per_channel_pct: float
     max_expansion_feerate_perkb: int
@@ -237,8 +239,8 @@ class HiveConfigSnapshot:
             planner_min_channel_sats=config.planner_min_channel_sats,
             planner_max_channel_sats=config.planner_max_channel_sats,
             planner_default_channel_sats=config.planner_default_channel_sats,
-            autonomous_budget_per_day=config.autonomous_budget_per_day,
-            autonomous_actions_per_hour=config.autonomous_actions_per_hour,
+            failsafe_budget_per_day=config.failsafe_budget_per_day,
+            failsafe_actions_per_hour=config.failsafe_actions_per_hour,
             budget_reserve_pct=config.budget_reserve_pct,
             budget_max_per_channel_pct=config.budget_max_per_channel_pct,
             max_expansion_feerate_perkb=config.max_expansion_feerate_perkb,

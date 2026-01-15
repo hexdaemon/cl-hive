@@ -227,7 +227,7 @@ class CooperativeExpansionManager:
             after_reserve = int(raw_balance * (1.0 - reserve_pct))
 
             # Apply daily budget limit
-            daily_budget = getattr(cfg, 'autonomous_budget_per_day', 10_000_000)
+            daily_budget = getattr(cfg, 'failsafe_budget_per_day', 1_000_000)
 
             # Apply max per-channel percentage
             max_per_channel_pct = getattr(cfg, 'budget_max_per_channel_pct', 0.50)

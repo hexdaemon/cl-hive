@@ -255,8 +255,8 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
         },
         "governance": {
             "governance_mode": ctx.config.governance_mode,
-            "autonomous_budget_per_day": ctx.config.autonomous_budget_per_day,
-            "autonomous_actions_per_hour": ctx.config.autonomous_actions_per_hour,
+            "failsafe_budget_per_day": ctx.config.failsafe_budget_per_day,
+            "failsafe_actions_per_hour": ctx.config.failsafe_actions_per_hour,
         },
         "membership": {
             "membership_enabled": ctx.config.membership_enabled,
@@ -438,7 +438,7 @@ def _reject_all_actions(ctx: HiveContext) -> Dict[str, Any]:
 
 def budget_summary(ctx: HiveContext, days: int = 7) -> Dict[str, Any]:
     """
-    Get budget usage summary for autonomous mode.
+    Get budget usage summary for failsafe mode.
 
     Args:
         ctx: HiveContext
@@ -461,7 +461,7 @@ def budget_summary(ctx: HiveContext, days: int = 7) -> Dict[str, Any]:
     if not cfg:
         return {"error": "Config not initialized"}
 
-    daily_budget = cfg.autonomous_budget_per_day
+    daily_budget = cfg.failsafe_budget_per_day
     summary = ctx.database.get_budget_summary(daily_budget, days)
 
     return {
@@ -669,13 +669,13 @@ def _execute_channel_open(
 
         # Calculate budget components:
         # 1. Daily budget remaining
-        daily_remaining = ctx.database.get_available_budget(cfg.autonomous_budget_per_day)
+        daily_remaining = ctx.database.get_available_budget(cfg.failsafe_budget_per_day)
 
         # 2. Onchain reserve limit (keep reserve_pct for future expansion)
         spendable_onchain = int(onchain_sats * (1.0 - cfg.budget_reserve_pct))
 
         # 3. Max per-channel limit (percentage of daily budget)
-        max_per_channel = int(cfg.autonomous_budget_per_day * cfg.budget_max_per_channel_pct)
+        max_per_channel = int(cfg.failsafe_budget_per_day * cfg.budget_max_per_channel_pct)
 
         # Effective budget is the minimum of all constraints
         effective_budget = min(daily_remaining, spendable_onchain, max_per_channel)
@@ -684,7 +684,7 @@ def _execute_channel_open(
             "onchain_sats": onchain_sats,
             "reserve_pct": cfg.budget_reserve_pct,
             "spendable_onchain": spendable_onchain,
-            "daily_budget": cfg.autonomous_budget_per_day,
+            "daily_budget": cfg.failsafe_budget_per_day,
             "daily_remaining": daily_remaining,
             "max_per_channel_pct": cfg.budget_max_per_channel_pct,
             "max_per_channel": max_per_channel,
@@ -1086,7 +1086,7 @@ def set_mode(ctx: HiveContext, mode: str) -> Dict[str, Any]:
 
     Args:
         ctx: HiveContext
-        mode: New governance mode ('advisor' or 'autonomous')
+        mode: New governance mode ('advisor' or 'failsafe')
 
     Returns:
         Dict with new mode and previous mode.

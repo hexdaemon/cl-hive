@@ -1270,7 +1270,7 @@ class Planner:
         - Must have sufficient onchain funds (> 2 * MIN_CHANNEL_SIZE)
         - Target must exist in public graph
         - No existing pending intent for target
-        - Governance mode must be 'autonomous' to broadcast
+        - In advisor mode, actions are queued for AI/human approval
 
         Args:
             cfg: Config snapshot
@@ -1474,11 +1474,11 @@ class Planner:
                     decisions[-1]['governance_result'] = 'error'
             else:
                 # Fallback: Manual governance handling (backwards compatibility)
-                if cfg.governance_mode == 'autonomous':
+                if cfg.governance_mode == 'failsafe':
                     self._broadcast_intent(intent)
                     decisions[-1]['broadcast'] = True
                 else:
-                    # In advisor/oracle mode, queue to pending_actions for manual approval
+                    # In advisor mode, queue to pending_actions for AI/human approval
                     action_id = self.db.add_pending_action(
                         action_type='channel_open',
                         payload={

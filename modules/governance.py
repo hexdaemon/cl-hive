@@ -2,8 +2,16 @@
 Governance Module for cl-hive (Phase 7)
 
 Implements the Decision Engine that controls how Hive actions are executed:
-- ADVISOR mode: Queue actions for manual approval (human in the loop)
-- AUTONOMOUS mode: Execute within safety limits (budget cap, rate limits)
+- ADVISOR mode: Queue actions for AI/human approval via MCP server (primary mode)
+- FAILSAFE mode: Auto-execute emergency actions within tight safety limits
+
+Design Philosophy:
+  ADVISOR mode is the primary decision path - AI (via MCP server) makes smart,
+  context-aware decisions about channel opens, fee adjustments, and rebalancing.
+
+  FAILSAFE mode is for emergency situations when AI is unavailable - it handles
+  only critical safety actions (bans, rate limiting) within strict budget/rate
+  limits. All strategic decisions still queue to pending_actions.
 
 Security Constraints (GEMINI.md):
 - Rule #3: Fail-Closed Bias - On any error, fall back to ADVISOR mode
@@ -33,8 +41,8 @@ DEFAULT_ACTION_EXPIRY_HOURS = 24
 
 class GovernanceMode(Enum):
     """Decision-making modes for the Hive."""
-    ADVISOR = 'advisor'       # Queue for manual approval
-    AUTONOMOUS = 'autonomous' # Execute within safety limits
+    ADVISOR = 'advisor'    # Queue for AI/human approval (primary mode)
+    FAILSAFE = 'failsafe'  # Emergency auto-execute within tight limits
 
 
 class DecisionResult(Enum):
@@ -52,17 +60,17 @@ class DecisionResult(Enum):
 @dataclass
 class DecisionPacket:
     """
-    Packet sent to external oracle for decision.
+    Packet containing action details for governance decision.
 
-    Contains all context needed for the oracle to make an informed decision.
+    Contains all context needed to make an informed decision about the action.
     """
-    action_type: str          # 'channel_open', 'rebalance', 'ban'
+    action_type: str          # 'channel_open', 'rebalance', 'ban', 'emergency_ban'
     target: str               # Target peer pubkey
     context: Dict[str, Any]   # Additional context (capacity, share, balance)
     timestamp: int            # Unix timestamp
 
     def to_json(self) -> str:
-        """Serialize to JSON for API call."""
+        """Serialize to JSON."""
         return json.dumps(asdict(self), sort_keys=True)
 
 
@@ -72,7 +80,6 @@ class DecisionResponse:
     result: DecisionResult
     action_id: Optional[int] = None   # ID in pending_actions table (if queued)
     reason: str = ""                   # Human-readable reason
-    oracle_response: Optional[Dict] = None  # Raw oracle response (if applicable)
 
 
 # =============================================================================
@@ -84,8 +91,11 @@ class DecisionEngine:
     Governance decision engine for the Hive.
 
     Handles action proposals based on the configured governance mode:
-    - ADVISOR: Queue to pending_actions, require manual approval
-    - AUTONOMOUS: Execute if within budget/rate limits
+    - ADVISOR: Queue to pending_actions for AI/human approval (primary mode)
+    - FAILSAFE: Execute emergency actions within strict budget/rate limits
+
+    ADVISOR mode is the primary path - the MCP server enables AI to make smart
+    decisions about pending_actions. FAILSAFE is for when AI is unavailable.
 
     Thread Safety:
     - Uses config snapshot pattern for consistency
@@ -103,7 +113,7 @@ class DecisionEngine:
         self.db = database
         self.plugin = plugin
 
-        # Autonomous mode state tracking
+        # Failsafe mode state tracking (budget and rate limits)
         self._daily_spend_sats: int = 0
         self._daily_spend_reset_day: int = 0  # Day of year for reset
         self._hourly_actions: List[int] = []  # Timestamps of recent actions
@@ -142,11 +152,11 @@ class DecisionEngine:
 
         This is the main entry point for all governance decisions.
         Based on the governance mode, the action will be:
-        - ADVISOR: Queued for manual approval
-        - AUTONOMOUS: Executed if within limits, else queued
+        - ADVISOR: Queued for AI/human approval via MCP server
+        - FAILSAFE: Emergency actions executed if within limits, else queued
 
         Args:
-            action_type: Type of action ('channel_open', 'rebalance', 'ban')
+            action_type: Type of action ('channel_open', 'rebalance', 'ban', 'emergency_ban')
             target: Target peer pubkey
             context: Additional context for decision
             cfg: Config snapshot
@@ -168,8 +178,8 @@ class DecisionEngine:
 
             if mode == GovernanceMode.ADVISOR:
                 return self._handle_advisor_mode(packet, cfg)
-            elif mode == GovernanceMode.AUTONOMOUS:
-                return self._handle_autonomous_mode(packet, cfg)
+            elif mode == GovernanceMode.FAILSAFE:
+                return self._handle_failsafe_mode(packet, cfg)
             else:
                 # Unknown mode - fail closed to ADVISOR
                 self._log(f"Unknown mode {mode}, falling back to ADVISOR", level='warn')
@@ -186,7 +196,10 @@ class DecisionEngine:
 
     def _handle_advisor_mode(self, packet: DecisionPacket, cfg) -> DecisionResponse:
         """
-        Handle action in ADVISOR mode - queue for manual approval.
+        Handle action in ADVISOR mode - queue for AI/human approval.
+
+        This is the primary decision path. Actions are queued to pending_actions
+        where the AI (via MCP server) can make smart, context-aware decisions.
 
         Args:
             packet: Decision packet
@@ -195,7 +208,7 @@ class DecisionEngine:
         Returns:
             DecisionResponse with QUEUED result
         """
-        # Queue to pending_actions
+        # Queue to pending_actions for AI/human review
         action_id = self.db.add_pending_action(
             action_type=packet.action_type,
             payload={
@@ -206,41 +219,58 @@ class DecisionEngine:
             expires_hours=DEFAULT_ACTION_EXPIRY_HOURS
         )
 
-        self._log(f"Action queued for approval (id={action_id})")
+        self._log(f"Action queued for AI/human approval (id={action_id})")
 
         return DecisionResponse(
             result=DecisionResult.QUEUED,
             action_id=action_id,
-            reason="Queued for manual approval (ADVISOR mode)"
+            reason="Queued for AI/human approval (ADVISOR mode)"
         )
 
     # =========================================================================
-    # AUTONOMOUS MODE
+    # FAILSAFE MODE
     # =========================================================================
 
-    def _handle_autonomous_mode(self, packet: DecisionPacket, cfg) -> DecisionResponse:
+    # Action types that can be auto-executed in failsafe mode
+    FAILSAFE_ACTION_TYPES = {'emergency_ban', 'rate_limit_peer'}
+
+    def _handle_failsafe_mode(self, packet: DecisionPacket, cfg) -> DecisionResponse:
         """
-        Handle action in AUTONOMOUS mode - execute within safety limits.
+        Handle action in FAILSAFE mode - auto-execute emergency actions only.
+
+        FAILSAFE mode is for when AI is unavailable. It only auto-executes
+        critical safety actions (emergency bans, rate limiting). All strategic
+        decisions (channel opens, fee changes, rebalancing) still queue to
+        pending_actions for later AI review.
 
         Safety constraints:
-        - Daily budget cap (cfg.autonomous_budget_per_day)
-        - Hourly rate limit (cfg.autonomous_actions_per_hour)
+        - Only emergency action types can auto-execute
+        - Daily budget cap (cfg.failsafe_budget_per_day)
+        - Hourly rate limit (cfg.failsafe_actions_per_hour)
 
-        If limits exceeded, falls back to queuing (ADVISOR behavior).
+        If limits exceeded or non-emergency action, falls back to queuing.
 
         Args:
             packet: Decision packet
             cfg: Config snapshot
 
         Returns:
-            DecisionResponse with APPROVED/QUEUED/DENIED result
+            DecisionResponse with APPROVED/QUEUED result
         """
+        # Only auto-execute emergency action types
+        if packet.action_type not in self.FAILSAFE_ACTION_TYPES:
+            self._log(
+                f"Non-emergency action {packet.action_type} in FAILSAFE mode, queueing",
+                level='info'
+            )
+            return self._handle_advisor_mode(packet, cfg)
+
         # Check daily budget
         amount_sats = packet.context.get('amount_sats', 0)
         if not self._check_budget(amount_sats, cfg):
             self._log(
                 f"Daily budget exceeded ({self._daily_spend_sats} + {amount_sats} > "
-                f"{cfg.autonomous_budget_per_day}), queueing action",
+                f"{cfg.failsafe_budget_per_day}), queueing action",
                 level='warn'
             )
             return self._handle_advisor_mode(packet, cfg)
@@ -249,12 +279,12 @@ class DecisionEngine:
         if not self._check_rate_limit(cfg):
             self._log(
                 f"Hourly rate limit exceeded ({len(self._hourly_actions)} >= "
-                f"{cfg.autonomous_actions_per_hour}), queueing action",
+                f"{cfg.failsafe_actions_per_hour}), queueing action",
                 level='warn'
             )
             return self._handle_advisor_mode(packet, cfg)
 
-        # Execute the action
+        # Execute the emergency action
         executor = self._executors.get(packet.action_type)
         if executor:
             try:
@@ -264,11 +294,11 @@ class DecisionEngine:
                 self._daily_spend_sats += amount_sats
                 self._hourly_actions.append(int(time.time()))
 
-                self._log(f"Action executed (AUTONOMOUS mode)")
+                self._log(f"Emergency action executed (FAILSAFE mode)")
 
                 return DecisionResponse(
                     result=DecisionResult.APPROVED,
-                    reason="Executed within safety limits (AUTONOMOUS mode)"
+                    reason="Emergency action executed (FAILSAFE mode)"
                 )
             except Exception as e:
                 self._log(f"Execution failed: {e}, queueing action", level='warn')
@@ -280,7 +310,7 @@ class DecisionEngine:
 
     def _check_budget(self, amount_sats: int, cfg) -> bool:
         """
-        Check if amount is within daily budget.
+        Check if amount is within daily budget (failsafe mode).
 
         Resets budget at midnight UTC.
 
@@ -299,11 +329,11 @@ class DecisionEngine:
             self._daily_spend_sats = 0
             self._daily_spend_reset_day = current_day
 
-        return (self._daily_spend_sats + amount_sats) <= cfg.autonomous_budget_per_day
+        return (self._daily_spend_sats + amount_sats) <= cfg.failsafe_budget_per_day
 
     def _check_rate_limit(self, cfg) -> bool:
         """
-        Check if within hourly rate limit.
+        Check if within hourly rate limit (failsafe mode).
 
         Args:
             cfg: Config snapshot
@@ -317,7 +347,7 @@ class DecisionEngine:
         # Prune old actions
         self._hourly_actions = [ts for ts in self._hourly_actions if ts > cutoff]
 
-        return len(self._hourly_actions) < cfg.autonomous_actions_per_hour
+        return len(self._hourly_actions) < cfg.failsafe_actions_per_hour
 
     # =========================================================================
     # STATISTICS
