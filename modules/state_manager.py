@@ -44,10 +44,10 @@ MAX_PEER_ID_LEN = 128
 class HivePeerState:
     """
     Represents the cached state of a Hive peer.
-    
+
     This is what we know about a peer's current liquidity and policy,
     updated via GOSSIP messages or FULL_SYNC responses.
-    
+
     Attributes:
         peer_id: Node public key (33 bytes hex)
         capacity_sats: Total channel capacity to this peer
@@ -57,6 +57,9 @@ class HivePeerState:
         version: Monotonically increasing version number
         last_update: Unix timestamp of last gossip received
         state_hash: Hash of this peer's local state view
+        budget_available_sats: Current budget-constrained spendable liquidity
+        budget_reserved_until: Unix timestamp when any active budget hold expires
+        budget_last_update: Unix timestamp when budget was last calculated
     """
     peer_id: str
     capacity_sats: int
@@ -66,6 +69,9 @@ class HivePeerState:
     version: int
     last_update: int
     state_hash: str = ""
+    budget_available_sats: int = 0
+    budget_reserved_until: int = 0
+    budget_last_update: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -73,8 +79,39 @@ class HivePeerState:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'HivePeerState':
-        """Create from dictionary."""
-        return cls(**data)
+        """
+        Create from dictionary with backward compatibility.
+
+        Handles old nodes that don't send budget fields by using defaults.
+        """
+        # Required fields
+        peer_id = data.get("peer_id", "")
+        capacity_sats = data.get("capacity_sats", 0)
+        available_sats = data.get("available_sats", 0)
+        fee_policy = data.get("fee_policy", {})
+        topology = data.get("topology", [])
+        version = data.get("version", 0)
+        last_update = data.get("last_update", data.get("timestamp", 0))
+        state_hash = data.get("state_hash", "")
+
+        # Budget fields (optional, backward compatible defaults)
+        budget_available_sats = data.get("budget_available_sats", 0)
+        budget_reserved_until = data.get("budget_reserved_until", 0)
+        budget_last_update = data.get("budget_last_update", 0)
+
+        return cls(
+            peer_id=peer_id,
+            capacity_sats=capacity_sats,
+            available_sats=available_sats,
+            fee_policy=fee_policy,
+            topology=topology,
+            version=version,
+            last_update=last_update,
+            state_hash=state_hash,
+            budget_available_sats=budget_available_sats,
+            budget_reserved_until=budget_reserved_until,
+            budget_last_update=budget_last_update,
+        )
     
     def to_hash_tuple(self) -> Dict[str, Any]:
         """
@@ -207,7 +244,11 @@ class StateManager:
             topology=gossip_data.get('topology', []),
             version=remote_version,
             last_update=gossip_data.get('timestamp', now),
-            state_hash=gossip_data.get('state_hash', "")
+            state_hash=gossip_data.get('state_hash', ""),
+            # Budget fields (Phase 8 - backward compatible, defaults to 0)
+            budget_available_sats=gossip_data.get('budget_available_sats', 0),
+            budget_reserved_until=gossip_data.get('budget_reserved_until', 0),
+            budget_last_update=gossip_data.get('budget_last_update', 0),
         )
         
         # Update in-memory cache
@@ -270,7 +311,66 @@ class StateManager:
     def get_all_peer_states(self) -> List[HivePeerState]:
         """Get all cached peer states."""
         return list(self._local_state.values())
-    
+
+    def get_fleet_budget_summary(self, min_channel_sats: int = 0,
+                                  stale_threshold_sec: int = 600) -> Dict[str, Any]:
+        """
+        Get aggregated budget information across the hive fleet.
+
+        Used for pre-flight affordability checks before starting expansion rounds.
+
+        Args:
+            min_channel_sats: Minimum channel size to consider "affordable"
+            stale_threshold_sec: Seconds after which budget data is considered stale
+
+        Returns:
+            Dict with:
+                - total_available_sats: Sum of all member budgets
+                - members_with_budget: Count of members with budget > 0
+                - affordable_members: List of peer_ids that can afford min_channel_sats
+                - stale_count: Number of members with stale budget data
+                - freshness_avg_sec: Average age of budget data
+                - can_afford: True if any member can afford min_channel_sats
+        """
+        now = int(time.time())
+
+        total_available = 0
+        members_with_budget = 0
+        affordable_members = []
+        stale_count = 0
+        budget_ages = []
+
+        for state in self._local_state.values():
+            budget = state.budget_available_sats
+            budget_time = state.budget_last_update
+
+            # Track budget totals
+            if budget > 0:
+                total_available += budget
+                members_with_budget += 1
+
+            # Check affordability
+            if min_channel_sats > 0 and budget >= min_channel_sats:
+                affordable_members.append(state.peer_id)
+
+            # Track staleness
+            if budget_time > 0:
+                age = now - budget_time
+                budget_ages.append(age)
+                if age > stale_threshold_sec:
+                    stale_count += 1
+
+        avg_age = sum(budget_ages) / len(budget_ages) if budget_ages else 0
+
+        return {
+            "total_available_sats": total_available,
+            "members_with_budget": members_with_budget,
+            "affordable_members": affordable_members,
+            "stale_count": stale_count,
+            "freshness_avg_sec": int(avg_age),
+            "can_afford": len(affordable_members) > 0 or min_channel_sats == 0,
+        }
+
     def remove_peer_state(self, peer_id: str) -> bool:
         """Remove a peer from the state cache (e.g., after ban)."""
         if peer_id in self._local_state:

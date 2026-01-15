@@ -71,6 +71,10 @@ class ExpansionRound:
     expires_at: int = 0
     completed_at: int = 0
     result: str = ""
+    # Phase 8: Fallback support
+    ranked_candidates: List[tuple] = field(default_factory=list)  # [(pubkey, score), ...]
+    decline_count: int = 0  # Number of declines received
+    declined_by: List[str] = field(default_factory=list)  # Pubkeys who declined
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -89,6 +93,10 @@ class ExpansionRound:
             "expires_at": self.expires_at,
             "completed_at": self.completed_at,
             "result": self.result,
+            # Phase 8: Fallback support
+            "decline_count": self.decline_count,
+            "declined_by": [d[:16] + "..." for d in self.declined_by],
+            "fallback_candidates": len(self.ranked_candidates),
         }
 
 
@@ -128,6 +136,7 @@ class CooperativeExpansionManager:
     MAX_ACTIVE_ROUNDS = 5             # Max concurrent expansion rounds
     MIN_NOMINATIONS_FOR_ELECTION = 1  # Min nominations to proceed
     MIN_QUALITY_SCORE = 0.45          # Min quality to trigger round
+    MAX_FALLBACK_ATTEMPTS = 2         # Max declines before cancelling round (Phase 8)
 
     def __init__(
         self,
@@ -135,7 +144,8 @@ class CooperativeExpansionManager:
         quality_scorer: 'PeerQualityScorer' = None,
         plugin=None,
         our_id: str = None,
-        config_getter=None
+        config_getter=None,
+        state_manager=None
     ):
         """
         Initialize the CooperativeExpansionManager.
@@ -146,12 +156,14 @@ class CooperativeExpansionManager:
             plugin: Plugin instance for RPC and logging
             our_id: Our node's pubkey
             config_getter: Callable that returns current HiveConfig
+            state_manager: StateManager for fleet budget queries (Phase 8)
         """
         self.database = database
         self.quality_scorer = quality_scorer
         self.plugin = plugin
         self.our_id = our_id
         self._config_getter = config_getter
+        self.state_manager = state_manager
 
         # Active rounds (keyed by round_id)
         self._rounds: Dict[str, ExpansionRound] = {}
@@ -248,6 +260,98 @@ class CooperativeExpansionManager:
             self._log(f"Error calculating budget-constrained liquidity: {e}", level='warn')
             return int(raw_balance * 0.8)
 
+    def check_fleet_affordability(self, min_channel_sats: int = 0) -> Dict[str, Any]:
+        """
+        Check if ANY hive member can afford the minimum channel size.
+
+        Uses cached budget data from recent GOSSIP messages via StateManager.
+        Falls back to local-only check if StateManager not available.
+
+        Args:
+            min_channel_sats: Minimum channel size required. If 0, uses config default.
+
+        Returns:
+            Dict with:
+                - can_afford: True if at least one member can afford
+                - affordable_members: List of peer_ids that can afford
+                - total_available_sats: Sum of all member budgets
+                - stale_count: Number of members with stale budget data
+                - freshness_avg_sec: Average age of budget data
+                - local_budget_sats: Our own budget (always fresh)
+        """
+        # Determine minimum channel size
+        if min_channel_sats == 0 and self._config_getter:
+            try:
+                cfg = self._config_getter()
+                if cfg:
+                    min_channel_sats = getattr(cfg, 'planner_min_channel_sats', 100_000)
+            except Exception:
+                min_channel_sats = 100_000
+
+        # Get our local budget (always fresh)
+        local_budget = self._get_budget_constrained_liquidity()
+
+        # If no state_manager, fall back to local-only check
+        if not self.state_manager:
+            can_afford = local_budget >= min_channel_sats
+            return {
+                "can_afford": can_afford,
+                "affordable_members": [self._get_our_id()] if can_afford else [],
+                "total_available_sats": local_budget,
+                "stale_count": 0,
+                "freshness_avg_sec": 0,
+                "local_budget_sats": local_budget,
+                "source": "local_only",
+            }
+
+        # Query state_manager for fleet-wide budget summary
+        try:
+            summary = self.state_manager.get_fleet_budget_summary(
+                min_channel_sats=min_channel_sats,
+                stale_threshold_sec=600  # 10 minutes
+            )
+
+            # Add our local budget to the result
+            summary["local_budget_sats"] = local_budget
+            summary["source"] = "fleet_gossip"
+
+            # If we can afford but aren't in the list (our gossip might be stale),
+            # add ourselves
+            our_id = self._get_our_id()
+            if local_budget >= min_channel_sats and our_id not in summary.get("affordable_members", []):
+                summary["affordable_members"].append(our_id)
+                summary["can_afford"] = True
+
+            # Log if no one can afford
+            if not summary.get("can_afford"):
+                self._log(
+                    f"Fleet affordability check: no member can afford {min_channel_sats:,} sats "
+                    f"(total_available={summary.get('total_available_sats', 0):,})",
+                    level='info'
+                )
+            else:
+                self._log(
+                    f"Fleet affordability check: {len(summary.get('affordable_members', []))} members "
+                    f"can afford {min_channel_sats:,} sats",
+                    level='debug'
+                )
+
+            return summary
+        except Exception as e:
+            self._log(f"Error checking fleet affordability: {e}", level='warn')
+            # Fall back to local-only
+            can_afford = local_budget >= min_channel_sats
+            return {
+                "can_afford": can_afford,
+                "affordable_members": [self._get_our_id()] if can_afford else [],
+                "total_available_sats": local_budget,
+                "stale_count": 0,
+                "freshness_avg_sec": 0,
+                "local_budget_sats": local_budget,
+                "source": "local_fallback",
+                "error": str(e),
+            }
+
     def _get_channel_count(self) -> int:
         """Get our total channel count."""
         if not self.plugin:
@@ -332,6 +436,17 @@ class CooperativeExpansionManager:
             self._log(
                 f"Target {target_peer_id[:16]}... quality too low: {quality_score:.2f}",
                 level='debug'
+            )
+            return None
+
+        # Phase 8: Pre-flight affordability check
+        # Don't start rounds if no hive member can afford minimum channel
+        affordability = self.check_fleet_affordability()
+        if not affordability.get("can_afford", False):
+            self._log(
+                f"Skipping expansion for {target_peer_id[:16]}...: no member can afford "
+                f"(total_available={affordability.get('total_available_sats', 0):,} sats)",
+                level='info'
             )
             return None
 
@@ -695,6 +810,10 @@ class CooperativeExpansionManager:
         # Winner is highest scored
         winner, winner_score, winner_factors = scored[0]
 
+        # Phase 8: Store top 3 candidates for potential fallback
+        # Format: [(pubkey, score), ...]
+        ranked_candidates = [(nom.nominator_id, score) for nom, score, _ in scored[:3]]
+
         # Capture target_peer_id inside lock for thread safety
         target_peer_id = None
         with self._lock:
@@ -703,6 +822,7 @@ class CooperativeExpansionManager:
                 round_obj.elected_id = winner.nominator_id
                 round_obj.state = ExpansionRoundState.ELECTED
                 round_obj.result = f"elected with score {winner_score:.3f}"
+                round_obj.ranked_candidates = ranked_candidates  # Phase 8: Store for fallback
                 target_peer_id = round_obj.target_peer_id
 
         self._log(
@@ -766,6 +886,116 @@ class CooperativeExpansionManager:
             }
 
         return {"action": "none", "round_id": round_id}
+
+    def handle_decline(self, peer_id: str, payload: Dict) -> Dict:
+        """
+        Handle an incoming EXPANSION_DECLINE message (Phase 8).
+
+        When the elected member declines (insufficient funds, feerate, etc.),
+        fallback to the next ranked candidate if available.
+
+        Args:
+            peer_id: Sender's pubkey (should match decliner_id)
+            payload: Decline payload with round_id, decliner_id, reason
+
+        Returns:
+            Response dict with fallback_elected (new winner) or cancelled
+        """
+        round_id = payload.get("round_id")
+        decliner_id = payload.get("decliner_id")
+        reason = payload.get("reason", "unknown")
+
+        if not round_id or not decliner_id:
+            return {"error": "missing round_id or decliner_id"}
+
+        # Verify sender matches decliner
+        if peer_id != decliner_id:
+            self._log(
+                f"Decline mismatch: sender {peer_id[:16]}... != decliner {decliner_id[:16]}...",
+                level='warning'
+            )
+            return {"error": "sender does not match decliner"}
+
+        with self._lock:
+            round_obj = self._rounds.get(round_id)
+            if not round_obj:
+                return {"error": "round not found"}
+
+            # Only accept decline from the currently elected member
+            if round_obj.elected_id != decliner_id:
+                self._log(
+                    f"Decline from non-elected member {decliner_id[:16]}... "
+                    f"(elected={round_obj.elected_id[:16] if round_obj.elected_id else 'none'}...)",
+                    level='warning'
+                )
+                return {"error": "decliner is not the elected member"}
+
+            # Check if we've exceeded max fallback attempts
+            if round_obj.decline_count >= self.MAX_FALLBACK_ATTEMPTS:
+                round_obj.state = ExpansionRoundState.CANCELLED
+                round_obj.result = f"cancelled_after_{round_obj.decline_count}_declines"
+                self._log(
+                    f"Round {round_id[:8]}... cancelled - max fallback attempts reached"
+                )
+                return {
+                    "action": "cancelled",
+                    "round_id": round_id,
+                    "reason": "max_fallbacks_exceeded",
+                }
+
+            # Track this decline
+            round_obj.decline_count += 1
+            round_obj.declined_by.append(decliner_id)
+
+            self._log(
+                f"Round {round_id[:8]}... received decline from {decliner_id[:16]}... "
+                f"(reason={reason}, decline #{round_obj.decline_count})"
+            )
+
+            # Find next candidate not in declined_by
+            next_candidate = None
+            next_score = 0.0
+            for candidate_id, score in round_obj.ranked_candidates:
+                if candidate_id not in round_obj.declined_by:
+                    next_candidate = candidate_id
+                    next_score = score
+                    break
+
+            if not next_candidate:
+                # No more candidates available
+                round_obj.state = ExpansionRoundState.CANCELLED
+                round_obj.result = f"no_fallback_candidates_after_{round_obj.decline_count}_declines"
+                self._log(
+                    f"Round {round_id[:8]}... cancelled - no fallback candidates available"
+                )
+                return {
+                    "action": "cancelled",
+                    "round_id": round_id,
+                    "reason": "no_fallback_candidates",
+                }
+
+            # Elect the fallback candidate
+            round_obj.elected_id = next_candidate
+            round_obj.result = f"fallback_elected with score {next_score:.3f}"
+            target_peer_id = round_obj.target_peer_id
+            channel_size_sats = round_obj.recommended_size_sats
+
+        self._log(
+            f"Round {round_id[:8]}... fallback elected {next_candidate[:16]}... "
+            f"(score={next_score:.3f})"
+        )
+
+        # Track this as a recent open for fairness
+        self._recent_opens[next_candidate] = int(time.time())
+
+        return {
+            "action": "fallback_elected",
+            "round_id": round_id,
+            "elected_id": next_candidate,
+            "target_peer_id": target_peer_id,
+            "channel_size_sats": channel_size_sats,
+            "decline_count": round_obj.decline_count,
+        }
 
     def complete_round(self, round_id: str, success: bool, result: str = "") -> None:
         """

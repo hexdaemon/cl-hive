@@ -66,7 +66,7 @@ class IntentType(str, Enum):
 class Intent:
     """
     Represents an Intent lock for a coordinated action.
-    
+
     Attributes:
         intent_type: Type of action (channel_open, rebalance, ban_peer)
         target: Target identifier (peer_id for channel_open/ban, route for rebalance)
@@ -75,6 +75,8 @@ class Intent:
         expires_at: Unix timestamp when intent expires
         status: Current status (pending, committed, aborted, expired)
         intent_id: Database ID (set after insertion)
+        amount_sats: Committed budget for this intent (Phase 8, optional)
+        budget_proof_timestamp: When budget was verified (Phase 8, optional)
     """
     intent_type: str
     target: str
@@ -83,10 +85,13 @@ class Intent:
     expires_at: int
     status: str = STATUS_PENDING
     intent_id: Optional[int] = None
+    # Phase 8: Budget commitment fields (optional, for backward compatibility)
+    amount_sats: int = 0
+    budget_proof_timestamp: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
-        return {
+        result = {
             'intent_type': self.intent_type,
             'target': self.target,
             'initiator': self.initiator,
@@ -94,6 +99,12 @@ class Intent:
             'expires_at': self.expires_at,
             'status': self.status
         }
+        # Phase 8: Include budget fields if set (backward compatible)
+        if self.amount_sats > 0:
+            result['amount_sats'] = self.amount_sats
+        if self.budget_proof_timestamp > 0:
+            result['budget_proof_timestamp'] = self.budget_proof_timestamp
+        return result
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any], intent_id: Optional[int] = None) -> 'Intent':
@@ -105,7 +116,10 @@ class Intent:
             timestamp=data['timestamp'],
             expires_at=data.get('expires_at', data['timestamp'] + DEFAULT_HOLD_SECONDS),
             status=data.get('status', STATUS_PENDING),
-            intent_id=intent_id
+            intent_id=intent_id,
+            # Phase 8: Budget fields (optional, default to 0)
+            amount_sats=data.get('amount_sats', 0),
+            budget_proof_timestamp=data.get('budget_proof_timestamp', 0),
         )
     
     def is_expired(self) -> bool:

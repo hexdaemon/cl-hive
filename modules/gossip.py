@@ -44,7 +44,7 @@ MAX_FEE_POLICY_KEYS = 20
 class GossipState:
     """
     Tracks the last broadcast state for comparison.
-    
+
     Used to determine if a new gossip is warranted based on
     threshold rules.
     """
@@ -54,6 +54,8 @@ class GossipState:
     topology: List[str] = field(default_factory=list)
     last_broadcast: int = 0
     version: int = 0
+    budget_available_sats: int = 0
+    budget_reserved_until: int = 0
 
 
 # =============================================================================
@@ -194,25 +196,29 @@ class GossipManager:
     
     def create_gossip_payload(self, our_pubkey: str, capacity_sats: int,
                                available_sats: int, fee_policy: Dict[str, Any],
-                               topology: List[str]) -> Dict[str, Any]:
+                               topology: List[str],
+                               budget_available_sats: int = 0,
+                               budget_reserved_until: int = 0) -> Dict[str, Any]:
         """
         Create a gossip payload for broadcast.
-        
+
         Updates internal tracking state after creating payload.
-        
+
         Args:
             our_pubkey: Our node's public key
             capacity_sats: Total Hive channel capacity
             available_sats: Available outbound liquidity
             fee_policy: Current fee policy
             topology: List of external peer connections
-            
+            budget_available_sats: Budget-constrained spendable liquidity
+            budget_reserved_until: Timestamp when budget hold expires (0 if none)
+
         Returns:
             Dict payload ready for GOSSIP message serialization
         """
         now = int(time.time())
         new_version = self._last_broadcast_state.version + 1
-        
+
         # Update our tracking state
         self._last_broadcast_state = GossipState(
             capacity_sats=capacity_sats,
@@ -220,9 +226,11 @@ class GossipManager:
             fee_policy=fee_policy.copy(),
             topology=topology.copy(),
             last_broadcast=now,
-            version=new_version
+            version=new_version,
+            budget_available_sats=budget_available_sats,
+            budget_reserved_until=budget_reserved_until,
         )
-        
+
         # Also update the state manager with our local state
         self.state_manager.update_local_state(
             capacity_sats=capacity_sats,
@@ -231,7 +239,7 @@ class GossipManager:
             topology=topology,
             our_pubkey=our_pubkey
         )
-        
+
         return {
             "peer_id": our_pubkey,
             "capacity_sats": capacity_sats,
@@ -240,7 +248,11 @@ class GossipManager:
             "topology": topology,
             "version": new_version,
             "timestamp": now,
-            "state_hash": self.state_manager.calculate_fleet_hash()
+            "state_hash": self.state_manager.calculate_fleet_hash(),
+            # Budget fields (Phase 8 - Hive-wide Affordability)
+            "budget_available_sats": budget_available_sats,
+            "budget_reserved_until": budget_reserved_until,
+            "budget_last_update": now,
         }
     
     # =========================================================================

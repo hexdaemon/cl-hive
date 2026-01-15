@@ -86,6 +86,9 @@ class HiveMessageType(IntEnum):
     EXPANSION_NOMINATE = 32805  # Nominate self to open channel (Phase 6.4)
     EXPANSION_ELECT = 32807     # Announce elected member for expansion (Phase 6.4)
 
+    # Phase 8: Hive-wide Affordability
+    EXPANSION_DECLINE = 32819   # Elected member declines, trigger fallback (Phase 8)
+
     # Phase 7: Cooperative Fee Coordination
     FEE_INTELLIGENCE = 32809    # Share fee observations with hive
     LIQUIDITY_NEED = 32811      # Broadcast rebalancing needs
@@ -752,6 +755,23 @@ def validate_gossip(payload: Dict[str, Any]) -> bool:
     version = payload.get("version")
     if version is not None and (not isinstance(version, int) or version < 0):
         return False
+
+    # Budget fields (Phase 8 - optional, backward compatible)
+    # Validate only if present, must be non-negative integers
+    budget_available = payload.get("budget_available_sats")
+    if budget_available is not None:
+        if not isinstance(budget_available, int) or budget_available < 0:
+            return False
+
+    budget_reserved = payload.get("budget_reserved_until")
+    if budget_reserved is not None:
+        if not isinstance(budget_reserved, int) or budget_reserved < 0:
+            return False
+
+    budget_update = payload.get("budget_last_update")
+    if budget_update is not None:
+        if not isinstance(budget_update, int) or budget_update < 0:
+            return False
 
     return True
 
@@ -1449,6 +1469,116 @@ def create_expansion_elect(
         payload["reason"] = reason
 
     return serialize(HiveMessageType.EXPANSION_ELECT, payload)
+
+
+# =============================================================================
+# PHASE 8: EXPANSION DECLINE SIGNING & VALIDATION
+# =============================================================================
+
+def get_expansion_decline_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for EXPANSION_DECLINE messages.
+
+    Args:
+        payload: EXPANSION_DECLINE message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    return (
+        f"EXPANSION_DECLINE:"
+        f"{payload.get('round_id', '')}:"
+        f"{payload.get('decliner_id', '')}:"
+        f"{payload.get('reason', '')}:"
+        f"{payload.get('timestamp', 0)}"
+    )
+
+
+def validate_expansion_decline(payload: Dict[str, Any]) -> bool:
+    """
+    Validate EXPANSION_DECLINE payload schema.
+
+    SECURITY: Requires cryptographic signature from the decliner.
+
+    Args:
+        payload: EXPANSION_DECLINE message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    # Required fields
+    round_id = payload.get("round_id")
+    decliner_id = payload.get("decliner_id")
+    reason = payload.get("reason")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # round_id must be at least 8 characters
+    if not isinstance(round_id, str) or len(round_id) < 8:
+        return False
+
+    # decliner_id must be valid pubkey
+    if not _valid_pubkey(decliner_id):
+        return False
+
+    # reason must be a non-empty string
+    if not isinstance(reason, str) or not reason:
+        return False
+
+    # Valid reasons
+    valid_reasons = {
+        'insufficient_funds', 'budget_consumed', 'feerate_high',
+        'channel_exists', 'peer_unavailable', 'config_changed', 'manual'
+    }
+    if reason not in valid_reasons:
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    return True
+
+
+def create_expansion_decline(
+    round_id: str,
+    decliner_id: str,
+    reason: str,
+    timestamp: int,
+    signature: str
+) -> bytes:
+    """
+    Create an EXPANSION_DECLINE message.
+
+    Sent by an elected member who cannot fulfill the channel open.
+    Triggers fallback election to next candidate.
+
+    Args:
+        round_id: The expansion round ID
+        decliner_id: Our pubkey (the elected member declining)
+        reason: Reason for declining
+        timestamp: Current Unix timestamp
+        signature: Signature over the signing payload
+
+    Returns:
+        Serialized EXPANSION_DECLINE message
+    """
+    payload = {
+        "round_id": round_id,
+        "decliner_id": decliner_id,
+        "reason": reason,
+        "timestamp": timestamp,
+        "signature": signature,
+    }
+
+    return serialize(HiveMessageType.EXPANSION_DECLINE, payload)
 
 
 # =============================================================================

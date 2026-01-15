@@ -50,9 +50,10 @@ from modules.protocol import (
     validate_promotion_request, validate_vouch, validate_promotion,
     validate_member_left, validate_ban_proposal, validate_ban_vote,
     validate_peer_available, create_peer_available,
-    validate_expansion_nominate, validate_expansion_elect,
-    create_expansion_nominate, create_expansion_elect,
+    validate_expansion_nominate, validate_expansion_elect, validate_expansion_decline,
+    create_expansion_nominate, create_expansion_elect, create_expansion_decline,
     get_expansion_nominate_signing_payload, get_expansion_elect_signing_payload,
+    get_expansion_decline_signing_payload,
     VOUCH_TTL_SECONDS, MAX_VOUCHES_IN_PROMOTION,
     create_challenge, create_welcome,
     # Signed message validation (security hardening)
@@ -1182,6 +1183,8 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_expansion_nominate(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.EXPANSION_ELECT:
             return handle_expansion_elect(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.EXPANSION_DECLINE:
+            return handle_expansion_decline(peer_id, msg_payload, plugin)
         # Phase 7: Cooperative Fee Coordination
         elif msg_type == HiveMessageType.FEE_INTELLIGENCE:
             return handle_fee_intelligence(peer_id, msg_payload, plugin)
@@ -3500,6 +3503,71 @@ def _broadcast_expansion_elect(round_id: str, target_peer_id: str, elected_id: s
     return sent
 
 
+def _broadcast_expansion_decline(round_id: str, reason: str) -> int:
+    """
+    Broadcast an EXPANSION_DECLINE message to all hive members (Phase 8).
+
+    Called when we (the elected member) cannot open the channel due to
+    insufficient funds, high feerate, or other reasons. This triggers
+    fallback to the next ranked candidate.
+
+    SECURITY: The message is signed by the decliner (us) to prevent
+    spoofing decline messages.
+
+    Args:
+        round_id: The cooperative expansion round ID
+        reason: Why we're declining (insufficient_funds, feerate_high, etc.)
+
+    Returns:
+        Number of members message was sent to
+    """
+    if not safe_plugin or not database:
+        return 0
+
+    try:
+        decliner_id = safe_plugin.rpc.getinfo().get("id")
+    except Exception:
+        return 0
+
+    import time
+    timestamp = int(time.time())
+
+    # Build payload for signing (SECURITY: sign before sending)
+    signing_payload = {
+        "round_id": round_id,
+        "decliner_id": decliner_id,
+        "reason": reason,
+        "timestamp": timestamp,
+    }
+    signing_message = get_expansion_decline_signing_payload(signing_payload)
+
+    # Sign the message with our node key
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_message)
+        signature = sig_result['zbase']
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: Failed to sign decline: {e}", level='error')
+        return 0
+
+    msg = create_expansion_decline(
+        round_id=round_id,
+        decliner_id=decliner_id,
+        reason=reason,
+        timestamp=timestamp,
+        signature=signature,
+    )
+
+    sent = _broadcast_to_members(msg)
+    if sent > 0:
+        safe_plugin.log(
+            f"cl-hive: Broadcast expansion decline for round {round_id[:8]}... "
+            f"(reason={reason}) to {sent} members",
+            level='info'
+        )
+
+    return sent
+
+
 def handle_expansion_nominate(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle EXPANSION_NOMINATE message from another hive member.
@@ -3670,6 +3738,10 @@ def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                     f"(proposed={proposed_size}, min={cfg.planner_min_channel_sats})",
                     level='info'
                 )
+                # Phase 8: Broadcast decline to trigger fallback
+                round_id = payload.get("round_id", "")
+                if round_id:
+                    _broadcast_expansion_decline(round_id, "insufficient_funds")
                 return {"result": "declined", "reason": "insufficient_funds"}
             if was_capped:
                 plugin.log(
@@ -3697,6 +3769,141 @@ def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         )
 
     return {"result": "continue", "election_result": result}
+
+
+def handle_expansion_decline(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle EXPANSION_DECLINE message from the elected member (Phase 8).
+
+    When the elected member cannot afford the channel open or has another
+    reason to decline, this message triggers fallback to the next candidate.
+
+    SECURITY: Verifies cryptographic signature from the decliner.
+    """
+    if not coop_expansion or not database:
+        return {"result": "continue"}
+
+    if not validate_expansion_decline(payload):
+        plugin.log(f"cl-hive: Invalid EXPANSION_DECLINE from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: EXPANSION_DECLINE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # SECURITY: Verify the cryptographic signature from decliner
+    decliner_id = payload.get("decliner_id", "")
+    signature = payload.get("signature", "")
+    signing_message = get_expansion_decline_signing_payload(payload)
+
+    try:
+        verify_result = plugin.rpc.checkmessage(signing_message, signature)
+        if not verify_result.get("verified", False):
+            plugin.log(
+                f"cl-hive: [DECLINE] Signature verification failed for decliner {decliner_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+        # Verify the signature is from the claimed decliner
+        recovered_pubkey = verify_result.get("pubkey", "")
+        if recovered_pubkey != decliner_id:
+            plugin.log(
+                f"cl-hive: [DECLINE] Signature mismatch: claimed={decliner_id[:16]}... "
+                f"actual={recovered_pubkey[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+        # Verify the decliner is a hive member
+        decliner_member = database.get_member(decliner_id)
+        if not decliner_member or database.is_banned(decliner_id):
+            plugin.log(
+                f"cl-hive: [DECLINE] Decliner {decliner_id[:16]}... not a member or banned",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: [DECLINE] Signature verification error: {e}", level='warn')
+        return {"result": "continue"}
+
+    round_id = payload.get("round_id", "")
+    reason = payload.get("reason", "unknown")
+    plugin.log(
+        f"cl-hive: [DECLINE] Verified decline from {decliner_id[:16]}... "
+        f"for round {round_id[:8]}... (reason={reason})",
+        level='info'
+    )
+
+    # Process the decline - this may elect a fallback candidate
+    result = coop_expansion.handle_decline(peer_id, payload)
+
+    if result.get("action") == "fallback_elected":
+        # A fallback candidate was elected
+        new_elected = result.get("elected_id", "")
+        our_id = None
+        try:
+            our_id = plugin.rpc.getinfo().get("id")
+        except Exception:
+            pass
+
+        if new_elected == our_id:
+            # We are the fallback candidate
+            target_peer_id = result.get("target_peer_id", "")
+            channel_size = result.get("channel_size_sats", 0)
+            plugin.log(
+                f"cl-hive: We are the fallback candidate for round {round_id[:8]}... "
+                f"(target={target_peer_id[:16]}...)",
+                level='info'
+            )
+
+            # Queue the channel open via pending actions
+            if database and config:
+                cfg = config.snapshot()
+                proposed_size = channel_size or cfg.planner_default_channel_sats
+
+                # Check affordability before queuing
+                capped_size, insufficient, was_capped = _cap_channel_size_to_budget(
+                    proposed_size, cfg, f"FALLBACK_ELECT for {target_peer_id[:16]}..."
+                )
+                if insufficient:
+                    plugin.log(
+                        f"cl-hive: [FALLBACK] Also declining: insufficient funds",
+                        level='info'
+                    )
+                    # Broadcast our own decline
+                    _broadcast_expansion_decline(round_id, "insufficient_funds")
+                    return {"result": "declined", "reason": "insufficient_funds"}
+
+                action_id = database.add_pending_action(
+                    action_type="channel_open",
+                    payload={
+                        "target": target_peer_id,
+                        "amount_sats": capped_size,
+                        "source": "cooperative_expansion_fallback",
+                        "round_id": round_id,
+                        "reason": f"Fallback elected after {result.get('decline_count', 1)} decline(s)"
+                    },
+                    expires_hours=24
+                )
+                plugin.log(
+                    f"cl-hive: Queued fallback channel open to {target_peer_id[:16]}... "
+                    f"(action_id={action_id})",
+                    level='info'
+                )
+        else:
+            plugin.log(
+                f"cl-hive: [DECLINE] Fallback elected {new_elected[:16]}... (not us)",
+                level='debug'
+            )
+
+    elif result.get("action") == "cancelled":
+        plugin.log(
+            f"cl-hive: [DECLINE] Round {round_id[:8]}... cancelled: {result.get('reason', 'unknown')}",
+            level='info'
+        )
+
+    return {"result": "continue", "decline_result": result}
 
 
 # =============================================================================

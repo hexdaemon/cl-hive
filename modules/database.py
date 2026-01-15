@@ -384,6 +384,42 @@ class HiveDatabase:
         """)
 
         # =====================================================================
+        # BUDGET HOLDS TABLE (Phase 8 - Hive-wide Affordability)
+        # =====================================================================
+        # Temporary budget reservations during expansion rounds
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS budget_holds (
+                hold_id TEXT PRIMARY KEY,
+                round_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                consumed_by TEXT,
+                consumed_at INTEGER
+            )
+        """)
+
+        # Index for querying holds by peer and status
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_budget_holds_peer_status
+            ON budget_holds(peer_id, status)
+        """)
+
+        # Index for querying holds by round
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_budget_holds_round
+            ON budget_holds(round_id)
+        """)
+
+        # Index for querying expiring holds
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_budget_holds_expires
+            ON budget_holds(expires_at) WHERE status = 'active'
+        """)
+
+        # =====================================================================
         # DELEGATION ATTEMPTS TABLE (Phase 8 - Cooperative Failure Handling)
         # =====================================================================
         # Tracks channel open delegation attempts when local opens fail
@@ -2123,6 +2159,130 @@ class HiveDatabase:
             'action_breakdown': action_breakdown,
             'history': daily_spending
         }
+
+    # =========================================================================
+    # BUDGET HOLDS OPERATIONS (Phase 8 - Hive-wide Affordability)
+    # =========================================================================
+
+    def create_budget_hold(self, hold_id: str, round_id: str, peer_id: str,
+                           amount_sats: int, expires_seconds: int) -> bool:
+        """
+        Create a new budget hold.
+
+        Args:
+            hold_id: Unique hold identifier
+            round_id: Expansion round ID
+            peer_id: Member creating the hold
+            amount_sats: Amount to reserve
+            expires_seconds: Seconds until hold expires
+
+        Returns:
+            True if created, False on error
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        expires_at = now + expires_seconds
+
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO budget_holds
+                (hold_id, round_id, peer_id, amount_sats, created_at, expires_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'active')
+            """, (hold_id, round_id, peer_id, amount_sats, now, expires_at))
+            conn.commit()
+            return True
+        except Exception:
+            return False
+
+    def release_budget_hold(self, hold_id: str) -> bool:
+        """Release a budget hold (round completed/cancelled)."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                UPDATE budget_holds SET status = 'released'
+                WHERE hold_id = ? AND status = 'active'
+            """, (hold_id,))
+            conn.commit()
+            return conn.total_changes > 0
+        except Exception:
+            return False
+
+    def consume_budget_hold(self, hold_id: str, consumed_by: str) -> bool:
+        """Mark a hold as consumed (channel opened)."""
+        conn = self._get_connection()
+        now = int(time.time())
+        try:
+            conn.execute("""
+                UPDATE budget_holds
+                SET status = 'consumed', consumed_by = ?, consumed_at = ?
+                WHERE hold_id = ? AND status = 'active'
+            """, (consumed_by, now, hold_id))
+            conn.commit()
+            return conn.total_changes > 0
+        except Exception:
+            return False
+
+    def expire_budget_hold(self, hold_id: str) -> bool:
+        """Mark a hold as expired."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                UPDATE budget_holds SET status = 'expired'
+                WHERE hold_id = ? AND status = 'active'
+            """, (hold_id,))
+            conn.commit()
+            return conn.total_changes > 0
+        except Exception:
+            return False
+
+    def get_budget_hold(self, hold_id: str) -> Optional[Dict[str, Any]]:
+        """Get a budget hold by ID."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM budget_holds WHERE hold_id = ?
+        """, (hold_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_active_holds_for_peer(self, peer_id: str) -> List[Dict[str, Any]]:
+        """Get all active holds for a peer."""
+        conn = self._get_connection()
+        now = int(time.time())
+        rows = conn.execute("""
+            SELECT * FROM budget_holds
+            WHERE peer_id = ? AND status = 'active' AND expires_at > ?
+            ORDER BY created_at DESC
+        """, (peer_id, now)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_holds_for_round(self, round_id: str) -> List[Dict[str, Any]]:
+        """Get all holds for a specific round."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM budget_holds WHERE round_id = ?
+        """, (round_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_total_held_for_peer(self, peer_id: str) -> int:
+        """Get total amount held for a peer across active holds."""
+        conn = self._get_connection()
+        now = int(time.time())
+        row = conn.execute("""
+            SELECT COALESCE(SUM(amount_sats), 0) as total
+            FROM budget_holds
+            WHERE peer_id = ? AND status = 'active' AND expires_at > ?
+        """, (peer_id, now)).fetchone()
+        return row['total'] if row else 0
+
+    def cleanup_expired_holds(self) -> int:
+        """Mark all expired holds as expired. Returns count."""
+        conn = self._get_connection()
+        now = int(time.time())
+        cursor = conn.execute("""
+            UPDATE budget_holds SET status = 'expired'
+            WHERE status = 'active' AND expires_at <= ?
+        """, (now,))
+        conn.commit()
+        return cursor.rowcount
 
     # =========================================================================
     # FEE INTELLIGENCE OPERATIONS (Phase 7)
