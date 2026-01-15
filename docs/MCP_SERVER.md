@@ -185,9 +185,22 @@ Once enabled, you can ask Claude Code to manage your fleet:
 
 ## Security Considerations
 
-1. **Rune Permissions**: Create restricted runes that only allow the RPC methods needed:
+1. **Rune Permissions**: Create restricted runes that only allow the RPC methods needed.
+
+   **IMPORTANT**: All method patterns must be in a SINGLE array for OR logic. Multiple arrays are ANDed together (which won't work).
+
    ```bash
-   lightning-cli createrune restrictions='[["method^hive-"],["method^getinfo"],["method^listfunds"],["method^listpeerchannels"],["method^setchannel"]]'
+   # CORRECT - single array with all methods (OR logic)
+   lightning-cli createrune restrictions='[["method^hive-","method^getinfo","method^listfunds","method^listpeerchannels","method^setchannel","method^revenue-","method^feerates"]]'
+
+   # With rate limit (60 calls/min) - two arrays ANDed together
+   lightning-cli createrune restrictions='[["method^hive-","method^getinfo","method^listfunds","method^listpeerchannels","method^setchannel","method^revenue-","method^feerates"],["rate=300"]]'
+   ```
+
+   **WRONG** - this ANDs all conditions (impossible to satisfy):
+   ```bash
+   # DON'T DO THIS - separate arrays means method must match ALL patterns
+   lightning-cli createrune restrictions='[["method^hive-"],["method^getinfo"],["method^listfunds"]]'
    ```
 
 2. **Network Security**:
@@ -276,6 +289,13 @@ The `tools/hive-monitor.py` daemon provides real-time monitoring and daily repor
 # Run continuous monitoring (alerts for new pending actions, health issues)
 ./tools/hive-monitor.py --config nodes.json monitor --interval 60
 ```
+
+## Production AI Advisor Setup
+
+For automated AI advisor running on a management server, see the following guides:
+
+- [Production AI Advisor Guide](AI_ADVISOR_SETUP.md) - Complete setup guide for automated operation
+- [production.example/README.md](../production.example/README.md) - Quick start for production deployment
 
 ## Related Documentation
 
