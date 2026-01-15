@@ -308,11 +308,6 @@ async def list_tools() -> List[Tool]:
                     "node": {
                         "type": "string",
                         "description": "Specific node name (optional, defaults to all nodes)"
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["pending", "approved", "rejected", "executed"],
-                        "description": "Filter by status (default: pending)"
                     }
                 }
             }
@@ -774,18 +769,17 @@ async def handle_hive_status(args: Dict) -> Dict:
 async def handle_pending_actions(args: Dict) -> Dict:
     """Get pending actions from nodes."""
     node_name = args.get("node")
-    status = args.get("status", "pending")
 
     if node_name:
         node = fleet.get_node(node_name)
         if not node:
             return {"error": f"Unknown node: {node_name}"}
-        result = await node.call("hive-pending-actions", {"status": status})
+        result = await node.call("hive-pending-actions")
         return {node_name: result}
     else:
         results = {}
         for name, node in fleet.nodes.items():
-            results[name] = await node.call("hive-pending-actions", {"status": status})
+            results[name] = await node.call("hive-pending-actions")
         return results
 
 
@@ -1014,7 +1008,7 @@ async def read_resource(uri: str) -> str:
                 results = {}
                 total_pending = 0
                 for name, node in fleet.nodes.items():
-                    pending = await node.call("hive-pending-actions", {"status": "pending"})
+                    pending = await node.call("hive-pending-actions")
                     actions = pending.get("actions", [])
                     results[name] = {
                         "count": len(actions),
@@ -1042,7 +1036,7 @@ async def read_resource(uri: str) -> str:
                 for name, node in fleet.nodes.items():
                     status = await node.call("hive-status")
                     funds = await node.call("listfunds")
-                    pending = await node.call("hive-pending-actions", {"status": "pending"})
+                    pending = await node.call("hive-pending-actions")
 
                     channels = funds.get("channels", [])
                     outputs = funds.get("outputs", [])
@@ -1089,7 +1083,7 @@ async def read_resource(uri: str) -> str:
                 status = await node.call("hive-status")
                 info = await node.call("getinfo")
                 funds = await node.call("listfunds")
-                pending = await node.call("hive-pending-actions", {"status": "pending"})
+                pending = await node.call("hive-pending-actions")
 
                 channels = funds.get("channels", [])
                 outputs = funds.get("outputs", [])
