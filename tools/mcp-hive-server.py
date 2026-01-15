@@ -793,9 +793,9 @@ async def handle_approve_action(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
+    # Note: reason is for logging only, not passed to plugin
     return await node.call("hive-approve-action", {
-        "action_id": action_id,
-        "reason": reason
+        "action_id": action_id
     })
 
 
@@ -809,9 +809,9 @@ async def handle_reject_action(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
+    # Note: reason is for logging only, not passed to plugin
     return await node.call("hive-reject-action", {
-        "action_id": action_id,
-        "reason": reason
+        "action_id": action_id
     })
 
 
