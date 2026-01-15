@@ -70,6 +70,42 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-hive")
 
 # =============================================================================
+# Strategy Prompt Loading
+# =============================================================================
+
+STRATEGY_DIR = os.environ.get('HIVE_STRATEGY_DIR', '')
+
+
+def load_strategy(name: str) -> str:
+    """
+    Load a strategy prompt from a markdown file.
+
+    Strategy files are expected in HIVE_STRATEGY_DIR with .md extension.
+    Returns empty string if file not found or HIVE_STRATEGY_DIR not set.
+
+    Args:
+        name: Base name of strategy file (without .md extension)
+
+    Returns:
+        Content of the strategy file, or empty string
+    """
+    if not STRATEGY_DIR:
+        return ""
+    path = os.path.join(STRATEGY_DIR, f"{name}.md")
+    try:
+        with open(path, 'r') as f:
+            content = f.read().strip()
+            logger.debug(f"Loaded strategy prompt: {name}")
+            return "\n\n" + content
+    except FileNotFoundError:
+        logger.debug(f"Strategy file not found: {path}")
+        return ""
+    except Exception as e:
+        logger.warning(f"Error loading strategy {name}: {e}")
+        return ""
+
+
+# =============================================================================
 # Node Connection
 # =============================================================================
 
@@ -283,7 +319,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="hive_approve_action",
-            description="Approve a pending action on a node. The action will be executed.",
+            description=f"Approve a pending action on a node. The action will be executed.{load_strategy('approval_criteria')}",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -305,7 +341,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="hive_reject_action",
-            description="Reject a pending action on a node. The action will not be executed.",
+            description=f"Reject a pending action on a node. The action will not be executed.{load_strategy('approval_criteria')}",
             inputSchema={
                 "type": "object",
                 "properties": {

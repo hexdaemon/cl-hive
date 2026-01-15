@@ -1,0 +1,39 @@
+[Unit]
+Description=Hive AI Advisor - Review and Act on Pending Actions
+Documentation=https://github.com/santyr/cl-hive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Run as the installing user (use %u for username, %h for home)
+User=%u
+
+# Environment setup
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# Working directory - adjust path as needed for your deployment
+WorkingDirectory=%h/cl-hive
+
+# Main execution script
+ExecStart=%h/cl-hive/production/scripts/run-advisor.sh
+
+# Allow up to 5 minutes for Claude to process
+TimeoutStartSec=300
+
+# Logging to systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hive-advisor
+
+# Resource limits (optional safety)
+MemoryMax=1G
+CPUQuota=80%
+
+# Don't restart on failure - the timer will trigger the next run
+Restart=no
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,11 @@
+{
+  "mode": "rest",
+  "nodes": [
+    {
+      "name": "mainnet",
+      "rest_url": "https://YOUR_NODE_IP_OR_HOSTNAME:3001",
+      "rune": "YOUR_COMMANDO_RUNE_HERE",
+      "ca_cert": null
+    }
+  ]
+}

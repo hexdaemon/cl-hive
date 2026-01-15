@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "hive": {
+      "command": "python3",
+      "args": ["tools/mcp-hive-server.py"],
+      "env": {
+        "HIVE_NODES_CONFIG": "production/nodes.production.json",
+        "HIVE_STRATEGY_DIR": "production/strategy-prompts",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

@@ -60,3 +60,6 @@ vendor/
 .mcp.json
 nodes.json
 reports/
+
+# Production deployment folder (contains secrets - use production.example/ as template)
+production/
