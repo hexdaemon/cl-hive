@@ -45,10 +45,13 @@ The advisor maintains a local SQLite database for intelligent decision-making:
 
 | Capability | Description |
 |------------|-------------|
+| **Context Injection** | Pre-run summary with trends, unresolved alerts, recent decisions |
+| **Alert Deduplication** | Avoid re-flagging same zombie/bleeder channels every 15 min |
+| **Peer Intelligence** | Track peer reliability and profitability over time |
+| **Outcome Tracking** | Measure if past decisions led to positive results |
 | **Trend Analysis** | Compare metrics over 7/30 days to spot changes |
 | **Velocity Tracking** | Predict when channels will deplete or fill |
 | **Decision Audit** | Full history of AI decisions with reasoning |
-| **Pattern Learning** | Avoid repeating ineffective recommendations |
 
 Database location: `production/data/advisor.db`
 

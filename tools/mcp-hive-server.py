@@ -828,6 +828,135 @@ async def list_tools() -> List[Tool]:
                 "type": "object",
                 "properties": {}
             }
+        ),
+        # =====================================================================
+        # New Advisor Intelligence Tools
+        # =====================================================================
+        Tool(
+            name="advisor_get_context_brief",
+            description="Get a pre-run context summary with situational awareness. Call this at the START of each run to understand: revenue/capacity trends, velocity alerts, unresolved flags, and recent decisions. This gives you memory across runs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Number of days to analyze (default: 7)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="advisor_check_alert",
+            description="Check if a channel issue should be flagged or skipped (deduplication). Call this BEFORE flagging any channel to avoid repeating alerts. Returns action: 'flag' (new issue), 'skip' (already flagged <24h), 'mention_unresolved' (24-72h), or 'escalate' (>72h).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "alert_type": {
+                        "type": "string",
+                        "enum": ["zombie", "bleeder", "depleting", "velocity", "unprofitable"],
+                        "description": "Type of alert"
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID (SCID format)"
+                    }
+                },
+                "required": ["alert_type", "node"]
+            }
+        ),
+        Tool(
+            name="advisor_record_alert",
+            description="Record an alert for a channel issue. Only call this after advisor_check_alert returns action='flag'. This tracks when issues were flagged to prevent alert fatigue.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "alert_type": {
+                        "type": "string",
+                        "enum": ["zombie", "bleeder", "depleting", "velocity", "unprofitable"],
+                        "description": "Type of alert"
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID (SCID format)"
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": ["info", "warning", "critical"],
+                        "description": "Alert severity (default: warning)"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Alert message/description"
+                    }
+                },
+                "required": ["alert_type", "node"]
+            }
+        ),
+        Tool(
+            name="advisor_resolve_alert",
+            description="Mark an alert as resolved. Call this when an issue has been addressed (channel closed, rebalanced, etc.).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "alert_type": {
+                        "type": "string",
+                        "enum": ["zombie", "bleeder", "depleting", "velocity", "unprofitable"],
+                        "description": "Type of alert"
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID (SCID format)"
+                    },
+                    "resolution_action": {
+                        "type": "string",
+                        "description": "What action resolved the alert (e.g., 'channel_closed', 'rebalanced')"
+                    }
+                },
+                "required": ["alert_type", "node"]
+            }
+        ),
+        Tool(
+            name="advisor_get_peer_intel",
+            description="Get peer intelligence for a pubkey. Shows reliability score, profitability, force-close history, and recommendation ('excellent', 'good', 'neutral', 'caution', 'avoid'). Use this when evaluating channel open proposals.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Peer public key"
+                    }
+                },
+                "required": ["peer_id"]
+            }
+        ),
+        Tool(
+            name="advisor_measure_outcomes",
+            description="Measure outcomes for decisions made 24-72 hours ago. This checks if channel health improved or worsened after decisions were made, enabling learning from past actions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "min_hours": {
+                        "type": "integer",
+                        "description": "Minimum hours since decision (default: 24)"
+                    },
+                    "max_hours": {
+                        "type": "integer",
+                        "description": "Maximum hours since decision (default: 72)"
+                    }
+                }
+            }
         )
     ]
 
@@ -893,6 +1022,19 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_advisor_get_recent_decisions(arguments)
         elif name == "advisor_db_stats":
             result = await handle_advisor_db_stats(arguments)
+        # New advisor intelligence tools
+        elif name == "advisor_get_context_brief":
+            result = await handle_advisor_get_context_brief(arguments)
+        elif name == "advisor_check_alert":
+            result = await handle_advisor_check_alert(arguments)
+        elif name == "advisor_record_alert":
+            result = await handle_advisor_record_alert(arguments)
+        elif name == "advisor_resolve_alert":
+            result = await handle_advisor_resolve_alert(arguments)
+        elif name == "advisor_get_peer_intel":
+            result = await handle_advisor_get_peer_intel(arguments)
+        elif name == "advisor_measure_outcomes":
+            result = await handle_advisor_measure_outcomes(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -1777,6 +1919,167 @@ async def handle_advisor_db_stats(args: Dict) -> Dict:
     stats["database_path"] = ADVISOR_DB_PATH
 
     return stats
+
+
+async def handle_advisor_get_context_brief(args: Dict) -> Dict:
+    """Get pre-run context summary for AI advisor."""
+    db = ensure_advisor_db()
+    days = args.get("days", 7)
+
+    brief = db.get_context_brief(days)
+
+    # Serialize dataclass to dict
+    return {
+        "period_days": brief.period_days,
+        "total_capacity_sats": brief.total_capacity_sats,
+        "capacity_change_pct": brief.capacity_change_pct,
+        "total_channels": brief.total_channels,
+        "channel_count_change": brief.channel_count_change,
+        "period_revenue_sats": brief.period_revenue_sats,
+        "revenue_change_pct": brief.revenue_change_pct,
+        "channels_depleting": brief.channels_depleting,
+        "channels_filling": brief.channels_filling,
+        "critical_velocity_channels": brief.critical_velocity_channels,
+        "unresolved_alerts": brief.unresolved_alerts,
+        "recent_decisions_count": brief.recent_decisions_count,
+        "decisions_by_type": brief.decisions_by_type,
+        "summary_text": brief.summary_text
+    }
+
+
+async def handle_advisor_check_alert(args: Dict) -> Dict:
+    """Check if an alert should be raised (deduplication)."""
+    db = ensure_advisor_db()
+
+    alert_type = args.get("alert_type")
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+
+    if not alert_type or not node_name:
+        return {"error": "alert_type and node are required"}
+
+    status = db.check_alert(alert_type, node_name, channel_id)
+
+    return {
+        "alert_type": status.alert_type,
+        "node_name": status.node_name,
+        "channel_id": status.channel_id,
+        "is_new": status.is_new,
+        "first_flagged": status.first_flagged.isoformat() if status.first_flagged else None,
+        "last_flagged": status.last_flagged.isoformat() if status.last_flagged else None,
+        "times_flagged": status.times_flagged,
+        "hours_since_last": status.hours_since_last,
+        "action": status.action,
+        "message": status.message
+    }
+
+
+async def handle_advisor_record_alert(args: Dict) -> Dict:
+    """Record an alert (handles dedup automatically)."""
+    db = ensure_advisor_db()
+
+    alert_type = args.get("alert_type")
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    peer_id = args.get("peer_id")
+    severity = args.get("severity", "warning")
+    message = args.get("message")
+
+    if not alert_type or not node_name:
+        return {"error": "alert_type and node are required"}
+
+    status = db.record_alert(alert_type, node_name, channel_id, peer_id, severity, message)
+
+    return {
+        "recorded": True,
+        "alert_type": status.alert_type,
+        "is_new": status.is_new,
+        "times_flagged": status.times_flagged,
+        "action": status.action
+    }
+
+
+async def handle_advisor_resolve_alert(args: Dict) -> Dict:
+    """Mark an alert as resolved."""
+    db = ensure_advisor_db()
+
+    alert_type = args.get("alert_type")
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    resolution_action = args.get("resolution_action")
+
+    if not alert_type or not node_name:
+        return {"error": "alert_type and node are required"}
+
+    resolved = db.resolve_alert(alert_type, node_name, channel_id, resolution_action)
+
+    return {
+        "resolved": resolved,
+        "alert_type": alert_type,
+        "node_name": node_name,
+        "channel_id": channel_id
+    }
+
+
+async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
+    """Get peer intelligence/reputation data."""
+    db = ensure_advisor_db()
+
+    peer_id = args.get("peer_id")
+
+    if peer_id:
+        intel = db.get_peer_intelligence(peer_id)
+        if not intel:
+            return {"error": f"No data for peer: {peer_id}"}
+
+        return {
+            "peer_id": intel.peer_id,
+            "alias": intel.alias,
+            "first_seen": intel.first_seen.isoformat() if intel.first_seen else None,
+            "last_seen": intel.last_seen.isoformat() if intel.last_seen else None,
+            "channels_opened": intel.channels_opened,
+            "channels_closed": intel.channels_closed,
+            "force_closes": intel.force_closes,
+            "avg_channel_lifetime_days": intel.avg_channel_lifetime_days,
+            "total_forwards": intel.total_forwards,
+            "total_revenue_sats": intel.total_revenue_sats,
+            "total_costs_sats": intel.total_costs_sats,
+            "profitability_score": intel.profitability_score,
+            "reliability_score": intel.reliability_score,
+            "recommendation": intel.recommendation
+        }
+    else:
+        # Return all peers
+        all_intel = db.get_all_peer_intelligence()
+        return {
+            "count": len(all_intel),
+            "peers": [{
+                "peer_id": intel.peer_id,
+                "alias": intel.alias,
+                "channels_opened": intel.channels_opened,
+                "force_closes": intel.force_closes,
+                "total_forwards": intel.total_forwards,
+                "total_revenue_sats": intel.total_revenue_sats,
+                "profitability_score": intel.profitability_score,
+                "reliability_score": intel.reliability_score,
+                "recommendation": intel.recommendation
+            } for intel in all_intel]
+        }
+
+
+async def handle_advisor_measure_outcomes(args: Dict) -> Dict:
+    """Measure outcomes for past decisions."""
+    db = ensure_advisor_db()
+
+    min_hours = args.get("min_hours", 24)
+    max_hours = args.get("max_hours", 72)
+
+    outcomes = db.measure_decision_outcomes(min_hours, max_hours)
+
+    return {
+        "measured_count": len(outcomes),
+        "outcomes": outcomes
+    }
 
 
 # =============================================================================

@@ -37,6 +37,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 import signal
 
+# Local imports
+try:
+    from advisor_db import AdvisorDB
+except ImportError:
+    # Allow running without database
+    AdvisorDB = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -160,11 +167,20 @@ class Alert:
 class FleetMonitor:
     """Monitors a fleet of Hive nodes."""
 
-    def __init__(self, nodes: Dict[str, NodeConnection]):
+    def __init__(self, nodes: Dict[str, NodeConnection], db_path: str = None):
         self.nodes = nodes
         self.state: Dict[str, NodeState] = {}
         self.alerts: List[Alert] = []
         self.report_data: Dict[str, Any] = {}
+
+        # Initialize advisor database for historical tracking
+        self.db = None
+        if AdvisorDB is not None:
+            try:
+                self.db = AdvisorDB(db_path)
+                logger.info(f"Advisor database initialized at {self.db.db_path}")
+            except Exception as e:
+                logger.warning(f"Could not initialize advisor database: {e}")
 
         # Initialize state for each node
         for name in nodes:
@@ -280,12 +296,222 @@ class FleetMonitor:
                 results[name] = {"error": str(e)}
         return results
 
+    def _get_hive_topology(self) -> Dict[str, Any]:
+        """Get hive membership and topology from a healthy node."""
+        topology = {
+            "members": [],
+            "member_count": 0,
+            "admin_count": 0,
+            "member_tier_count": 0,
+            "neophyte_count": 0
+        }
+
+        # Find a healthy node to query
+        for name, node in self.nodes.items():
+            if self.state[name].is_healthy:
+                members = node.call("hive-members")
+                if "error" not in members:
+                    topology["members"] = members.get("members", [])
+                    topology["member_count"] = len(topology["members"])
+                    for m in topology["members"]:
+                        tier = m.get("tier", "").lower()
+                        if tier == "admin":
+                            topology["admin_count"] += 1
+                        elif tier == "member":
+                            topology["member_tier_count"] += 1
+                        elif tier == "neophyte":
+                            topology["neophyte_count"] += 1
+                    break
+
+        return topology
+
+    def _get_channel_details(self, node: NodeConnection) -> List[Dict]:
+        """Get detailed channel info including fees, balances, and flow state."""
+        channels = []
+
+        # Get peer channels with balances
+        peer_channels = node.call("listpeerchannels")
+        if "error" in peer_channels:
+            return channels
+
+        # Get revenue-ops flow state if available
+        rev_status = node.call("revenue-status")
+        flow_states = {}
+        if "error" not in rev_status:
+            for ch in rev_status.get("channel_states", []):
+                flow_states[ch.get("channel_id")] = ch
+
+        for ch in peer_channels.get("channels", []):
+            if ch.get("state") != "CHANNELD_NORMAL":
+                continue
+
+            scid = ch.get("short_channel_id", "")
+            total_msat = ch.get("total_msat", 0)
+            our_msat = ch.get("to_us_msat", 0)
+
+            # Calculate balance ratio
+            total_sats = total_msat // 1000 if isinstance(total_msat, int) else int(total_msat.replace("msat", "")) // 1000
+            our_sats = our_msat // 1000 if isinstance(our_msat, int) else int(our_msat.replace("msat", "")) // 1000
+            balance_ratio = our_sats / total_sats if total_sats > 0 else 0.5
+
+            # Get flow state
+            flow = flow_states.get(scid, {})
+
+            channel_info = {
+                "channel_id": scid,
+                "peer_id": ch.get("peer_id", ""),
+                "capacity_sats": total_sats,
+                "local_sats": our_sats,
+                "remote_sats": total_sats - our_sats,
+                "balance_ratio": round(balance_ratio, 3),
+                # Fee info
+                "fee_base_msat": ch.get("fee_base_msat", 0),
+                "fee_ppm": ch.get("fee_proportional_millionths", 0),
+                # Flow state from revenue-ops
+                "flow_state": flow.get("state", "unknown"),
+                "flow_ratio": round(flow.get("flow_ratio", 0), 3),
+                "confidence": round(flow.get("confidence", 0), 2),
+                "forward_count": flow.get("forward_count", 0),
+                # Health indicators
+                "needs_inbound": balance_ratio > 0.8,
+                "needs_outbound": balance_ratio < 0.2,
+                "is_balanced": 0.35 <= balance_ratio <= 0.65
+            }
+            channels.append(channel_info)
+
+        return channels
+
+    def _analyze_rebalance_opportunities(self, channels: List[Dict]) -> List[Dict]:
+        """Identify channels that need rebalancing."""
+        opportunities = []
+
+        sources = [c for c in channels if c.get("needs_outbound") and c["local_sats"] > 50000]
+        sinks = [c for c in channels if c.get("needs_inbound") and c["remote_sats"] > 50000]
+
+        for sink in sinks:
+            for source in sources:
+                if sink["peer_id"] != source["peer_id"]:
+                    amount = min(
+                        source["local_sats"] - 50000,  # Leave some buffer
+                        sink["remote_sats"] - 50000,
+                        500000  # Cap at 500k sats
+                    )
+                    if amount > 10000:
+                        opportunities.append({
+                            "from_channel": source["channel_id"],
+                            "to_channel": sink["channel_id"],
+                            "amount_sats": amount,
+                            "reason": f"Rebalance from depleted ({source['balance_ratio']:.0%}) to full ({sink['balance_ratio']:.0%})"
+                        })
+
+        # Sort by amount descending
+        opportunities.sort(key=lambda x: x["amount_sats"], reverse=True)
+        return opportunities[:5]  # Top 5
+
+    def _generate_ai_recommendations(self, report: Dict) -> List[Dict]:
+        """Generate intelligent recommendations based on report data."""
+        recommendations = []
+
+        # Check for critical velocity channels (from database)
+        if self.db:
+            try:
+                critical_channels = self.db.get_critical_channels(hours_threshold=12)
+                for v in critical_channels[:3]:  # Top 3 most urgent
+                    if v.trend == "depleting":
+                        recommendations.append({
+                            "type": "velocity_alert",
+                            "message": f"{v.node_name}: Channel {v.channel_id} depleting - {v.hours_until_depleted:.1f} hours until empty",
+                            "priority": "critical" if v.urgency == "critical" else "high",
+                            "action": f"Rebalance inbound to {v.channel_id} immediately",
+                            "velocity": f"{v.velocity_sats_per_hour:,.0f} sats/hour outflow"
+                        })
+                    elif v.trend == "filling":
+                        recommendations.append({
+                            "type": "velocity_alert",
+                            "message": f"{v.node_name}: Channel {v.channel_id} filling - {v.hours_until_full:.1f} hours until full",
+                            "priority": "high" if v.urgency in ("critical", "high") else "warning",
+                            "action": f"Rebalance outbound from {v.channel_id}",
+                            "velocity": f"{v.velocity_sats_per_hour:,.0f} sats/hour inflow"
+                        })
+            except Exception as e:
+                logger.warning(f"Error checking velocity alerts: {e}")
+
+        # Check for pending actions
+        total_pending = report["fleet_summary"].get("total_pending_actions", 0)
+        if total_pending > 0:
+            recommendations.append({
+                "type": "action_required",
+                "message": f"{total_pending} pending actions need review",
+                "priority": "high"
+            })
+
+        # Check for unhealthy nodes
+        unhealthy = report["fleet_summary"].get("nodes_unhealthy", 0)
+        if unhealthy > 0:
+            recommendations.append({
+                "type": "health_check",
+                "message": f"{unhealthy} node(s) not running cl-hive - consider installing plugin",
+                "priority": "critical"
+            })
+
+        # Analyze fleet-wide metrics
+        for name, node_data in report.get("nodes", {}).items():
+            if not node_data.get("healthy"):
+                continue
+
+            # Check for bleeder channels
+            dashboard = node_data.get("dashboard_30d", {})
+            if dashboard.get("bleeder_count", 0) > 0:
+                recommendations.append({
+                    "type": "bleeding_channel",
+                    "message": f"{name}: {dashboard['bleeder_count']} channel(s) losing money on rebalancing",
+                    "priority": "warning",
+                    "action": f"Review rebalance policy on {name}"
+                })
+
+            # Check profitability
+            profit = node_data.get("profitability", {}).get("summary", {})
+            if profit.get("underwater_count", 0) > profit.get("profitable_count", 0):
+                recommendations.append({
+                    "type": "profitability",
+                    "message": f"{name}: More underwater channels ({profit['underwater_count']}) than profitable ({profit['profitable_count']})",
+                    "priority": "warning",
+                    "action": "Consider fee adjustments or closing unprofitable channels"
+                })
+
+            # Check for rebalance opportunities
+            rebalance_ops = node_data.get("rebalance_opportunities", [])
+            if rebalance_ops:
+                top_op = rebalance_ops[0]
+                recommendations.append({
+                    "type": "rebalance_opportunity",
+                    "message": f"{name}: Can rebalance {top_op['amount_sats']:,} sats from {top_op['from_channel']} to {top_op['to_channel']}",
+                    "priority": "info",
+                    "action": f"revenue-rebalance from_channel={top_op['from_channel']} to_channel={top_op['to_channel']} amount_sats={top_op['amount_sats']}"
+                })
+
+            # Check for fee optimization opportunities
+            channels = node_data.get("channels_detail", [])
+            for ch in channels:
+                # High flow but low fee
+                if ch.get("flow_ratio", 0) > 0.3 and ch.get("fee_ppm", 0) < 200:
+                    recommendations.append({
+                        "type": "fee_optimization",
+                        "message": f"{name}: Channel {ch['channel_id']} has high flow ({ch['flow_ratio']:.0%}) but low fee ({ch['fee_ppm']} ppm)",
+                        "priority": "info",
+                        "action": f"Consider raising fee on {ch['channel_id']}"
+                    })
+                    break  # Only one fee rec per node
+
+        return recommendations
+
     def generate_daily_report(self) -> Dict[str, Any]:
-        """Generate a comprehensive daily report."""
+        """Generate a comprehensive daily report with AI decision support."""
         report = {
             "generated_at": datetime.now().isoformat(),
             "report_type": "daily",
             "fleet_summary": {},
+            "hive_topology": {},
             "nodes": {},
             "alerts_24h": [],
             "recommendations": []
@@ -297,6 +523,10 @@ class FleetMonitor:
         total_pending_actions = 0
         nodes_healthy = 0
         nodes_unhealthy = 0
+        fleet_channels = []
+
+        # Get hive topology first
+        report["hive_topology"] = self._get_hive_topology()
 
         for name, node in self.nodes.items():
             state = self.state[name]
@@ -312,20 +542,39 @@ class FleetMonitor:
                 "pending_actions": len(state.pending_action_ids),
             }
 
-            # Get profitability summary
-            profitability = node.call("revenue-profitability")
-            if "error" not in profitability:
-                node_report["profitability"] = profitability
+            if state.is_healthy:
+                # Get detailed channel info with fees and balances
+                channel_details = self._get_channel_details(node)
+                node_report["channels_detail"] = channel_details
+                fleet_channels.extend([(name, c) for c in channel_details])
 
-            # Get 30-day dashboard
-            dashboard = node.call("revenue-dashboard", {"window_days": 30})
-            if "error" not in dashboard:
-                node_report["dashboard_30d"] = dashboard
+                # Analyze rebalance opportunities
+                node_report["rebalance_opportunities"] = self._analyze_rebalance_opportunities(channel_details)
 
-            # Get history
-            history = node.call("revenue-history")
-            if "error" not in history:
-                node_report["lifetime_history"] = history
+                # Get profitability summary
+                profitability = node.call("revenue-profitability")
+                if "error" not in profitability:
+                    node_report["profitability"] = profitability
+
+                # Get 30-day dashboard
+                dashboard = node.call("revenue-dashboard", {"window_days": 30})
+                if "error" not in dashboard:
+                    node_report["dashboard_30d"] = dashboard
+
+                # Get history
+                history = node.call("revenue-history")
+                if "error" not in history:
+                    node_report["lifetime_history"] = history
+
+                # Get planner insights
+                planner_log = node.call("hive-planner-log", {"limit": 5})
+                if "error" not in planner_log:
+                    node_report["recent_planner_decisions"] = planner_log.get("entries", [])
+
+                # Get topology view
+                topology = node.call("hive-topology")
+                if "error" not in topology:
+                    node_report["topology"] = topology
 
             report["nodes"][name] = node_report
 
@@ -351,6 +600,18 @@ class FleetMonitor:
             "total_pending_actions": total_pending_actions
         }
 
+        # Fleet-wide channel analysis
+        balanced_count = sum(1 for _, c in fleet_channels if c.get("is_balanced"))
+        needs_inbound = sum(1 for _, c in fleet_channels if c.get("needs_inbound"))
+        needs_outbound = sum(1 for _, c in fleet_channels if c.get("needs_outbound"))
+
+        report["fleet_summary"]["channel_health"] = {
+            "balanced": balanced_count,
+            "needs_inbound": needs_inbound,
+            "needs_outbound": needs_outbound,
+            "total_analyzed": len(fleet_channels)
+        }
+
         # Recent alerts (last 24 hours)
         cutoff = datetime.now() - timedelta(hours=24)
         report["alerts_24h"] = [
@@ -358,23 +619,75 @@ class FleetMonitor:
             if a.timestamp > cutoff
         ]
 
-        # Generate recommendations
-        if total_pending_actions > 0:
-            report["recommendations"].append({
-                "type": "action_required",
-                "message": f"{total_pending_actions} pending actions need review",
-                "priority": "high"
-            })
+        # Generate AI recommendations
+        report["recommendations"] = self._generate_ai_recommendations(report)
 
-        if nodes_unhealthy > 0:
-            report["recommendations"].append({
-                "type": "health_check",
-                "message": f"{nodes_unhealthy} node(s) reporting errors",
-                "priority": "critical"
-            })
+        # Record to historical database if available
+        if self.db:
+            try:
+                self.db.record_fleet_snapshot(report, snapshot_type="daily")
+                self.db.record_channel_states(report)
+                logger.info("Recorded snapshot to advisor database")
+
+                # Add velocity and trend data to report
+                report["velocity_analysis"] = self._get_velocity_analysis()
+                report["fleet_trends"] = self._get_fleet_trends()
+            except Exception as e:
+                logger.warning(f"Failed to record to database: {e}")
 
         self.report_data = report
         return report
+
+    def _get_velocity_analysis(self) -> Dict[str, Any]:
+        """Get channel velocity analysis from database."""
+        if not self.db:
+            return {}
+
+        try:
+            critical = self.db.get_critical_channels(hours_threshold=24)
+            return {
+                "critical_channels": [
+                    {
+                        "node": v.node_name,
+                        "channel_id": v.channel_id,
+                        "trend": v.trend,
+                        "velocity_sats_per_hour": round(v.velocity_sats_per_hour, 0),
+                        "hours_until_action": round(v.hours_until_depleted or v.hours_until_full or 0, 1),
+                        "urgency": v.urgency,
+                        "current_balance_pct": round(v.current_balance_ratio * 100, 1)
+                    }
+                    for v in critical
+                ],
+                "critical_count": len(critical),
+                "channels_depleting": len([v for v in critical if v.trend == "depleting"]),
+                "channels_filling": len([v for v in critical if v.trend == "filling"])
+            }
+        except Exception as e:
+            logger.warning(f"Error getting velocity analysis: {e}")
+            return {}
+
+    def _get_fleet_trends(self) -> Dict[str, Any]:
+        """Get fleet trends from database."""
+        if not self.db:
+            return {}
+
+        try:
+            trends = self.db.get_fleet_trends(days=7)
+            if not trends:
+                return {"message": "Insufficient historical data for trend analysis"}
+
+            return {
+                "period_days": 7,
+                "revenue_change_pct": trends.revenue_change_pct,
+                "capacity_change_pct": trends.capacity_change_pct,
+                "channel_count_change": trends.channel_count_change,
+                "health_trend": trends.health_trend,
+                "channels_depleting": trends.channels_depleting,
+                "channels_filling": trends.channels_filling
+            }
+        except Exception as e:
+            logger.warning(f"Error getting fleet trends: {e}")
+            return {}
 
 
 # =============================================================================
@@ -389,6 +702,7 @@ class MonitorDaemon:
         self.interval = interval
         self.running = False
         self.reports_dir = Path(os.environ.get("HIVE_REPORTS_DIR", "./reports"))
+        self.last_hourly_snapshot = None
 
     async def run(self):
         """Main monitoring loop."""
@@ -406,8 +720,16 @@ class MonitorDaemon:
                 # Regular status check
                 self.monitor.check_all_nodes()
 
-                # Generate daily report at midnight or on first run
                 now = datetime.now()
+
+                # Record hourly snapshot to database
+                if self.monitor.db:
+                    if self.last_hourly_snapshot is None or \
+                       (now - self.last_hourly_snapshot).total_seconds() >= 3600:
+                        self._record_hourly_snapshot()
+                        self.last_hourly_snapshot = now
+
+                # Generate daily report at midnight or on first run
                 if last_daily_report is None or now.date() > last_daily_report.date():
                     self._save_daily_report()
                     last_daily_report = now
@@ -424,6 +746,17 @@ class MonitorDaemon:
     def stop(self):
         """Stop the daemon."""
         self.running = False
+
+    def _record_hourly_snapshot(self):
+        """Record hourly snapshot to advisor database."""
+        try:
+            # Generate a quick report for the snapshot
+            report = self.monitor.generate_daily_report()
+            self.monitor.db.record_fleet_snapshot(report, snapshot_type="hourly")
+            self.monitor.db.record_channel_states(report)
+            logger.info("Recorded hourly snapshot to advisor database")
+        except Exception as e:
+            logger.warning(f"Failed to record hourly snapshot: {e}")
 
     def _save_daily_report(self):
         """Generate and save daily report."""

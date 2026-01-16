@@ -161,8 +161,11 @@ Restart Claude Code in the cl-hive directory. It will detect the `.mcp.json` and
 
 These tools maintain a local SQLite database for historical tracking and trend analysis:
 
+#### Core Tools
+
 | Tool | Description |
 |------|-------------|
+| `advisor_get_context_brief` | Pre-run summary with situational awareness (call at START of each run) |
 | `advisor_record_snapshot` | Record current fleet state for trend tracking (call at START of each run) |
 | `advisor_get_trends` | Get fleet-wide trends over 7/30 days (revenue, capacity, health) |
 | `advisor_get_velocities` | Find channels depleting/filling within threshold hours |
@@ -171,15 +174,38 @@ These tools maintain a local SQLite database for historical tracking and trend a
 | `advisor_get_recent_decisions` | Get recent decisions to avoid repeating recommendations |
 | `advisor_db_stats` | Database statistics (record counts, oldest data) |
 
+#### Alert Deduplication Tools
+
+| Tool | Description |
+|------|-------------|
+| `advisor_check_alert` | Check if alert should be raised (returns: flag/skip/escalate/mention_unresolved) |
+| `advisor_record_alert` | Record a new alert (handles deduplication automatically) |
+| `advisor_resolve_alert` | Mark an alert as resolved |
+
+#### Peer Intelligence Tools
+
+| Tool | Description |
+|------|-------------|
+| `advisor_get_peer_intel` | Get peer reputation, reliability score, and recommendation |
+
+#### Outcome Tracking Tools
+
+| Tool | Description |
+|------|-------------|
+| `advisor_measure_outcomes` | Measure if past decisions (24-72h ago) led to positive outcomes |
+
 **Configuration:**
 - Set `ADVISOR_DB_PATH` environment variable to customize database location
 - Default: `~/.lightning/advisor.db`
 
 **Capabilities enabled:**
+- **Context injection**: Pre-run summary with trends, unresolved alerts, recent decisions
+- **Alert deduplication**: Avoid re-flagging same issues every 15 minutes
+- **Peer intelligence**: Track peer reliability and profitability over time
+- **Outcome tracking**: Measure if decisions led to positive results
 - **Velocity tracking**: Predict when channels will deplete/fill
 - **Trend analysis**: Compare metrics over time
 - **Decision audit**: Track all AI decisions with reasoning
-- **Learning**: Avoid repeating ineffective recommendations
 
 ## Available Resources
 
