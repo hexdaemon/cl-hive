@@ -1260,6 +1260,49 @@ class Planner:
 
         return False, ""
 
+    def _should_pause_expansions_globally(self, cfg) -> tuple[bool, str]:
+        """
+        Check if expansions should be paused due to global constraints.
+
+        This prevents the planner from cycling through different targets when
+        the rejection reason is global (e.g., insufficient on-chain liquidity)
+        rather than target-specific.
+
+        The planner will pause expansions if:
+        1. There have been N consecutive rejections without any approvals
+        2. Uses exponential backoff based on rejection count
+
+        Args:
+            cfg: Config snapshot
+
+        Returns:
+            Tuple of (should_pause, reason)
+        """
+        if not self.db:
+            return False, ""
+
+        # Get consecutive rejection count
+        consecutive_rejections = self.db.count_consecutive_expansion_rejections()
+
+        # Configurable threshold (default: 3 consecutive rejections triggers pause)
+        pause_threshold = getattr(cfg, 'expansion_pause_threshold', 3)
+
+        if consecutive_rejections >= pause_threshold:
+            # Calculate backoff: after threshold, wait exponentially longer
+            # 3 rejections = 1 hour, 6 = 2 hours, 9 = 4 hours, etc.
+            backoff_hours = 2 ** ((consecutive_rejections - pause_threshold) // 3)
+            max_backoff_hours = 24  # Cap at 24 hours
+
+            backoff_hours = min(backoff_hours, max_backoff_hours)
+
+            # Check if enough time has passed since last rejection
+            recent_rejections = self.db.get_recent_expansion_rejections(hours=backoff_hours)
+
+            if len(recent_rejections) >= pause_threshold:
+                return True, f"global_constraint_backoff ({consecutive_rejections} consecutive rejections, {backoff_hours}h cooldown)"
+
+        return False, ""
+
     def _propose_expansion(self, cfg, run_id: str) -> List[Dict[str, Any]]:
         """
         Propose channel expansions to underserved targets.
@@ -1295,15 +1338,43 @@ class Planner:
             self._log("IntentManager not available, skipping expansions", level='debug')
             return decisions
 
-        # Check onchain balance
+        # Check for global constraints (e.g., consecutive rejections due to liquidity)
+        should_pause, pause_reason = self._should_pause_expansions_globally(cfg)
+        if should_pause:
+            self._log(
+                f"Expansions paused due to global constraint: {pause_reason}",
+                level='debug'
+            )
+            self.db.log_planner_action(
+                action_type='expansion',
+                result='skipped',
+                details={
+                    'reason': 'global_constraint',
+                    'detail': pause_reason,
+                    'run_id': run_id
+                }
+            )
+            return decisions
+
+        # Check onchain balance with realistic threshold
+        # The threshold includes: channel size + safety reserve + on-chain fee buffer
         onchain_balance = self._get_local_onchain_balance()
         min_channel_size = getattr(cfg, 'planner_min_channel_sats', MIN_CHANNEL_SIZE_SATS_FALLBACK)
-        min_required = min_channel_size * 2  # Need at least 2x min for fees/reserve
+
+        # Configurable safety reserve (default: 500k sats to match AI advisor criteria)
+        safety_reserve = getattr(cfg, 'planner_safety_reserve_sats', 500_000)
+
+        # Fee buffer for on-chain tx (default: 100k sats for worst-case fees)
+        fee_buffer = getattr(cfg, 'planner_fee_buffer_sats', 100_000)
+
+        # Total minimum required = channel + reserve + fees
+        min_required = min_channel_size + safety_reserve + fee_buffer
 
         if onchain_balance < min_required:
             self._log(
                 f"Insufficient onchain funds for expansion: "
-                f"{onchain_balance} < {min_required} sats",
+                f"{onchain_balance} < {min_required} sats "
+                f"(channel: {min_channel_size}, reserve: {safety_reserve}, fees: {fee_buffer})",
                 level='debug'
             )
             self.db.log_planner_action(
@@ -1313,6 +1384,9 @@ class Planner:
                     'reason': 'insufficient_funds',
                     'onchain_balance': onchain_balance,
                     'min_required': min_required,
+                    'min_channel_size': min_channel_size,
+                    'safety_reserve': safety_reserve,
+                    'fee_buffer': fee_buffer,
                     'run_id': run_id
                 }
             )

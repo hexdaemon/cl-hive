@@ -49,6 +49,9 @@ def mock_database():
     db.has_pending_action_for_target.return_value = False
     db.was_recently_rejected.return_value = False
     db.get_rejection_count.return_value = 0
+    # Mock global constraint tracking (BUG-001 fix)
+    db.count_consecutive_expansion_rejections.return_value = 0
+    db.get_recent_expansion_rejections.return_value = []
     # Mock peer event summary for quality scorer (neutral values)
     db.get_peer_event_summary.return_value = {
         "peer_id": "",
@@ -109,6 +112,10 @@ def mock_config():
     cfg.planner_min_channel_sats = 1_000_000  # 1M sats
     cfg.planner_max_channel_sats = 50_000_000  # 50M sats
     cfg.planner_default_channel_sats = 5_000_000  # 5M sats
+    # Global constraint tracking (BUG-001 fix)
+    cfg.expansion_pause_threshold = 3  # Pause after 3 consecutive rejections
+    cfg.planner_safety_reserve_sats = 500_000  # 500k sats safety reserve
+    cfg.planner_fee_buffer_sats = 100_000  # 100k sats for on-chain fees
     return cfg
 
 

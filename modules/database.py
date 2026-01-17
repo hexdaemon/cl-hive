@@ -1604,6 +1604,78 @@ class HiveDatabase:
 
         return count
 
+    def get_recent_expansion_rejections(self, hours: int = 24) -> List[Dict[str, Any]]:
+        """
+        Get all expansion-related rejections in the given time period.
+
+        This is used to detect global constraints (like insufficient liquidity)
+        that affect ALL expansion proposals, not just specific targets.
+
+        Args:
+            hours: Look-back period in hours (default: 24)
+
+        Returns:
+            List of rejected expansion actions with their payloads
+
+        Note:
+            Scans at most MAX_PENDING_ACTIONS_SCAN rows to bound query time.
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (hours * 3600)
+
+        rows = conn.execute("""
+            SELECT id, action_type, payload, proposed_at, status
+            FROM pending_actions
+            WHERE status = 'rejected'
+            AND action_type IN ('channel_open', 'expansion')
+            AND proposed_at > ?
+            ORDER BY proposed_at DESC
+            LIMIT ?
+        """, (cutoff, self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
+
+        results = []
+        for row in rows:
+            try:
+                result = dict(row)
+                result['payload'] = json.loads(result['payload'])
+                results.append(result)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return results
+
+    def count_consecutive_expansion_rejections(self) -> int:
+        """
+        Count consecutive expansion rejections without any approvals.
+
+        This detects patterns where ALL expansion proposals are being rejected
+        (e.g., due to global liquidity constraints), regardless of target.
+
+        Returns:
+            Number of consecutive rejections since last approval/execution
+        """
+        conn = self._get_connection()
+
+        # Get the most recent actions, ordered by time
+        # Look for the first non-rejection to break the streak
+        rows = conn.execute("""
+            SELECT status FROM pending_actions
+            WHERE action_type IN ('channel_open', 'expansion')
+            ORDER BY proposed_at DESC
+            LIMIT ?
+        """, (self.MAX_PENDING_ACTIONS_SCAN,)).fetchall()
+
+        consecutive = 0
+        for row in rows:
+            if row['status'] == 'rejected':
+                consecutive += 1
+            elif row['status'] in ('approved', 'executed'):
+                # Hit an approval, stop counting
+                break
+            # Skip 'pending' and 'expired' - they don't break the streak
+
+        return consecutive
+
     # =========================================================================
     # PLANNER LOGGING (Phase 6)
     # =========================================================================
