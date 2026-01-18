@@ -62,15 +62,15 @@ class ContributionManager:
             return
 
         mapping: Dict[str, str] = {}
-        for peer in data.get("peers", []):
-            peer_id = peer.get("id")
+        # listpeerchannels returns {"channels": [...]} with peer_id in each channel
+        for channel in data.get("channels", []):
+            peer_id = channel.get("peer_id")
             if not peer_id:
                 continue
-            for channel in peer.get("channels", []):
-                for key in ("short_channel_id", "channel_id", "scid"):
-                    chan_id = channel.get(key)
-                    if chan_id:
-                        mapping[str(chan_id)] = peer_id
+            for key in ("short_channel_id", "channel_id", "scid"):
+                chan_id = channel.get(key)
+                if chan_id:
+                    mapping[str(chan_id)] = peer_id
 
         self._channel_map = mapping
         self._last_refresh = now

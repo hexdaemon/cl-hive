@@ -1192,23 +1192,17 @@ class Planner:
 
     def _get_avg_fee_rate(self) -> int:
         """
-        Get average fee rate from cl-revenue-ops if available.
+        Get average fee rate - returns default value.
+
+        Note: Previously tried to get from cl-revenue-ops but the method
+        didn't exist. This returns a sensible default for channel sizing.
 
         Returns:
-            Average fee rate in ppm, or 500 as default
+            Default fee rate of 500 ppm
         """
-        if not self.bridge:
-            return 500
-
-        try:
-            # Try to get policy info from bridge
-            policy = self.bridge.get_current_policy()
-            if policy and 'avg_fee_ppm' in policy:
-                return policy['avg_fee_ppm']
-        except Exception:
-            pass
-
-        return 500  # Default if unavailable
+        # TODO: Could query revenue-status or calculate from peer policies
+        # For now, return sensible default used in channel sizing calculations
+        return 500
 
     def _has_pending_intent(self, target: str) -> bool:
         """
