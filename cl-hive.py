@@ -664,8 +664,11 @@ plugin.add_option(
 
 
 # =============================================================================
-# HOT-RELOAD SUPPORT (setconfig handler)
+# CONFIG RELOAD SUPPORT
 # =============================================================================
+# Note: CLN's setconfig command updates option values, but there's no
+# notification mechanism for plugins. Use `hive-reload-config` RPC to
+# sync the internal config object after using `lightning-cli setconfig`.
 
 # Mapping from plugin option names to config attribute names and types
 OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
@@ -721,96 +724,66 @@ def _parse_setconfig_value(value: Any, target_type: type) -> Any:
         return str(value)
 
 
-@plugin.subscribe("setconfig")
-def on_setconfig(plugin: Plugin, config_var: str, val: Any, **kwargs):
+def _reload_config_from_cln(plugin_obj: Plugin) -> Dict[str, Any]:
     """
-    Handle dynamic configuration changes via `lightning-cli setconfig`.
+    Reload all hive config options from CLN's current values.
 
-    This allows hot-reloading of most hive settings without restarting the node.
+    Call this after using `lightning-cli setconfig` to sync the internal
+    config object with CLN's option values.
 
-    Example usage:
-        lightning-cli setconfig hive-governance-mode autonomous
-        lightning-cli setconfig hive-member-fee-ppm 100
-        lightning-cli setconfig hive-planner-enable-expansions true
+    Returns dict with list of updated options and any errors.
     """
     global config, vpn_transport
 
-    # Check if this is a hive option
-    if not config_var.startswith('hive-'):
-        return
+    results = {"updated": [], "errors": [], "vpn_reconfigured": False}
 
-    plugin.log(f"cl-hive: setconfig received: {config_var}={val}")
-
-    # Reject changes to immutable options
-    if config_var == 'hive-db-path':
-        plugin.log(f"cl-hive: Cannot change immutable option {config_var} at runtime", level='warn')
-        return
-
-    # Handle VPN options (special case - reconfigure VPN transport)
-    if config_var in VPN_OPTIONS:
-        if vpn_transport is not None:
-            # Get current VPN config and update the changed option
-            current_mode = plugin.get_option('hive-transport-mode')
-            current_subnets = plugin.get_option('hive-vpn-subnets')
-            current_bind = plugin.get_option('hive-vpn-bind')
-            current_peers = plugin.get_option('hive-vpn-peers')
-            current_required = plugin.get_option('hive-vpn-required-messages')
-
-            # Override the changed option
-            if config_var == 'hive-transport-mode':
-                current_mode = val
-            elif config_var == 'hive-vpn-subnets':
-                current_subnets = val
-            elif config_var == 'hive-vpn-bind':
-                current_bind = val
-            elif config_var == 'hive-vpn-peers':
-                current_peers = val
-            elif config_var == 'hive-vpn-required-messages':
-                current_required = val
-
-            # Reconfigure VPN transport
-            vpn_result = vpn_transport.configure(
-                mode=current_mode,
-                vpn_subnets=current_subnets,
-                vpn_bind=current_bind,
-                vpn_peers=current_peers,
-                required_messages=current_required
-            )
-            plugin.log(f"cl-hive: VPN transport reconfigured - mode={vpn_result['mode']}")
-        return
-
-    # Handle standard config options
-    if config_var in OPTION_TO_CONFIG_MAP:
-        attr_name, attr_type = OPTION_TO_CONFIG_MAP[config_var]
-
+    # Reload standard config options
+    for option_name, (attr_name, attr_type) in OPTION_TO_CONFIG_MAP.items():
         try:
-            # Parse the value to the correct type
+            val = plugin_obj.get_option(option_name)
+            if val is None:
+                continue
+
             parsed_value = _parse_setconfig_value(val, attr_type)
-
-            # Update the config
             old_value = getattr(config, attr_name, None)
-            setattr(config, attr_name, parsed_value)
 
-            # Increment config version for snapshot detection
-            config._version += 1
-
-            plugin.log(
-                f"cl-hive: Config updated: {attr_name} = {parsed_value} "
-                f"(was: {old_value}, version: {config._version})"
-            )
-
-            # Validate the new config
-            validation_error = config.validate()
-            if validation_error:
-                # Revert the change
-                setattr(config, attr_name, old_value)
-                config._version -= 1
-                plugin.log(f"cl-hive: Config change reverted - {validation_error}", level='warn')
+            if old_value != parsed_value:
+                setattr(config, attr_name, parsed_value)
+                results["updated"].append({
+                    "option": option_name,
+                    "attr": attr_name,
+                    "old": old_value,
+                    "new": parsed_value
+                })
 
         except (ValueError, TypeError) as e:
-            plugin.log(f"cl-hive: Failed to parse {config_var}={val}: {e}", level='warn')
-    else:
-        plugin.log(f"cl-hive: Unknown config option: {config_var}", level='debug')
+            results["errors"].append({"option": option_name, "error": str(e)})
+
+    # Increment config version if anything changed
+    if results["updated"]:
+        config._version += 1
+
+        # Validate the new config
+        validation_error = config.validate()
+        if validation_error:
+            results["errors"].append({"validation": validation_error})
+
+    # Reload VPN options if VPN transport is active
+    if vpn_transport is not None:
+        try:
+            vpn_result = vpn_transport.configure(
+                mode=plugin_obj.get_option('hive-transport-mode'),
+                vpn_subnets=plugin_obj.get_option('hive-vpn-subnets'),
+                vpn_bind=plugin_obj.get_option('hive-vpn-bind'),
+                vpn_peers=plugin_obj.get_option('hive-vpn-peers'),
+                required_messages=plugin_obj.get_option('hive-vpn-required-messages')
+            )
+            results["vpn_reconfigured"] = True
+            results["vpn_mode"] = vpn_result.get('mode', 'unknown')
+        except Exception as e:
+            results["errors"].append({"vpn": str(e)})
+
+    return results
 
 
 # =============================================================================
@@ -4766,6 +4739,27 @@ def hive_config(plugin: Plugin):
         Dict with all current config values and metadata.
     """
     return rpc_get_config(_get_hive_context())
+
+
+@plugin.method("hive-reload-config")
+def hive_reload_config(plugin: Plugin):
+    """
+    Reload configuration from CLN after using setconfig.
+
+    CLN's setconfig command updates option values, but there's no automatic
+    notification to plugins. Call this after using setconfig to sync the
+    internal config object with CLN's current option values.
+
+    Example:
+        lightning-cli setconfig hive-governance-mode failsafe
+        lightning-cli hive-reload-config
+
+    Returns:
+        Dict with list of updated options and any errors.
+    """
+    result = _reload_config_from_cln(plugin)
+    result["config_version"] = config._version if config else 0
+    return result
 
 
 @plugin.method("hive-reinit-bridge")
