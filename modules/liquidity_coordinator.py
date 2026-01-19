@@ -116,6 +116,10 @@ class LiquidityCoordinator:
         self._liquidity_needs: Dict[str, LiquidityNeed] = {}  # reporter_id -> need
         self._pending_proposals: Dict[str, RebalanceProposal] = {}
 
+        # Phase 2: Liquidity state tracking (information only)
+        # Stores latest liquidity reports from cl-revenue-ops instances
+        self._member_liquidity_state: Dict[str, Dict[str, Any]] = {}
+
         # Rate limiting
         self._need_rate: Dict[str, List[float]] = defaultdict(list)
 
@@ -663,3 +667,305 @@ class LiquidityCoordinator:
             "pending_proposals": len(self._pending_proposals),
             "nnlb_status": nnlb_status
         }
+
+    # =========================================================================
+    # Phase 2: Liquidity Intelligence Sharing (Information Only)
+    # =========================================================================
+    # These methods coordinate INFORMATION about liquidity state.
+    # No fund transfers between nodes - each node manages its own funds.
+    # Knowing fleet state helps nodes make better independent decisions about:
+    # - Fee adjustments to direct public flow helpfully
+    # - Rebalancing timing to avoid route conflicts
+    # - Topology planning to prioritize helpful channel opens
+    # =========================================================================
+
+    def record_member_liquidity_report(
+        self,
+        member_id: str,
+        depleted_channels: List[Dict[str, Any]],
+        saturated_channels: List[Dict[str, Any]],
+        rebalancing_active: bool = False,
+        rebalancing_peers: List[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Record a liquidity state report from a cl-revenue-ops instance.
+
+        INFORMATION SHARING - enables coordinated fee/rebalance decisions.
+        No sats transfer between nodes.
+
+        Args:
+            member_id: Reporting member's pubkey
+            depleted_channels: List of {peer_id, local_pct, capacity_sats}
+            saturated_channels: List of {peer_id, local_pct, capacity_sats}
+            rebalancing_active: Whether member is currently rebalancing
+            rebalancing_peers: Which peers they're rebalancing through
+
+        Returns:
+            {"status": "recorded", ...}
+        """
+        # Verify member exists
+        member = self.database.get_member(member_id)
+        if not member:
+            return {"error": "member_not_found"}
+
+        timestamp = int(time.time())
+
+        # Store in database
+        self.database.update_member_liquidity_state(
+            member_id=member_id,
+            depleted_count=len(depleted_channels),
+            saturated_count=len(saturated_channels),
+            rebalancing_active=rebalancing_active,
+            rebalancing_peers=rebalancing_peers or [],
+            timestamp=timestamp
+        )
+
+        # Update in-memory tracking for fast access
+        self._member_liquidity_state[member_id] = {
+            "depleted_channels": depleted_channels,
+            "saturated_channels": saturated_channels,
+            "rebalancing_active": rebalancing_active,
+            "rebalancing_peers": rebalancing_peers or [],
+            "timestamp": timestamp
+        }
+
+        if self.plugin:
+            self.plugin.log(
+                f"cl-hive: Recorded liquidity state from {member_id[:16]}...: "
+                f"depleted={len(depleted_channels)}, saturated={len(saturated_channels)}, "
+                f"rebalancing={rebalancing_active}",
+                level='debug'
+            )
+
+        return {
+            "status": "recorded",
+            "depleted_count": len(depleted_channels),
+            "saturated_count": len(saturated_channels)
+        }
+
+    def get_fleet_liquidity_state(self) -> Dict[str, Any]:
+        """
+        Get fleet-wide liquidity state overview.
+
+        INFORMATION ONLY - helps nodes understand fleet situation
+        to make better independent decisions.
+
+        Returns:
+            Fleet liquidity summary for coordination
+        """
+        members = self.database.get_all_members()
+
+        members_with_depleted = 0
+        members_with_saturated = 0
+        members_rebalancing = 0
+        all_rebalancing_peers = set()
+
+        # Get our own state
+        our_state = self._member_liquidity_state.get(self.our_pubkey, {})
+
+        for member in members:
+            member_id = member.get("peer_id")
+            state = self._member_liquidity_state.get(member_id)
+
+            if state:
+                if state.get("depleted_channels"):
+                    members_with_depleted += 1
+                if state.get("saturated_channels"):
+                    members_with_saturated += 1
+                if state.get("rebalancing_active"):
+                    members_rebalancing += 1
+                    all_rebalancing_peers.update(state.get("rebalancing_peers", []))
+
+        # Identify common bottleneck peers (multiple members have issues)
+        bottleneck_peers = self._get_common_bottleneck_peers()
+
+        return {
+            "active": True,
+            "fleet_summary": {
+                "total_members": len(members),
+                "members_with_depleted_channels": members_with_depleted,
+                "members_with_saturated_channels": members_with_saturated,
+                "members_rebalancing": members_rebalancing,
+                "common_bottleneck_peers": bottleneck_peers
+            },
+            "our_state": {
+                "depleted_channels": len(our_state.get("depleted_channels", [])),
+                "saturated_channels": len(our_state.get("saturated_channels", [])),
+                "rebalancing_active": our_state.get("rebalancing_active", False)
+            },
+            "rebalancing_activity": {
+                "active_count": members_rebalancing,
+                "peers_in_use": list(all_rebalancing_peers)
+            }
+        }
+
+    def get_fleet_liquidity_needs(self) -> List[Dict[str, Any]]:
+        """
+        Get fleet liquidity needs for coordination.
+
+        INFORMATION ONLY - helps nodes understand what others need
+        so they can make coordinated fee/rebalance decisions.
+
+        Returns:
+            List of needs with relevance scores
+        """
+        needs = []
+
+        for member_id, state in self._member_liquidity_state.items():
+            if member_id == self.our_pubkey:
+                continue  # Skip ourselves
+
+            # Get member health for priority
+            member_health = self.database.get_member_health(member_id)
+            health_score = member_health.get("overall_health", 50) if member_health else 50
+            health_tier = member_health.get("health_tier", "stable") if member_health else "stable"
+
+            # Process depleted channels (they need outbound)
+            for ch in state.get("depleted_channels", []):
+                peer_id = ch.get("peer_id")
+                if not peer_id:
+                    continue
+
+                # Calculate relevance: how much we could help via fee adjustment
+                relevance = self._calculate_relevance_score(peer_id)
+
+                needs.append({
+                    "member_id": member_id,
+                    "need_type": "outbound",
+                    "peer_id": peer_id,
+                    "local_pct": ch.get("local_pct", 0),
+                    "capacity_sats": ch.get("capacity_sats", 0),
+                    "severity": "high" if ch.get("local_pct", 0) < 0.1 else "medium",
+                    "member_health_tier": health_tier,
+                    "our_relevance": relevance
+                })
+
+            # Process saturated channels (they need inbound)
+            for ch in state.get("saturated_channels", []):
+                peer_id = ch.get("peer_id")
+                if not peer_id:
+                    continue
+
+                relevance = self._calculate_relevance_score(peer_id)
+
+                needs.append({
+                    "member_id": member_id,
+                    "need_type": "inbound",
+                    "peer_id": peer_id,
+                    "local_pct": ch.get("local_pct", 1.0),
+                    "capacity_sats": ch.get("capacity_sats", 0),
+                    "severity": "high" if ch.get("local_pct", 1.0) > 0.9 else "medium",
+                    "member_health_tier": health_tier,
+                    "our_relevance": relevance
+                })
+
+        # Sort by severity and health tier (struggling members first)
+        tier_priority = {"struggling": 0, "vulnerable": 1, "stable": 2, "thriving": 3}
+        severity_priority = {"high": 0, "medium": 1, "low": 2}
+
+        needs.sort(key=lambda n: (
+            tier_priority.get(n["member_health_tier"], 2),
+            severity_priority.get(n["severity"], 1),
+            -n["our_relevance"]  # Higher relevance first
+        ))
+
+        return needs
+
+    def _calculate_relevance_score(self, peer_id: str) -> float:
+        """
+        Calculate how relevant we are to helping with a peer.
+
+        Based on whether we have a channel to this peer and our balance state.
+        Higher score = we're better positioned to influence flow via fees.
+        """
+        try:
+            channels = self.plugin.rpc.listpeerchannels(id=peer_id)
+            our_channels = channels.get("channels", [])
+
+            if not our_channels:
+                return 0.0  # No direct connection
+
+            # Sum capacity to this peer
+            total_capacity = 0
+            total_local = 0
+
+            for ch in our_channels:
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                capacity = ch.get("total_msat", 0) // 1000
+                local = ch.get("to_us_msat", 0) // 1000
+                total_capacity += capacity
+                total_local += local
+
+            if total_capacity == 0:
+                return 0.0
+
+            # Balanced channels are more useful for flow influence
+            balance_ratio = total_local / total_capacity
+            # Score peaks at 50% balance
+            balance_score = 1.0 - abs(0.5 - balance_ratio) * 2
+
+            # Larger capacity = more influence
+            capacity_score = min(1.0, total_capacity / 10_000_000)  # Cap at 10M
+
+            return (balance_score * 0.6 + capacity_score * 0.4)
+
+        except Exception:
+            return 0.0
+
+    def _get_common_bottleneck_peers(self) -> List[str]:
+        """
+        Identify peers that multiple hive members have liquidity issues with.
+
+        These are priority targets for fee coordination or new channel opens.
+        """
+        peer_issue_count: Dict[str, int] = defaultdict(int)
+
+        for state in self._member_liquidity_state.values():
+            for ch in state.get("depleted_channels", []):
+                peer_id = ch.get("peer_id")
+                if peer_id:
+                    peer_issue_count[peer_id] += 1
+
+            for ch in state.get("saturated_channels", []):
+                peer_id = ch.get("peer_id")
+                if peer_id:
+                    peer_issue_count[peer_id] += 1
+
+        # Return peers with issues from 2+ members
+        bottlenecks = [
+            peer_id for peer_id, count in peer_issue_count.items()
+            if count >= 2
+        ]
+
+        return sorted(bottlenecks, key=lambda p: peer_issue_count[p], reverse=True)[:10]
+
+    def check_rebalancing_conflict(self, peer_id: str) -> Dict[str, Any]:
+        """
+        Check if another fleet member is actively rebalancing through a peer.
+
+        INFORMATION ONLY - helps avoid competing for the same routes.
+
+        Args:
+            peer_id: The peer to check
+
+        Returns:
+            Conflict info if found
+        """
+        for member_id, state in self._member_liquidity_state.items():
+            if member_id == self.our_pubkey:
+                continue
+
+            if not state.get("rebalancing_active"):
+                continue
+
+            if peer_id in state.get("rebalancing_peers", []):
+                return {
+                    "conflict": True,
+                    "member_id": member_id,
+                    "peer_id": peer_id,
+                    "recommendation": "delay_rebalance",
+                    "reason": f"Member {member_id[:12]}... is actively rebalancing through this peer"
+                }
+
+        return {"conflict": False}

@@ -6721,6 +6721,112 @@ def hive_liquidity_status(plugin: Plugin):
     return liquidity_coord.get_status()
 
 
+@plugin.method("hive-liquidity-state")
+def hive_liquidity_state(plugin: Plugin, action: str = "status"):
+    """
+    Query fleet liquidity state for coordination.
+
+    INFORMATION ONLY - no sats move between nodes. This enables nodes
+    to make better independent decisions about fees and rebalancing.
+
+    Args:
+        action: "status" (overview), "needs" (who needs what)
+
+    Returns for "status":
+        Fleet liquidity state overview including:
+        - Members with depleted/saturated channels
+        - Common bottleneck peers
+        - Rebalancing activity
+
+    Returns for "needs":
+        List of fleet liquidity needs with relevance scores
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not liquidity_coord:
+        return {"error": "Liquidity coordinator not initialized"}
+
+    if action == "status":
+        return liquidity_coord.get_fleet_liquidity_state()
+    elif action == "needs":
+        return {"fleet_needs": liquidity_coord.get_fleet_liquidity_needs()}
+    else:
+        return {"error": f"Unknown action: {action}"}
+
+
+@plugin.method("hive-report-liquidity-state")
+def hive_report_liquidity_state(
+    plugin: Plugin,
+    depleted_channels: list = None,
+    saturated_channels: list = None,
+    rebalancing_active: bool = False,
+    rebalancing_peers: list = None
+):
+    """
+    Report liquidity state from cl-revenue-ops.
+
+    INFORMATION SHARING - enables coordinated fee/rebalance decisions.
+    No sats transfer between nodes.
+
+    Called periodically by cl-revenue-ops profitability analyzer to share
+    current channel states with the fleet.
+
+    Args:
+        depleted_channels: List of {peer_id, local_pct, capacity_sats}
+        saturated_channels: List of {peer_id, local_pct, capacity_sats}
+        rebalancing_active: Whether we're currently rebalancing
+        rebalancing_peers: Which peers we're rebalancing through
+
+    Returns:
+        {"status": "recorded", "depleted_count": N, "saturated_count": M}
+
+    Permission: None (local cl-revenue-ops integration)
+    """
+    # No permission check - this is for local cl-revenue-ops integration
+
+    if not liquidity_coord or not our_pubkey:
+        return {"error": "Liquidity coordinator not initialized"}
+
+    return liquidity_coord.record_member_liquidity_report(
+        member_id=our_pubkey,
+        depleted_channels=depleted_channels or [],
+        saturated_channels=saturated_channels or [],
+        rebalancing_active=rebalancing_active,
+        rebalancing_peers=rebalancing_peers
+    )
+
+
+@plugin.method("hive-check-rebalance-conflict")
+def hive_check_rebalance_conflict(plugin: Plugin, peer_id: str):
+    """
+    Check if another fleet member is rebalancing through a peer.
+
+    INFORMATION ONLY - helps avoid competing for same routes.
+
+    Args:
+        peer_id: The peer to check
+
+    Returns:
+        Conflict info if another member is rebalancing through this peer
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not liquidity_coord:
+        return {"error": "Liquidity coordinator not initialized"}
+
+    return liquidity_coord.check_rebalancing_conflict(peer_id)
+
+
 @plugin.method("hive-set-mode")
 def hive_set_mode(plugin: Plugin, mode: str):
     """

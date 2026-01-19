@@ -551,6 +551,22 @@ class HiveDatabase:
         )
 
         # =====================================================================
+        # MEMBER LIQUIDITY STATE TABLE (Phase 2 - Liquidity Intelligence)
+        # =====================================================================
+        # Stores current liquidity state from cl-revenue-ops reports.
+        # INFORMATION ONLY - no fund transfers, enables coordinated decisions.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS member_liquidity_state (
+                peer_id TEXT PRIMARY KEY,
+                depleted_count INTEGER DEFAULT 0,
+                saturated_count INTEGER DEFAULT 0,
+                rebalancing_active INTEGER DEFAULT 0,
+                rebalancing_peers TEXT DEFAULT '[]',
+                timestamp INTEGER NOT NULL
+            )
+        """)
+
+        # =====================================================================
         # ROUTE PROBES TABLE (Phase 7.4 - Routing Intelligence)
         # =====================================================================
         # Stores route probe observations from hive members
@@ -2773,6 +2789,109 @@ class HiveDatabase:
             result['needs_inbound'] = bool(result.get('needs_inbound', 0))
             result['needs_outbound'] = bool(result.get('needs_outbound', 0))
             result['needs_channels'] = bool(result.get('needs_channels', 0))
+            results.append(result)
+        return results
+
+    # =========================================================================
+    # MEMBER LIQUIDITY STATE OPERATIONS (Phase 2 - Liquidity Intelligence)
+    # =========================================================================
+    # Stores liquidity state reports from cl-revenue-ops instances.
+    # INFORMATION ONLY - enables coordinated decisions, no fund transfers.
+
+    def update_member_liquidity_state(
+        self,
+        member_id: str,
+        depleted_count: int,
+        saturated_count: int,
+        rebalancing_active: bool = False,
+        rebalancing_peers: List[str] = None,
+        timestamp: Optional[int] = None
+    ) -> None:
+        """
+        Update liquidity state for a hive member.
+
+        INFORMATION SHARING - enables coordinated fee/rebalance decisions.
+        No sats transfer between nodes.
+
+        Args:
+            member_id: Hive member peer ID
+            depleted_count: Number of depleted channels
+            saturated_count: Number of saturated channels
+            rebalancing_active: Whether member is currently rebalancing
+            rebalancing_peers: Which peers they're rebalancing through
+            timestamp: When the report was made
+        """
+        import json
+        conn = self._get_connection()
+        ts = timestamp or int(time.time())
+        peers_json = json.dumps(rebalancing_peers or [])
+
+        conn.execute("""
+            INSERT INTO member_liquidity_state (
+                peer_id, depleted_count, saturated_count,
+                rebalancing_active, rebalancing_peers, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(peer_id) DO UPDATE SET
+                depleted_count = excluded.depleted_count,
+                saturated_count = excluded.saturated_count,
+                rebalancing_active = excluded.rebalancing_active,
+                rebalancing_peers = excluded.rebalancing_peers,
+                timestamp = excluded.timestamp
+        """, (
+            member_id, depleted_count, saturated_count,
+            1 if rebalancing_active else 0, peers_json, ts
+        ))
+
+    def get_member_liquidity_state(
+        self,
+        member_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get liquidity state for a hive member.
+
+        Args:
+            member_id: Hive member peer ID
+
+        Returns:
+            Liquidity state dict or None if not found
+        """
+        import json
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM member_liquidity_state WHERE peer_id = ?
+        """, (member_id,)).fetchone()
+
+        if not row:
+            return None
+
+        result = dict(row)
+        result['rebalancing_active'] = bool(result.get('rebalancing_active', 0))
+        result['rebalancing_peers'] = json.loads(
+            result.get('rebalancing_peers', '[]')
+        )
+        return result
+
+    def get_all_member_liquidity_states(self) -> List[Dict[str, Any]]:
+        """
+        Get liquidity state for all members.
+
+        Returns:
+            List of liquidity state dicts
+        """
+        import json
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM member_liquidity_state
+            ORDER BY timestamp DESC
+        """).fetchall()
+
+        results = []
+        for row in rows:
+            result = dict(row)
+            result['rebalancing_active'] = bool(result.get('rebalancing_active', 0))
+            result['rebalancing_peers'] = json.loads(
+                result.get('rebalancing_peers', '[]')
+            )
             results.append(result)
         return results
 
