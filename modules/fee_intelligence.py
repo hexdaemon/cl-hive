@@ -942,3 +942,233 @@ class FeeIntelligenceManager:
             "needs_help": needs_help,
             "can_help_others": can_help
         }
+
+    # =========================================================================
+    # COMPETITOR FEE INTELLIGENCE (Phase 1: Query Integration)
+    # =========================================================================
+    # These methods expose aggregated fee profiles for cl-revenue-ops
+
+    def get_aggregated_profile(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get aggregated fee profile for external query by cl-revenue-ops.
+
+        Combines:
+        - Aggregated fee data from peer_fee_profiles table
+        - Market share calculation based on hive capacity to this peer
+        - Fee volatility estimate from recent observations
+        - Confidence weighting based on data freshness
+
+        Args:
+            peer_id: External peer to get profile for
+
+        Returns:
+            Dict with profile data or None if no data available:
+            {
+                "peer_id": "02abc...",
+                "avg_fee_charged": 250,
+                "min_fee": 100,
+                "max_fee": 500,
+                "fee_volatility": 0.15,
+                "estimated_elasticity": -0.8,
+                "optimal_fee_estimate": 180,
+                "confidence": 0.75,
+                "market_share": 0.12,
+                "hive_capacity_sats": 6000000,
+                "hive_reporters": 3,
+                "last_updated": 1705000000
+            }
+        """
+        profile = self.db.get_peer_fee_profile(peer_id)
+        if not profile:
+            return None
+
+        # Get recent observations to calculate volatility
+        reports = self.db.get_fee_intelligence_for_peer(peer_id, max_age_hours=72)
+        volatility = self._calculate_fee_volatility(reports)
+
+        # Calculate hive capacity to this peer from recent observations
+        hive_capacity = sum(
+            r.get("forward_volume_sats", 0)
+            for r in reports
+            if r.get("forward_volume_sats", 0) > 0
+        )
+
+        # Apply freshness decay to confidence
+        now = int(time.time())
+        last_update = profile.get("last_update", now)
+        age_hours = (now - last_update) / 3600
+        freshness_factor = max(0.1, 1.0 - (age_hours / 48))  # Decay over 48h
+
+        return {
+            "peer_id": peer_id,
+            "avg_fee_charged": int(profile.get("avg_fee_charged", 0)),
+            "min_fee": profile.get("min_fee_charged", 0),
+            "max_fee": profile.get("max_fee_charged", 0),
+            "fee_volatility": round(volatility, 3),
+            "estimated_elasticity": round(profile.get("estimated_elasticity", 0), 3),
+            "optimal_fee_estimate": profile.get("optimal_fee_estimate", 0),
+            "confidence": round(profile.get("confidence", 0) * freshness_factor, 3),
+            "market_share": 0.0,  # Calculated by caller with their data
+            "hive_capacity_sats": hive_capacity,
+            "hive_reporters": profile.get("reporter_count", 0),
+            "last_updated": last_update
+        }
+
+    def get_all_profiles(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get all known peer profiles for batch query.
+
+        Args:
+            limit: Maximum number of profiles to return
+
+        Returns:
+            List of profile dicts (see get_aggregated_profile for format)
+        """
+        profiles = self.db.get_all_peer_fee_profiles(limit=limit)
+        result = []
+
+        for profile in profiles:
+            peer_id = profile.get("peer_id")
+            if not peer_id:
+                continue
+
+            # Skip profiles with no useful data
+            if profile.get("reporter_count", 0) == 0:
+                continue
+
+            # Get recent observations for volatility
+            reports = self.db.get_fee_intelligence_for_peer(peer_id, max_age_hours=72)
+            volatility = self._calculate_fee_volatility(reports)
+
+            # Calculate hive capacity
+            hive_capacity = sum(
+                r.get("forward_volume_sats", 0)
+                for r in reports
+                if r.get("forward_volume_sats", 0) > 0
+            )
+
+            # Apply freshness decay
+            now = int(time.time())
+            last_update = profile.get("last_update", now)
+            age_hours = (now - last_update) / 3600
+            freshness_factor = max(0.1, 1.0 - (age_hours / 48))
+
+            result.append({
+                "peer_id": peer_id,
+                "avg_fee_charged": int(profile.get("avg_fee_charged", 0)),
+                "min_fee": profile.get("min_fee_charged", 0),
+                "max_fee": profile.get("max_fee_charged", 0),
+                "fee_volatility": round(volatility, 3),
+                "estimated_elasticity": round(profile.get("estimated_elasticity", 0), 3),
+                "optimal_fee_estimate": profile.get("optimal_fee_estimate", 0),
+                "confidence": round(profile.get("confidence", 0) * freshness_factor, 3),
+                "market_share": 0.0,
+                "hive_capacity_sats": hive_capacity,
+                "hive_reporters": profile.get("reporter_count", 0),
+                "last_updated": last_update
+            })
+
+        return result
+
+    def _calculate_fee_volatility(self, reports: List[Dict[str, Any]]) -> float:
+        """
+        Calculate fee volatility from recent observations.
+
+        Volatility is the standard deviation of fees divided by mean.
+        Higher volatility indicates the peer changes fees frequently.
+
+        Args:
+            reports: List of fee intelligence reports
+
+        Returns:
+            Volatility coefficient (0.0 = stable, 1.0+ = high volatility)
+        """
+        if len(reports) < 2:
+            return 0.0
+
+        fees = [r.get("our_fee_ppm", 0) for r in reports if r.get("our_fee_ppm", 0) > 0]
+        if len(fees) < 2:
+            return 0.0
+
+        mean_fee = sum(fees) / len(fees)
+        if mean_fee == 0:
+            return 0.0
+
+        variance = sum((f - mean_fee) ** 2 for f in fees) / len(fees)
+        std_dev = variance ** 0.5
+
+        return min(1.0, std_dev / mean_fee)  # Cap at 1.0
+
+    # =========================================================================
+    # LOCAL OBSERVATION STORAGE (Phase 2: Bidirectional Sharing)
+    # =========================================================================
+    # These methods handle observations reported by local cl-revenue-ops
+
+    def store_local_observation(
+        self,
+        target_peer_id: str,
+        our_fee_ppm: int,
+        their_fee_ppm: Optional[int] = None,
+        forward_count: int = 0,
+        forward_volume_sats: int = 0,
+        revenue_rate: float = 0.0,
+        flow_direction: str = "balanced",
+        utilization_pct: float = 0.0,
+        timestamp: Optional[int] = None
+    ) -> int:
+        """
+        Store a local fee observation from cl-revenue-ops.
+
+        Unlike handle_fee_intelligence() which processes signed messages from
+        remote hive members, this method stores local observations directly.
+        These observations are used for local aggregation and can optionally
+        be broadcast to hive members.
+
+        Args:
+            target_peer_id: External peer being observed
+            our_fee_ppm: Our fee toward this peer
+            their_fee_ppm: Their fee toward us (optional)
+            forward_count: Number of forwards in period
+            forward_volume_sats: Volume routed in period
+            revenue_rate: Calculated revenue rate (sats/hour)
+            flow_direction: 'source', 'sink', or 'balanced'
+            utilization_pct: Channel utilization (0.0-1.0)
+            timestamp: Observation timestamp (defaults to now)
+
+        Returns:
+            Observation ID from database
+        """
+        if timestamp is None:
+            timestamp = int(time.time())
+
+        # Calculate revenue from volume if not provided
+        revenue_sats = int(revenue_rate * 1.0)  # Assuming 1 hour period
+        if forward_volume_sats > 0 and our_fee_ppm > 0:
+            revenue_sats = (forward_volume_sats * our_fee_ppm) // 1_000_000
+
+        # Store using our own pubkey as reporter
+        # Use "local" signature to distinguish from remote reports
+        observation_id = self.db.store_fee_intelligence(
+            reporter_id=self.our_pubkey or "local",
+            target_peer_id=target_peer_id,
+            timestamp=timestamp,
+            our_fee_ppm=our_fee_ppm,
+            their_fee_ppm=their_fee_ppm or 0,
+            forward_count=forward_count,
+            forward_volume_sats=forward_volume_sats,
+            revenue_sats=revenue_sats,
+            flow_direction=flow_direction,
+            utilization_pct=utilization_pct,
+            signature="local",  # Mark as local observation
+            last_fee_change_ppm=0,
+            volume_delta_pct=0.0,
+            days_observed=1
+        )
+
+        self._log(
+            f"Stored local observation for {target_peer_id[:16]}... "
+            f"(fee={our_fee_ppm}, volume={forward_volume_sats}, forwards={forward_count})",
+            level='debug'
+        )
+
+        return observation_id

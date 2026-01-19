@@ -5992,6 +5992,158 @@ def hive_aggregate_fees(plugin: Plugin):
     }
 
 
+@plugin.method("hive-fee-intel-query")
+def hive_fee_intel_query(plugin: Plugin, peer_id: str = None, action: str = "query"):
+    """
+    Query aggregated fee intelligence from the hive.
+
+    This RPC is designed for cl-revenue-ops to query competitor fee data
+    for informing Hill Climbing fee decisions.
+
+    Args:
+        peer_id: Specific peer to query (None for all). Can also use
+                 action="list" with peer_id=None to get all known peers.
+        action: "query" (default) or "list"
+            - query: Get aggregated profile for a single peer
+            - list: Get all known peer profiles
+
+    Returns for single peer (action="query"):
+    {
+        "peer_id": "02abc...",
+        "avg_fee_charged": 250,
+        "min_fee": 100,
+        "max_fee": 500,
+        "fee_volatility": 0.15,
+        "estimated_elasticity": -0.8,
+        "optimal_fee_estimate": 180,
+        "confidence": 0.75,
+        "market_share": 0.0,  # Calculated by caller with their capacity data
+        "hive_capacity_sats": 6000000,
+        "hive_reporters": 3,
+        "last_updated": 1705000000
+    }
+
+    Returns for "list" action:
+    {
+        "peers": [...],  # List of profiles in same format
+        "count": 25
+    }
+
+    Permission: None (accessible without hive membership for local cl-revenue-ops)
+    """
+    # No permission check - this is for local cl-revenue-ops integration
+    # cl-revenue-ops runs on the same node, so it's trusted
+
+    if not fee_intel_mgr:
+        return {"error": "Fee intelligence manager not initialized"}
+
+    if action == "list":
+        profiles = fee_intel_mgr.get_all_profiles(limit=100)
+        return {
+            "peers": profiles,
+            "count": len(profiles)
+        }
+
+    if not peer_id:
+        return {"error": "peer_id required for query action"}
+
+    profile = fee_intel_mgr.get_aggregated_profile(peer_id)
+    if not profile:
+        return {
+            "error": "no_data",
+            "peer_id": peer_id,
+            "message": "No fee intelligence data for this peer"
+        }
+
+    return profile
+
+
+@plugin.method("hive-report-fee-observation")
+def hive_report_fee_observation(
+    plugin: Plugin,
+    peer_id: str,
+    our_fee_ppm: int,
+    their_fee_ppm: int = None,
+    volume_sats: int = 0,
+    forward_count: int = 0,
+    period_hours: float = 1.0,
+    revenue_rate: float = None
+):
+    """
+    Receive fee observation from cl-revenue-ops.
+
+    This RPC is designed for cl-revenue-ops to report its fee observations
+    back to cl-hive for collective intelligence sharing.
+
+    The observation is:
+    1. Stored locally in fee_intelligence table
+    2. (Optionally) Broadcast to hive via FEE_INTELLIGENCE message
+    3. Used in fee profile aggregation
+
+    Args:
+        peer_id: External peer being observed
+        our_fee_ppm: Our current fee toward this peer
+        their_fee_ppm: Their fee toward us (if known)
+        volume_sats: Volume routed in observation period
+        forward_count: Number of forwards
+        period_hours: Observation window length
+        revenue_rate: Calculated revenue rate (sats/hour)
+
+    Returns:
+        {"status": "accepted", "observation_id": <id>}
+
+    Permission: None (local cl-revenue-ops integration)
+    """
+    # No permission check - this is for local cl-revenue-ops integration
+
+    if not database or not fee_intel_mgr:
+        return {"error": "Fee intelligence not initialized"}
+
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    if our_fee_ppm < 0:
+        return {"error": "our_fee_ppm must be non-negative"}
+
+    # Store the observation
+    try:
+        timestamp = int(time.time())
+
+        # Calculate revenue if not provided
+        if revenue_rate is None and period_hours > 0:
+            revenue_sats = (volume_sats * our_fee_ppm) // 1_000_000
+            revenue_rate = revenue_sats / period_hours
+
+        # Determine flow direction based on balance change (simplified)
+        flow_direction = "balanced"
+
+        # Calculate utilization (simplified - would need channel capacity)
+        utilization_pct = 0.0
+
+        # Store via fee_intel_mgr's observation handler
+        observation_id = fee_intel_mgr.store_local_observation(
+            target_peer_id=peer_id,
+            our_fee_ppm=our_fee_ppm,
+            their_fee_ppm=their_fee_ppm,
+            forward_count=forward_count,
+            forward_volume_sats=volume_sats,
+            revenue_rate=revenue_rate or 0.0,
+            flow_direction=flow_direction,
+            utilization_pct=utilization_pct,
+            timestamp=timestamp
+        )
+
+        return {
+            "status": "accepted",
+            "observation_id": observation_id,
+            "peer_id": peer_id
+        }
+
+    except Exception as e:
+        plugin.log(f"Error storing fee observation: {e}", level='warn')
+        return {"error": f"Failed to store observation: {e}"}
+
+
 @plugin.method("hive-trigger-fee-broadcast")
 def hive_trigger_fee_broadcast(plugin: Plugin):
     """

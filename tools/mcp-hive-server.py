@@ -754,6 +754,28 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
+            name="revenue_competitor_analysis",
+            description="Get competitor fee analysis from hive intelligence. Shows how our fees compare to competitors, market positioning opportunities, and recommended fee adjustments.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Specific peer pubkey (optional, omit for top N by reporters)"
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Number of top peers to analyze (default: 10)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="goat_feeder_history",
             description="Get historical goat feeder P&L from the advisor database. Shows snapshots over time for trend analysis.",
             inputSchema={
@@ -1101,6 +1123,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_revenue_history(arguments)
         elif name == "revenue_outgoing":
             result = await handle_revenue_outgoing(arguments)
+        elif name == "revenue_competitor_analysis":
+            result = await handle_revenue_competitor_analysis(arguments)
         elif name == "goat_feeder_history":
             result = await handle_goat_feeder_history(arguments)
         elif name == "goat_feeder_trends":
@@ -1593,18 +1617,70 @@ async def read_resource(uri: str) -> str:
 # =============================================================================
 
 async def handle_revenue_status(args: Dict) -> Dict:
-    """Get cl-revenue-ops plugin status."""
+    """Get cl-revenue-ops plugin status with competitor intelligence info."""
     node_name = args.get("node")
 
     node = fleet.get_node(node_name)
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    return await node.call("revenue-status")
+    # Get base status from cl-revenue-ops
+    status = await node.call("revenue-status")
+
+    if "error" in status:
+        return status
+
+    # Add competitor intelligence status from cl-hive
+    try:
+        intel_result = await node.call("hive-fee-intel-query", {"action": "list"})
+
+        if intel_result.get("error"):
+            status["competitor_intelligence"] = {
+                "enabled": False,
+                "error": intel_result.get("error"),
+                "data_quality": "unavailable"
+            }
+        else:
+            peers = intel_result.get("peers", [])
+            peers_tracked = len(peers)
+
+            # Calculate data quality based on confidence scores
+            if peers_tracked == 0:
+                data_quality = "no_data"
+            else:
+                avg_confidence = sum(p.get("confidence", 0) for p in peers) / peers_tracked
+                if avg_confidence > 0.6:
+                    data_quality = "good"
+                elif avg_confidence > 0.3:
+                    data_quality = "moderate"
+                else:
+                    data_quality = "stale"
+
+            # Find most recent update
+            last_sync = max(
+                (p.get("last_updated", 0) for p in peers),
+                default=0
+            )
+
+            status["competitor_intelligence"] = {
+                "enabled": True,
+                "peers_tracked": peers_tracked,
+                "last_sync": last_sync,
+                "data_quality": data_quality
+            }
+
+    except Exception as e:
+        status["competitor_intelligence"] = {
+            "enabled": False,
+            "error": str(e),
+            "data_quality": "unavailable"
+        }
+
+    return status
 
 
 async def handle_revenue_profitability(args: Dict) -> Dict:
-    """Get channel profitability analysis."""
+    """Get channel profitability analysis with market context."""
     node_name = args.get("node")
     channel_id = args.get("channel_id")
 
@@ -1616,7 +1692,61 @@ async def handle_revenue_profitability(args: Dict) -> Dict:
     if channel_id:
         params["channel_id"] = channel_id
 
-    return await node.call("revenue-profitability", params if params else None)
+    # Get profitability data
+    profitability = await node.call("revenue-profitability", params if params else None)
+
+    if "error" in profitability:
+        return profitability
+
+    # Try to add market context from competitor intelligence
+    try:
+        channels = profitability.get("channels", [])
+
+        # Build a map of peer_id -> intel for quick lookup
+        intel_map = {}
+        intel_result = await node.call("hive-fee-intel-query", {"action": "list"})
+        if not intel_result.get("error"):
+            for peer in intel_result.get("peers", []):
+                pid = peer.get("peer_id")
+                if pid:
+                    intel_map[pid] = peer
+
+        # Add market context to each channel
+        for channel in channels:
+            peer_id = channel.get("peer_id")
+            if peer_id and peer_id in intel_map:
+                intel = intel_map[peer_id]
+                their_avg = intel.get("avg_fee_charged", 0)
+                our_fee = channel.get("our_fee_ppm", 0)
+
+                # Determine position
+                if their_avg == 0:
+                    position = "unknown"
+                    suggested_adjustment = None
+                elif our_fee < their_avg * 0.8:
+                    position = "underpriced"
+                    suggested_adjustment = f"+{their_avg - our_fee} ppm"
+                elif our_fee > their_avg * 1.2:
+                    position = "premium"
+                    suggested_adjustment = f"-{our_fee - their_avg} ppm"
+                else:
+                    position = "competitive"
+                    suggested_adjustment = None
+
+                channel["market_context"] = {
+                    "competitor_avg_fee": their_avg,
+                    "market_position": position,
+                    "suggested_adjustment": suggested_adjustment,
+                    "confidence": intel.get("confidence", 0)
+                }
+            else:
+                channel["market_context"] = None
+
+    except Exception as e:
+        # Don't fail if competitor intel is unavailable
+        logger.debug(f"Could not add market context: {e}")
+
+    return profitability
 
 
 async def handle_revenue_dashboard(args: Dict) -> Dict:
@@ -1961,6 +2091,156 @@ async def handle_revenue_outgoing(args: Dict) -> Dict:
             "source": f"LNbits ({LNBITS_URL})"
         },
         "error": revenue.get("error")
+    }
+
+
+async def handle_revenue_competitor_analysis(args: Dict) -> Dict:
+    """
+    Get competitor fee analysis from hive intelligence.
+
+    Shows:
+    - How our fees compare to competitors
+    - Market positioning opportunities
+    - Recommended fee adjustments
+
+    Uses the hive-fee-intel-query RPC to get aggregated competitor data.
+    """
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    top_n = args.get("top_n", 10)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Query competitor intelligence from cl-hive
+    if peer_id:
+        # Single peer query
+        intel_result = await node.call("hive-fee-intel-query", {
+            "peer_id": peer_id,
+            "action": "query"
+        })
+
+        if intel_result.get("error"):
+            return {
+                "node": node_name,
+                "error": intel_result.get("error"),
+                "message": intel_result.get("message", "No data available")
+            }
+
+        # Get our current fee to this peer for comparison
+        channels_result = await node.call("listchannels", {"source": peer_id})
+
+        our_fee = 0
+        for channel in channels_result.get("channels", []):
+            if channel.get("source") == peer_id:
+                our_fee = channel.get("fee_per_millionth", 0)
+                break
+
+        # Analyze positioning
+        their_avg_fee = intel_result.get("avg_fee_charged", 0)
+        analysis = _analyze_market_position(our_fee, their_avg_fee, intel_result)
+
+        return {
+            "node": node_name,
+            "analysis": [analysis],
+            "summary": {
+                "underpriced_count": 1 if analysis.get("market_position") == "underpriced" else 0,
+                "competitive_count": 1 if analysis.get("market_position") == "competitive" else 0,
+                "premium_count": 1 if analysis.get("market_position") == "premium" else 0,
+                "total_opportunity_sats": 0  # Single peer, no aggregate
+            }
+        }
+
+    else:
+        # List all known peers
+        intel_result = await node.call("hive-fee-intel-query", {"action": "list"})
+
+        if intel_result.get("error"):
+            return {
+                "node": node_name,
+                "error": intel_result.get("error")
+            }
+
+        peers = intel_result.get("peers", [])[:top_n]
+
+        # Analyze each peer
+        analyses = []
+        underpriced = 0
+        competitive = 0
+        premium = 0
+
+        for peer_intel in peers:
+            pid = peer_intel.get("peer_id", "")
+            their_avg_fee = peer_intel.get("avg_fee_charged", 0)
+
+            # For batch, we use optimal_fee_estimate as proxy for "our fee"
+            # since getting actual channel fees for all peers is expensive
+            our_fee = peer_intel.get("optimal_fee_estimate", their_avg_fee)
+
+            analysis = _analyze_market_position(our_fee, their_avg_fee, peer_intel)
+            analysis["peer_id"] = pid
+            analyses.append(analysis)
+
+            if analysis.get("market_position") == "underpriced":
+                underpriced += 1
+            elif analysis.get("market_position") == "competitive":
+                competitive += 1
+            else:
+                premium += 1
+
+        return {
+            "node": node_name,
+            "analysis": analyses,
+            "summary": {
+                "underpriced_count": underpriced,
+                "competitive_count": competitive,
+                "premium_count": premium,
+                "peers_analyzed": len(analyses)
+            }
+        }
+
+
+def _analyze_market_position(our_fee: int, their_avg_fee: int, intel: Dict) -> Dict:
+    """
+    Analyze market position relative to competitor.
+
+    Returns analysis dict with position and recommendation.
+    """
+    confidence = intel.get("confidence", 0)
+    elasticity = intel.get("estimated_elasticity", 0)
+    optimal_estimate = intel.get("optimal_fee_estimate", 0)
+
+    # Determine position
+    if their_avg_fee == 0:
+        position = "unknown"
+        opportunity = "hold"
+        reasoning = "No competitor fee data available"
+    elif our_fee < their_avg_fee * 0.8:
+        position = "underpriced"
+        opportunity = "raise_fees"
+        diff_pct = ((their_avg_fee - our_fee) / their_avg_fee * 100) if their_avg_fee > 0 else 0
+        reasoning = f"We're {diff_pct:.0f}% cheaper than competitors"
+    elif our_fee > their_avg_fee * 1.2:
+        position = "premium"
+        opportunity = "lower_fees" if elasticity < -0.5 else "hold"
+        diff_pct = ((our_fee - their_avg_fee) / their_avg_fee * 100) if their_avg_fee > 0 else 0
+        reasoning = f"We're {diff_pct:.0f}% more expensive than competitors"
+    else:
+        position = "competitive"
+        opportunity = "hold"
+        reasoning = "Fees are competitively positioned"
+
+    suggested_fee = optimal_estimate if optimal_estimate > 0 else our_fee
+
+    return {
+        "our_fee_ppm": our_fee,
+        "their_avg_fee": their_avg_fee,
+        "market_position": position,
+        "opportunity": opportunity,
+        "suggested_fee": suggested_fee,
+        "confidence": confidence,
+        "reasoning": reasoning
     }
 
 
