@@ -1077,9 +1077,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     routing_pool = RoutingPool(
         database=database,
         plugin=safe_plugin,
-        our_pubkey=our_pubkey,
         state_manager=state_manager
     )
+    routing_pool.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Routing pool initialized (collective economics)")
 
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)

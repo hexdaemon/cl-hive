@@ -1563,6 +1563,159 @@ This is arguably the most "hive-like" structure possible.
 
 ---
 
+## cl-revenue-ops Integration Requirements
+
+The yield optimization plan requires changes to both cl-hive (coordination layer) and cl-revenue-ops (execution layer). This section details what needs to change in cl-revenue-ops.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           cl-hive (Coordinator)                          │
+│                                                                          │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐ │
+│   │ Routing Pool │  │ Fee Intel    │  │ Liquidity    │  │ Planner    │ │
+│   │ (Phase 0)    │  │ Manager      │  │ Coordinator  │  │            │ │
+│   └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └────────────┘ │
+│          │                 │                 │                          │
+└──────────┼─────────────────┼─────────────────┼──────────────────────────┘
+           │                 │                 │
+           │    ┌────────────┴────────────┐    │
+           │    │      hive_bridge.py      │    │
+           │    │   (Circuit Breaker +     │    │
+           │    │        Caching)          │    │
+           │    └────────────┬────────────┘    │
+           │                 │                 │
+           ▼                 ▼                 ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                       cl-revenue-ops (Executor)                           │
+│                                                                           │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐ │
+│   │ Fee          │  │ Rebalancer   │  │ Profitability│  │ Policy      │ │
+│   │ Controller   │  │ (EV-based)   │  │ Analyzer     │  │ Manager     │ │
+│   │ (Hill Climb) │  │              │  │              │  │             │ │
+│   └──────────────┘  └──────────────┘  └──────────────┘  └─────────────┘ │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Changes by Phase
+
+#### Phase 0: Routing Pool Integration
+
+**cl-revenue-ops Changes**:
+- Add `report_routing_revenue()` to `hive_bridge.py`
+- Hook forward events to push revenue to cl-hive
+- Add `query_pool_status()` for visibility
+
+**Effort**: ~50 lines
+
+#### Phase 1: Metrics Sharing
+
+**cl-revenue-ops Changes**:
+- Add `revenue-yield-metrics` RPC command
+- Add `report_channel_metrics()` bridge method
+- Periodic metrics push to cl-hive
+
+**Effort**: ~100 lines
+
+#### Phase 2: Fee Coordination (Major)
+
+**cl-revenue-ops Changes**:
+
+1. **New Fee Strategy**: `HIVE_COORDINATED`
+   - Query cl-hive for coordinated fee recommendations
+   - Respect fleet fee floor/ceiling
+   - Fall back to local Hill Climbing if hive unavailable
+
+2. **Stigmergic Route Markers**:
+   - `deposit_route_marker()` - leave markers after routing
+   - `read_route_markers()` - read markers from fleet
+   - Indirect coordination without explicit messaging
+
+**New cl-hive RPC Commands Needed**:
+- `hive-fee-recommendation` - coordinated fee for a channel
+- `hive-deposit-route-marker` - leave stigmergic marker
+- `hive-read-route-markers` - read fleet markers
+
+**Effort**: ~200-400 lines
+
+#### Phase 3: Cost Reduction
+
+**cl-revenue-ops Changes**:
+
+1. **Predictive Rebalancing**:
+   - Query cl-hive for velocity predictions
+   - Rebalance early when urgency is low = cheaper fees
+   - `should_preemptive_rebalance()` method
+
+2. **Fleet Rebalance Paths**:
+   - Check if routing through fleet members is cheaper
+   - Fleet members have coordinated (lower) fees
+   - `find_fleet_rebalance_path()` method
+
+3. **Circular Flow Detection**:
+   - Detect wasteful A→B→C→A patterns within fleet
+   - Stop one leg to eliminate waste
+
+**Effort**: ~150 lines
+
+#### Phase 5: Strategic Positioning
+
+**cl-revenue-ops Changes**:
+
+1. **Flow Intensity Calculation**:
+   - `calculate_flow_intensity()` in profitability_analyzer
+   - Volume / Capacity metric for Physarum decisions
+
+2. **Physarum Recommendations**:
+   - High flow → recommend splice-in
+   - Low flow → recommend cooperative close
+   - Report to cl-hive for fleet coordination
+
+**Effort**: ~100 lines
+
+### Implementation Sprints
+
+| Sprint | Weeks | Focus | cl-revenue-ops Changes |
+|--------|-------|-------|------------------------|
+| 1 | 1-2 | Pool Integration | `report_routing_revenue()`, forward hooks |
+| 2 | 3-4 | Metrics | `yield-metrics` RPC, periodic push |
+| 3 | 5-8 | Fee Coordination | `HIVE_COORDINATED` strategy, route markers |
+| 4 | 9-12 | Cost Reduction | Predictive rebalancing, fleet paths |
+| 5 | 13-16 | Positioning | Flow intensity, Physarum recommendations |
+
+### Backward Compatibility
+
+All changes are **additive** and maintain backward compatibility:
+
+- cl-revenue-ops works standalone (without cl-hive)
+- Local Hill Climbing remains the fallback
+- Circuit breaker prevents hive failures from cascading
+- Existing policies (`dynamic`, `static`, `hive`, `passive`) unchanged
+
+### Total Effort Estimate
+
+| Component | Lines | Complexity |
+|-----------|-------|------------|
+| Phase 0 (Pool) | ~50 | Low |
+| Phase 1 (Metrics) | ~100 | Low |
+| Phase 2 (Fees) | ~300 | Medium |
+| Phase 3 (Costs) | ~150 | Medium |
+| Phase 5 (Position) | ~100 | Low |
+| **Total** | **~700** | Medium |
+
+### Key Design Decisions
+
+1. **cl-hive Coordinates, cl-revenue-ops Executes**: Clear separation of concerns
+2. **Graceful Degradation**: Always fall back to local-only mode
+3. **Eventual Consistency**: Accept stale data with reduced confidence
+4. **Idempotent Operations**: Safe retries for all bridge methods
+
+See `docs/planning/CL_REVENUE_OPS_INTEGRATION.md` for detailed implementation specifications.
+
+---
+
 ## Conclusion: Can We Match Block's 9.7%?
 
 **Yes, through operational excellence.**
