@@ -87,6 +87,7 @@ from modules.rpc_commands import (
     get_config as rpc_get_config,
     members as rpc_members,
     vpn_status as rpc_vpn_status,
+    expansion_recommendations as rpc_expansion_recommendations,
     vpn_add_peer as rpc_vpn_add_peer,
     vpn_remove_peer as rpc_vpn_remove_peer,
     pending_actions as rpc_pending_actions,
@@ -1029,6 +1030,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         state_manager=state_manager
     )
     plugin.log("cl-hive: Splice coordinator initialized")
+
+    # Link cooperation modules to Planner (Phase 7 - Cooperation Module Synergies)
+    # These modules were initialized after the planner, so we set them via setter
+    planner.set_cooperation_modules(
+        liquidity_coordinator=liquidity_coord,
+        splice_coordinator=splice_coord,
+        health_aggregator=health_aggregator
+    )
+    plugin.log("cl-hive: Planner linked to cooperation modules")
 
     # Initialize Routing Map (Phase 7.4 - Routing Intelligence)
     global routing_map
@@ -4833,6 +4843,26 @@ def hive_topology(plugin: Plugin):
         Dict with saturated targets, planner stats, and config.
     """
     return rpc_topology(_get_hive_context())
+
+
+@plugin.method("hive-expansion-recommendations")
+def hive_expansion_recommendations(plugin: Plugin, limit: int = 10):
+    """
+    Get expansion recommendations with cooperation module intelligence.
+
+    Returns detailed recommendations integrating:
+    - Hive coverage diversity (% of members with channels)
+    - Network competition (peer channel count)
+    - Bottleneck detection (from liquidity_coordinator)
+    - Splice recommendations (from splice_coordinator)
+
+    Args:
+        limit: Maximum number of recommendations to return (default: 10)
+
+    Returns:
+        Dict with expansion recommendations and coverage summary.
+    """
+    return rpc_expansion_recommendations(_get_hive_context(), limit=limit)
 
 
 @plugin.method("hive-channel-closed")

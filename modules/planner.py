@@ -89,6 +89,27 @@ MAX_EXPANSIONS_PER_CYCLE = 1
 MIN_QUALITY_SCORE = 0.45  # Minimum quality score for expansion
 QUALITY_SCORE_DAYS = 90   # Days of history to consider for quality scoring
 
+# =============================================================================
+# COOPERATION MODULE INTEGRATION (Phase 7)
+# =============================================================================
+
+# Hive coverage diversity thresholds
+HIVE_COVERAGE_HIGH_PCT = 0.60        # >60% of hive has channels = well covered
+HIVE_COVERAGE_MAJORITY_PCT = 0.50    # >50% = majority covered, consider splice
+
+# Network competition thresholds (peer's total channel count)
+LOW_COMPETITION_CHANNELS = 30         # <30 channels = low competition, good target
+MEDIUM_COMPETITION_CHANNELS = 100     # 30-100 = moderate competition
+HIGH_COMPETITION_CHANNELS = 200       # >200 = high competition (e.g., Kraken)
+
+# Competition discount factors (applied to base score)
+COMPETITION_DISCOUNT_LOW = 1.0        # No discount for low competition
+COMPETITION_DISCOUNT_MEDIUM = 0.85    # 15% discount for medium competition
+COMPETITION_DISCOUNT_HIGH = 0.65      # 35% discount for high competition
+
+# Bottleneck bonus (for peers identified by liquidity_coordinator)
+BOTTLENECK_BONUS_MULTIPLIER = 1.5     # 50% bonus for bottleneck peers
+
 
 # =============================================================================
 # DATA CLASSES
@@ -133,6 +154,28 @@ class ChannelSizeResult:
     recommended_size_sats: int
     factors: Dict[str, Any]
     reasoning: str
+
+
+@dataclass
+class ExpansionRecommendation:
+    """
+    Recommendation for expanding capacity to a peer.
+
+    Can recommend either a new channel open or a splice to existing.
+    Integrates cooperation module data for smarter topology decisions.
+    """
+    target: str
+    recommendation_type: str  # "open_channel" | "splice_in" | "no_action"
+    score: float
+    reasoning: str
+    details: Dict[str, Any]
+
+    # Cooperation data
+    hive_coverage_pct: float      # % of hive members with channels
+    hive_members_count: int       # Count of members with channels
+    network_channels: int         # Peer's total channel count
+    is_bottleneck: bool           # From liquidity_coordinator
+    competition_level: str        # "low" | "medium" | "high" | "very_high"
 
 
 # =============================================================================
@@ -522,7 +565,9 @@ class Planner:
     """
 
     def __init__(self, state_manager, database, bridge, clboss_bridge, plugin=None,
-                 intent_manager=None, decision_engine=None):
+                 intent_manager=None, decision_engine=None,
+                 liquidity_coordinator=None, splice_coordinator=None,
+                 health_aggregator=None):
         """
         Initialize the Planner.
 
@@ -534,6 +579,9 @@ class Planner:
             plugin: Plugin reference for RPC and logging
             intent_manager: IntentManager for coordinated channel opens
             decision_engine: DecisionEngine for governance decisions (Phase 7)
+            liquidity_coordinator: LiquidityCoordinator for bottleneck detection (Phase 7)
+            splice_coordinator: SpliceCoordinator for splice recommendations (Phase 7)
+            health_aggregator: HealthScoreAggregator for fleet health (Phase 7)
         """
         self.state_manager = state_manager
         self.db = database
@@ -542,6 +590,11 @@ class Planner:
         self.plugin = plugin
         self.intent_manager = intent_manager
         self.decision_engine = decision_engine
+
+        # Cooperation modules (Phase 7) - can be set after init via setter
+        self.liquidity_coordinator = liquidity_coordinator
+        self.splice_coordinator = splice_coordinator
+        self.health_aggregator = health_aggregator
 
         # Quality scorer for peer evaluation (Phase 6.2)
         if PeerQualityScorer and database:
@@ -563,6 +616,249 @@ class Planner:
         """Log a message if plugin is available."""
         if self.plugin:
             self.plugin.log(f"[Planner] {msg}", level=level)
+
+    def set_cooperation_modules(
+        self,
+        liquidity_coordinator=None,
+        splice_coordinator=None,
+        health_aggregator=None
+    ) -> None:
+        """
+        Set cooperation modules after initialization.
+
+        This allows the planner to be initialized before the cooperation
+        modules are available, then linked later.
+
+        Args:
+            liquidity_coordinator: LiquidityCoordinator for bottleneck detection
+            splice_coordinator: SpliceCoordinator for splice recommendations
+            health_aggregator: HealthScoreAggregator for fleet health
+        """
+        if liquidity_coordinator is not None:
+            self.liquidity_coordinator = liquidity_coordinator
+        if splice_coordinator is not None:
+            self.splice_coordinator = splice_coordinator
+        if health_aggregator is not None:
+            self.health_aggregator = health_aggregator
+
+        self._log(
+            f"Cooperation modules set: liquidity={liquidity_coordinator is not None}, "
+            f"splice={splice_coordinator is not None}, "
+            f"health={health_aggregator is not None}",
+            level='debug'
+        )
+
+    # =========================================================================
+    # COOPERATION MODULE INTEGRATION (Phase 7)
+    # =========================================================================
+
+    def _count_hive_members_with_target(self, target: str) -> Tuple[int, int]:
+        """
+        Count how many distinct hive members have channels to a target.
+
+        Uses state_manager to check topology data from all hive members.
+        This helps determine hive coverage diversity - if most members
+        already have channels to a peer, opening another is less valuable.
+
+        Args:
+            target: Target node pubkey
+
+        Returns:
+            (members_with_channels, total_members)
+        """
+        if not self.state_manager:
+            return 0, 0
+
+        hive_members = self._get_hive_members()
+        if not hive_members:
+            return 0, 0
+
+        all_states_list = self.state_manager.get_all_peer_states()
+        all_states = {s.peer_id: s for s in all_states_list}
+
+        members_with_channel = 0
+        for member_pubkey in hive_members:
+            state = all_states.get(member_pubkey)
+            if not state:
+                continue
+
+            topology = getattr(state, 'topology', []) or []
+            if target in topology:
+                members_with_channel += 1
+
+        return members_with_channel, len(hive_members)
+
+    def _calculate_competition_score(self, target: str) -> Tuple[float, str]:
+        """
+        Calculate competition discount based on peer's channel count.
+
+        Peers with many channels (like Kraken with 500+) have high
+        competition for routing fees. Opening a channel to them
+        provides less marginal value than to smaller nodes.
+
+        Args:
+            target: Target node pubkey
+
+        Returns:
+            (discount_factor, competition_level)
+            - discount_factor: 0.5 to 1.0, multiplied against base score
+            - competition_level: "low", "medium", "high", or "very_high"
+        """
+        channel_count = self._get_target_channel_count(target)
+
+        if channel_count < LOW_COMPETITION_CHANNELS:
+            return COMPETITION_DISCOUNT_LOW, "low"
+        elif channel_count < MEDIUM_COMPETITION_CHANNELS:
+            return COMPETITION_DISCOUNT_MEDIUM, "medium"
+        elif channel_count < HIGH_COMPETITION_CHANNELS:
+            return COMPETITION_DISCOUNT_HIGH, "high"
+        else:
+            # Very high competition (>200 channels) - even bigger discount
+            return 0.50, "very_high"
+
+    def _is_bottleneck_peer(self, target: str) -> bool:
+        """
+        Check if peer is a common bottleneck identified by liquidity_coordinator.
+
+        Bottleneck peers are those that multiple hive members have liquidity
+        issues with (depleted or saturated channels). These are priority
+        targets for new capacity as they benefit multiple fleet members.
+
+        Args:
+            target: Target node pubkey
+
+        Returns:
+            True if peer is a bottleneck
+        """
+        if not self.liquidity_coordinator:
+            return False
+
+        try:
+            # Use the private method that returns bottleneck peers
+            bottlenecks = self.liquidity_coordinator._get_common_bottleneck_peers()
+            return target in bottlenecks
+        except Exception as e:
+            self._log(f"Error checking bottleneck status: {e}", level='debug')
+            return False
+
+    def get_expansion_recommendation(
+        self,
+        target: str,
+        cfg
+    ) -> ExpansionRecommendation:
+        """
+        Get comprehensive expansion recommendation for a target.
+
+        Integrates all cooperation modules to determine:
+        1. Should we expand at all?
+        2. If yes, open new channel or splice into existing?
+        3. What's the priority score?
+
+        This provides richer analysis than get_underserved_targets()
+        for individual peer evaluation.
+
+        Args:
+            target: Target node pubkey
+            cfg: Config snapshot
+
+        Returns:
+            ExpansionRecommendation with action and reasoning
+        """
+        # Gather cooperation module data
+        members_with, total_members = self._count_hive_members_with_target(target)
+        hive_coverage_pct = members_with / total_members if total_members > 0 else 0
+
+        network_channels = self._get_target_channel_count(target)
+        competition_factor, competition_level = self._calculate_competition_score(target)
+
+        is_bottleneck = self._is_bottleneck_peer(target)
+
+        # Check splice recommendations from splice_coordinator
+        splice_rec = None
+        if self.splice_coordinator and members_with > 0:
+            try:
+                splice_rec = self.splice_coordinator.get_splice_recommendations(target)
+            except Exception as e:
+                self._log(f"Error getting splice recommendations: {e}", level='debug')
+
+        # Calculate hive share using existing method
+        result = self._calculate_hive_share(target, cfg)
+
+        # Base score calculation (from existing logic)
+        public_capacity = self._get_public_capacity_to_target(target)
+        capacity_btc = public_capacity / 100_000_000
+        base_score = capacity_btc * (1 - result.hive_share_pct)
+
+        # Apply competition discount
+        adjusted_score = base_score * competition_factor
+
+        # Apply bottleneck bonus
+        if is_bottleneck:
+            adjusted_score *= BOTTLENECK_BONUS_MULTIPLIER
+
+        # DECISION LOGIC
+        reasoning_parts = []
+        recommendation_type = "open_channel"
+
+        # Check 1: Majority coverage - recommend splice instead of open
+        if hive_coverage_pct >= HIVE_COVERAGE_MAJORITY_PCT:
+            if splice_rec and splice_rec.get("has_fleet_coverage"):
+                recommendation_type = "splice_in"
+                adjusted_score *= 0.7  # Reduce priority vs. true gaps
+                reasoning_parts.append(
+                    f"{members_with}/{total_members} hive members already have channels; "
+                    f"recommend splice-in to existing channel"
+                )
+            else:
+                recommendation_type = "no_action"
+                adjusted_score = 0
+                reasoning_parts.append(
+                    f"{members_with}/{total_members} hive members already have channels; "
+                    f"sufficient coverage exists"
+                )
+
+        # Check 2: High competition - deprioritize
+        if competition_level in ["high", "very_high"]:
+            reasoning_parts.append(
+                f"Peer has {network_channels} channels (high competition); "
+                f"score reduced by {int((1-competition_factor)*100)}%"
+            )
+
+        # Check 3: Bottleneck bonus
+        if is_bottleneck:
+            reasoning_parts.append(
+                f"Peer is a common bottleneck for fleet liquidity; "
+                f"score boosted by 50%"
+            )
+
+        # Check 4: Underserved check
+        if result.hive_share_pct < UNDERSERVED_THRESHOLD_PCT:
+            reasoning_parts.append(
+                f"Hive share is {result.hive_share_pct:.1%} < {UNDERSERVED_THRESHOLD_PCT:.0%}; "
+                f"underserved target"
+            )
+
+        if not reasoning_parts:
+            reasoning_parts.append("Standard expansion candidate")
+
+        return ExpansionRecommendation(
+            target=target,
+            recommendation_type=recommendation_type,
+            score=adjusted_score,
+            reasoning="; ".join(reasoning_parts),
+            details={
+                "hive_share_pct": result.hive_share_pct,
+                "public_capacity_sats": public_capacity,
+                "base_score": base_score,
+                "competition_factor": competition_factor,
+                "bottleneck_bonus": BOTTLENECK_BONUS_MULTIPLIER if is_bottleneck else 1.0
+            },
+            hive_coverage_pct=hive_coverage_pct,
+            hive_members_count=members_with,
+            network_channels=network_channels,
+            is_bottleneck=is_bottleneck,
+            competition_level=competition_level
+        )
 
     # =========================================================================
     # NETWORK CACHE
@@ -1040,6 +1336,11 @@ class Planner:
         - Target exists in public graph (verified via network cache)
         - Quality score >= MIN_QUALITY_SCORE (Phase 6.2) or insufficient data
 
+        ENHANCED with cooperation module integration (Phase 7):
+        - Filters out targets where majority of hive has channels
+        - Applies competition discount for high-channel-count peers
+        - Boosts bottleneck peers identified by liquidity_coordinator
+
         Args:
             cfg: Config snapshot
             include_low_quality: If True, include targets with low quality scores
@@ -1061,6 +1362,19 @@ class Planner:
 
             # Check if underserved (< 5% Hive share)
             if result.hive_share_pct >= UNDERSERVED_THRESHOLD_PCT:
+                continue
+
+            # Phase 7: Check hive coverage diversity
+            members_with, total_members = self._count_hive_members_with_target(target)
+            hive_coverage_pct = members_with / total_members if total_members > 0 else 0
+
+            # Skip if majority already has channels (diminishing returns)
+            if hive_coverage_pct >= HIVE_COVERAGE_MAJORITY_PCT:
+                self._log(
+                    f"Skipping {target[:16]}... - {members_with}/{total_members} "
+                    f"hive members already have channels ({hive_coverage_pct:.0%})",
+                    level='debug'
+                )
                 continue
 
             # Phase 6.2: Get quality score for the target
@@ -1101,8 +1415,28 @@ class Planner:
             capacity_btc = public_capacity / 100_000_000
             base_score = capacity_btc * (1 - result.hive_share_pct)
 
+            # Phase 7: Apply competition discount
+            competition_factor, competition_level = self._calculate_competition_score(target)
+            adjusted_score = base_score * competition_factor
+
+            if competition_level in ["high", "very_high"]:
+                self._log(
+                    f"Discounting {target[:16]}... - high competition "
+                    f"({self._get_target_channel_count(target)} channels, -{int((1-competition_factor)*100)}%)",
+                    level='debug'
+                )
+
+            # Phase 7: Apply bottleneck bonus
+            is_bottleneck = self._is_bottleneck_peer(target)
+            if is_bottleneck:
+                adjusted_score *= BOTTLENECK_BONUS_MULTIPLIER
+                self._log(
+                    f"Boosting {target[:16]}... - bottleneck peer (+50%)",
+                    level='debug'
+                )
+
             # Phase 6.2: Factor in quality score
-            # Combined score = base_score * quality_multiplier
+            # Combined score = adjusted_score * quality_multiplier
             # Quality multiplier ranges from 0.5 (avoid) to 1.5 (excellent)
             if quality_confidence > 0.3:
                 # Quality data is meaningful - apply multiplier
@@ -1111,7 +1445,7 @@ class Planner:
                 # Low confidence - use neutral multiplier
                 quality_multiplier = 1.0
 
-            combined_score = base_score * quality_multiplier
+            combined_score = adjusted_score * quality_multiplier
 
             underserved.append(UnderservedResult(
                 target=target,

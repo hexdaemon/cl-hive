@@ -1386,6 +1386,105 @@ def planner_log(ctx: HiveContext, limit: int = 50) -> Dict[str, Any]:
     }
 
 
+def expansion_recommendations(ctx: HiveContext, limit: int = 10) -> Dict[str, Any]:
+    """
+    Get expansion recommendations with cooperation module intelligence.
+
+    Returns detailed recommendations integrating:
+    - Hive coverage diversity (% of members with channels)
+    - Network competition (peer channel count)
+    - Bottleneck detection (from liquidity_coordinator)
+    - Splice recommendations (from splice_coordinator)
+
+    Args:
+        limit: Maximum number of recommendations to return (default: 10)
+
+    Returns:
+        Dict with expansion recommendations and coverage summary.
+    """
+    if not ctx.planner:
+        return {"error": "Planner not initialized"}
+    if not ctx.config:
+        return {"error": "Config not initialized"}
+
+    # Take config snapshot
+    cfg = ctx.config.snapshot()
+
+    # Refresh network cache
+    ctx.planner._refresh_network_cache(force=True)
+
+    # Get underserved targets (already uses cooperation modules)
+    underserved = ctx.planner.get_underserved_targets(cfg)
+
+    # Bound limit
+    limit = min(max(1, limit), 50)
+    underserved = underserved[:limit]
+
+    # Build detailed recommendations
+    recommendations = []
+    coverage_stats = {
+        "well_covered_peers": 0,
+        "partially_covered_peers": 0,
+        "uncovered_peers": 0,
+        "bottleneck_peers": 0
+    }
+
+    for target_result in underserved:
+        # Get full expansion recommendation
+        rec = ctx.planner.get_expansion_recommendation(target_result.target, cfg)
+
+        # Update coverage stats
+        if rec.hive_coverage_pct >= 0.60:
+            coverage_stats["well_covered_peers"] += 1
+        elif rec.hive_coverage_pct >= 0.20:
+            coverage_stats["partially_covered_peers"] += 1
+        else:
+            coverage_stats["uncovered_peers"] += 1
+
+        if rec.is_bottleneck:
+            coverage_stats["bottleneck_peers"] += 1
+
+        # Get node alias if available
+        alias = target_result.target[:12] + "..."
+        try:
+            if ctx.safe_plugin:
+                node_info = ctx.safe_plugin.rpc.listnodes(id=target_result.target)
+                nodes = node_info.get("nodes", [])
+                if nodes and nodes[0].get("alias"):
+                    alias = nodes[0]["alias"]
+        except Exception:
+            pass
+
+        recommendations.append({
+            "target": target_result.target[:16] + "...",
+            "target_full": target_result.target,
+            "alias": alias,
+            "recommendation": rec.recommendation_type,
+            "score": round(rec.score, 4),
+            "hive_coverage": f"{rec.hive_members_count}/{ctx.planner._get_hive_members().__len__()} members ({rec.hive_coverage_pct:.0%})",
+            "hive_coverage_pct": round(rec.hive_coverage_pct * 100, 1),
+            "hive_members_count": rec.hive_members_count,
+            "competition_level": rec.competition_level,
+            "network_channels": rec.network_channels,
+            "is_bottleneck": rec.is_bottleneck,
+            "reasoning": rec.reasoning,
+            "details": rec.details,
+            "quality_score": round(target_result.quality_score, 3),
+            "quality_recommendation": target_result.quality_recommendation
+        })
+
+    return {
+        "recommendations": recommendations,
+        "count": len(recommendations),
+        "coverage_summary": coverage_stats,
+        "cooperation_modules": {
+            "liquidity_coordinator": ctx.planner.liquidity_coordinator is not None,
+            "splice_coordinator": ctx.planner.splice_coordinator is not None,
+            "health_aggregator": ctx.planner.health_aggregator is not None
+        }
+    }
+
+
 def intent_status(ctx: HiveContext) -> Dict[str, Any]:
     """
     Get current intent status (local and remote intents).

@@ -21,9 +21,14 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.planner import (
-    Planner, ChannelInfo, SaturationResult, RpcError,
+    Planner, ChannelInfo, SaturationResult, RpcError, ExpansionRecommendation,
     MAX_IGNORES_PER_CYCLE, SATURATION_RELEASE_THRESHOLD_PCT,
-    MIN_TARGET_CAPACITY_SATS, NETWORK_CACHE_TTL_SECONDS
+    MIN_TARGET_CAPACITY_SATS, NETWORK_CACHE_TTL_SECONDS,
+    # Cooperation module constants (Phase 7)
+    HIVE_COVERAGE_MAJORITY_PCT, LOW_COMPETITION_CHANNELS,
+    MEDIUM_COMPETITION_CHANNELS, HIGH_COMPETITION_CHANNELS,
+    COMPETITION_DISCOUNT_LOW, COMPETITION_DISCOUNT_MEDIUM,
+    COMPETITION_DISCOUNT_HIGH, BOTTLENECK_BONUS_MULTIPLIER
 )
 
 
@@ -1049,6 +1054,371 @@ class TestUnderservedTargets:
 
         # Should not find the target (too small)
         assert len(underserved) == 0
+
+
+# =============================================================================
+# COOPERATION MODULE INTEGRATION TESTS (Phase 7)
+# =============================================================================
+
+class TestCooperationModuleIntegration:
+    """Test cooperation module integration for smarter topology decisions."""
+
+    def test_count_hive_members_with_target_basic(self, planner, mock_database, mock_state_manager):
+        """Should count how many hive members have channels to a target."""
+        target = '02' + 't' * 64
+        member1 = '02' + 'a' * 64
+        member2 = '02' + 'b' * 64
+        member3 = '02' + 'c' * 64
+
+        # Setup 3 hive members
+        mock_database.get_all_members.return_value = [
+            {'peer_id': member1, 'tier': 'member'},
+            {'peer_id': member2, 'tier': 'member'},
+            {'peer_id': member3, 'tier': 'admin'}
+        ]
+
+        # Only 2 of them have the target in their topology
+        mock_state1 = MagicMock()
+        mock_state1.peer_id = member1
+        mock_state1.topology = [target, '02' + 'd' * 64]
+
+        mock_state2 = MagicMock()
+        mock_state2.peer_id = member2
+        mock_state2.topology = [target]
+
+        mock_state3 = MagicMock()
+        mock_state3.peer_id = member3
+        mock_state3.topology = ['02' + 'e' * 64]  # Different peer
+
+        mock_state_manager.get_all_peer_states.return_value = [
+            mock_state1, mock_state2, mock_state3
+        ]
+
+        members_with, total = planner._count_hive_members_with_target(target)
+
+        assert members_with == 2
+        assert total == 3
+
+    def test_count_hive_members_no_state_manager(self, planner, mock_database):
+        """Should return 0,0 if state_manager is not available."""
+        planner.state_manager = None
+        target = '02' + 't' * 64
+
+        members_with, total = planner._count_hive_members_with_target(target)
+
+        assert members_with == 0
+        assert total == 0
+
+    def test_competition_score_low(self, planner, mock_plugin):
+        """Low competition peers should get no discount."""
+        target = '02' + 'l' * 64
+
+        # Setup network cache with 20 channels (< LOW_COMPETITION_CHANNELS)
+        channels = []
+        for i in range(20):
+            channels.append({
+                'source': target,
+                'destination': f'02{i:064x}'[:66],
+                'short_channel_id': f'{100+i}x1x0',
+                'satoshis': 1000000,
+                'active': True
+            })
+        mock_plugin.rpc.listchannels.return_value = {'channels': channels}
+        planner._refresh_network_cache(force=True)
+
+        discount, level = planner._calculate_competition_score(target)
+
+        assert discount == COMPETITION_DISCOUNT_LOW
+        assert level == "low"
+
+    def test_competition_score_medium(self, planner, mock_plugin):
+        """Medium competition peers should get 15% discount."""
+        target = '02' + 'm' * 64
+
+        # Setup network cache with 50 channels
+        channels = []
+        for i in range(50):
+            channels.append({
+                'source': target,
+                'destination': f'02{i:064x}'[:66],
+                'short_channel_id': f'{100+i}x1x0',
+                'satoshis': 1000000,
+                'active': True
+            })
+        mock_plugin.rpc.listchannels.return_value = {'channels': channels}
+        planner._refresh_network_cache(force=True)
+
+        discount, level = planner._calculate_competition_score(target)
+
+        assert discount == COMPETITION_DISCOUNT_MEDIUM
+        assert level == "medium"
+
+    def test_competition_score_high(self, planner, mock_plugin):
+        """High competition peers should get 35% discount."""
+        target = '02' + 'h' * 64
+
+        # Setup network cache with 150 channels
+        channels = []
+        for i in range(150):
+            channels.append({
+                'source': target,
+                'destination': f'02{i:064x}'[:66],
+                'short_channel_id': f'{100+i}x1x0',
+                'satoshis': 1000000,
+                'active': True
+            })
+        mock_plugin.rpc.listchannels.return_value = {'channels': channels}
+        planner._refresh_network_cache(force=True)
+
+        discount, level = planner._calculate_competition_score(target)
+
+        assert discount == COMPETITION_DISCOUNT_HIGH
+        assert level == "high"
+
+    def test_competition_score_very_high(self, planner, mock_plugin):
+        """Very high competition peers should get 50% discount."""
+        target = '02' + 'v' * 64
+
+        # Setup network cache with 300 channels (> HIGH_COMPETITION_CHANNELS)
+        channels = []
+        for i in range(300):
+            channels.append({
+                'source': target,
+                'destination': f'02{i:064x}'[:66],
+                'short_channel_id': f'{100+i}x1x0',
+                'satoshis': 1000000,
+                'active': True
+            })
+        mock_plugin.rpc.listchannels.return_value = {'channels': channels}
+        planner._refresh_network_cache(force=True)
+
+        discount, level = planner._calculate_competition_score(target)
+
+        assert discount == 0.50
+        assert level == "very_high"
+
+    def test_bottleneck_peer_detection(self, planner):
+        """Should detect bottleneck peers from liquidity_coordinator."""
+        target = '02' + 'b' * 64
+
+        # Setup mock liquidity coordinator
+        mock_liq_coord = MagicMock()
+        mock_liq_coord._get_common_bottleneck_peers.return_value = [
+            target, '02' + 'x' * 64
+        ]
+        planner.liquidity_coordinator = mock_liq_coord
+
+        is_bottleneck = planner._is_bottleneck_peer(target)
+
+        assert is_bottleneck is True
+
+    def test_bottleneck_peer_not_in_list(self, planner):
+        """Should return False if peer is not in bottleneck list."""
+        target = '02' + 'n' * 64
+
+        # Setup mock liquidity coordinator with different bottlenecks
+        mock_liq_coord = MagicMock()
+        mock_liq_coord._get_common_bottleneck_peers.return_value = [
+            '02' + 'x' * 64, '02' + 'y' * 64
+        ]
+        planner.liquidity_coordinator = mock_liq_coord
+
+        is_bottleneck = planner._is_bottleneck_peer(target)
+
+        assert is_bottleneck is False
+
+    def test_bottleneck_peer_no_coordinator(self, planner):
+        """Should return False if liquidity_coordinator is not available."""
+        target = '02' + 'n' * 64
+        planner.liquidity_coordinator = None
+
+        is_bottleneck = planner._is_bottleneck_peer(target)
+
+        assert is_bottleneck is False
+
+    def test_majority_coverage_filters_targets(
+        self, planner, mock_config, mock_plugin, mock_database, mock_state_manager
+    ):
+        """Should filter out targets where majority of hive already has channels."""
+        target = '02' + 'f' * 64
+        member1 = '02' + 'a' * 64
+        member2 = '02' + 'b' * 64
+
+        # Setup 2 hive members, both with channels to target (100% coverage)
+        mock_database.get_all_members.return_value = [
+            {'peer_id': member1, 'tier': 'member'},
+            {'peer_id': member2, 'tier': 'member'}
+        ]
+
+        mock_state1 = MagicMock()
+        mock_state1.peer_id = member1
+        mock_state1.topology = [target]
+        mock_state1.capacity_sats = 5000000
+
+        mock_state2 = MagicMock()
+        mock_state2.peer_id = member2
+        mock_state2.topology = [target]
+        mock_state2.capacity_sats = 5000000
+
+        mock_state_manager.get_all_peer_states.return_value = [mock_state1, mock_state2]
+
+        # Setup network cache with target having >1 BTC capacity
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'd' * 64,
+                    'destination': target,
+                    'short_channel_id': '100x1x0',
+                    'satoshis': 200_000_000,  # 2 BTC
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        underserved = planner.get_underserved_targets(mock_config)
+
+        # Target should be filtered out due to majority coverage
+        target_results = [u for u in underserved if u.target == target]
+        assert len(target_results) == 0
+
+    def test_expansion_recommendation_open_channel(
+        self, planner, mock_config, mock_plugin, mock_database, mock_state_manager
+    ):
+        """Should recommend open_channel for targets with low hive coverage."""
+        target = '02' + 'o' * 64
+        member1 = '02' + 'a' * 64
+
+        # Setup 3 hive members, only 1 with channel to target (33% coverage)
+        mock_database.get_all_members.return_value = [
+            {'peer_id': member1, 'tier': 'member'},
+            {'peer_id': '02' + 'b' * 64, 'tier': 'member'},
+            {'peer_id': '02' + 'c' * 64, 'tier': 'member'}
+        ]
+
+        mock_state1 = MagicMock()
+        mock_state1.peer_id = member1
+        mock_state1.topology = [target]
+        mock_state1.capacity_sats = 5000000
+
+        mock_state_manager.get_all_peer_states.return_value = [mock_state1]
+
+        # Setup network cache
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'd' * 64,
+                    'destination': target,
+                    'short_channel_id': '100x1x0',
+                    'satoshis': 200_000_000,
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        rec = planner.get_expansion_recommendation(target, mock_config)
+
+        assert rec.recommendation_type == "open_channel"
+        assert rec.hive_coverage_pct < HIVE_COVERAGE_MAJORITY_PCT
+
+    def test_expansion_recommendation_no_action_majority_coverage(
+        self, planner, mock_config, mock_plugin, mock_database, mock_state_manager
+    ):
+        """Should recommend no_action when majority has channels."""
+        target = '02' + 'n' * 64
+        member1 = '02' + 'a' * 64
+        member2 = '02' + 'b' * 64
+
+        # Setup 2 hive members, both with channels (100% > 50%)
+        mock_database.get_all_members.return_value = [
+            {'peer_id': member1, 'tier': 'member'},
+            {'peer_id': member2, 'tier': 'member'}
+        ]
+
+        mock_state1 = MagicMock()
+        mock_state1.peer_id = member1
+        mock_state1.topology = [target]
+        mock_state1.capacity_sats = 5000000
+
+        mock_state2 = MagicMock()
+        mock_state2.peer_id = member2
+        mock_state2.topology = [target]
+        mock_state2.capacity_sats = 5000000
+
+        mock_state_manager.get_all_peer_states.return_value = [mock_state1, mock_state2]
+
+        # Setup network cache
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'd' * 64,
+                    'destination': target,
+                    'short_channel_id': '100x1x0',
+                    'satoshis': 200_000_000,
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        rec = planner.get_expansion_recommendation(target, mock_config)
+
+        assert rec.recommendation_type == "no_action"
+        assert rec.hive_coverage_pct >= HIVE_COVERAGE_MAJORITY_PCT
+
+    def test_expansion_recommendation_bottleneck_bonus(
+        self, planner, mock_config, mock_plugin, mock_database, mock_state_manager
+    ):
+        """Bottleneck peers should get score boost."""
+        target = '02' + 'b' * 64
+
+        # Setup hive with no members having channels to target
+        mock_database.get_all_members.return_value = [
+            {'peer_id': '02' + 'a' * 64, 'tier': 'member'}
+        ]
+        mock_state_manager.get_all_peer_states.return_value = []
+
+        # Setup network cache
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'd' * 64,
+                    'destination': target,
+                    'short_channel_id': '100x1x0',
+                    'satoshis': 200_000_000,
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        # Setup mock liquidity coordinator with bottleneck
+        mock_liq_coord = MagicMock()
+        mock_liq_coord._get_common_bottleneck_peers.return_value = [target]
+        planner.liquidity_coordinator = mock_liq_coord
+
+        rec = planner.get_expansion_recommendation(target, mock_config)
+
+        assert rec.is_bottleneck is True
+        assert "bottleneck" in rec.reasoning.lower()
+        assert rec.details['bottleneck_bonus'] == BOTTLENECK_BONUS_MULTIPLIER
+
+    def test_set_cooperation_modules(self, planner):
+        """Should set cooperation modules via setter."""
+        mock_liq = MagicMock()
+        mock_splice = MagicMock()
+        mock_health = MagicMock()
+
+        planner.set_cooperation_modules(
+            liquidity_coordinator=mock_liq,
+            splice_coordinator=mock_splice,
+            health_aggregator=mock_health
+        )
+
+        assert planner.liquidity_coordinator == mock_liq
+        assert planner.splice_coordinator == mock_splice
+        assert planner.health_aggregator == mock_health
 
 
 if __name__ == "__main__":

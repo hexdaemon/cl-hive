@@ -1442,20 +1442,38 @@ async def handle_set_fees(args: Dict) -> Dict:
 
 
 async def handle_topology_analysis(args: Dict) -> Dict:
-    """Get topology analysis from planner log and topology view."""
+    """
+    Get topology analysis from planner log and topology view.
+
+    Enhanced with cooperation module data (Phase 7):
+    - Expansion recommendations with hive coverage diversity
+    - Network competition analysis
+    - Bottleneck peer identification
+    - Coverage summary
+    """
     node_name = args.get("node")
 
     node = fleet.get_node(node_name)
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Get both planner log and topology info
+    # Get planner log, topology info, and expansion recommendations
     planner_log = await node.call("hive-planner-log", {"limit": 10})
     topology = await node.call("hive-topology")
 
+    # Get expansion recommendations with cooperation module intelligence
+    try:
+        expansion_recs = await node.call("hive-expansion-recommendations", {"limit": 10})
+    except Exception as e:
+        # Graceful fallback if RPC not available
+        expansion_recs = {"error": str(e), "recommendations": []}
+
     return {
         "planner_log": planner_log,
-        "topology": topology
+        "topology": topology,
+        "expansion_recommendations": expansion_recs.get("recommendations", []),
+        "coverage_summary": expansion_recs.get("coverage_summary", {}),
+        "cooperation_modules": expansion_recs.get("cooperation_modules", {})
     }
 
 
