@@ -37,6 +37,8 @@ class HiveContext:
     coop_expansion_mgr: Any = None  # CooperativeExpansionManager
     contribution_mgr: Any = None  # ContributionManager
     routing_pool: Any = None  # RoutingPool (Phase 0 - Collective Economics)
+    yield_metrics_mgr: Any = None  # YieldMetricsManager (Phase 1 - Metrics)
+    liquidity_coordinator: Any = None  # LiquidityCoordinator (for competition detection)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
 
@@ -1821,3 +1823,162 @@ def pool_record_revenue(ctx: HiveContext, amount_sats: int, channel_id: str = No
         }
     except Exception as e:
         return {"error": f"Failed to record revenue: {e}"}
+
+
+# =============================================================================
+# YIELD METRICS COMMANDS (Phase 1 - Metrics & Measurement)
+# =============================================================================
+
+def yield_metrics(ctx: HiveContext, channel_id: str = None,
+                  period_days: int = 30) -> Dict[str, Any]:
+    """
+    Get yield metrics for channels.
+
+    Shows ROI, capital efficiency, turn rate, and flow characteristics.
+
+    Args:
+        ctx: HiveContext
+        channel_id: Optional specific channel (None for all)
+        period_days: Analysis period in days (default: 30)
+
+    Returns:
+        Dict with channel yield metrics.
+    """
+    if not ctx.yield_metrics_mgr:
+        return {"error": "Yield metrics manager not initialized"}
+
+    try:
+        metrics = ctx.yield_metrics_mgr.get_channel_yield_metrics(
+            channel_id=channel_id,
+            period_days=period_days
+        )
+
+        return {
+            "status": "ok",
+            "period_days": period_days,
+            "channel_count": len(metrics),
+            "channels": [m.to_dict() for m in metrics]
+        }
+    except Exception as e:
+        return {"error": f"Failed to get yield metrics: {e}"}
+
+
+def yield_summary(ctx: HiveContext, period_days: int = 30) -> Dict[str, Any]:
+    """
+    Get aggregated yield summary for the fleet.
+
+    Shows total revenue, ROI, and channel health distribution.
+
+    Args:
+        ctx: HiveContext
+        period_days: Analysis period in days (default: 30)
+
+    Returns:
+        Dict with fleet yield summary.
+    """
+    if not ctx.yield_metrics_mgr:
+        return {"error": "Yield metrics manager not initialized"}
+
+    try:
+        summary = ctx.yield_metrics_mgr.get_fleet_yield_summary(
+            period_days=period_days
+        )
+
+        return {
+            "status": "ok",
+            **summary.to_dict()
+        }
+    except Exception as e:
+        return {"error": f"Failed to get yield summary: {e}"}
+
+
+def velocity_prediction(ctx: HiveContext, channel_id: str,
+                        hours: int = 24) -> Dict[str, Any]:
+    """
+    Predict channel balance at future time based on flow velocity.
+
+    Shows depletion/saturation risk and recommended actions.
+
+    Args:
+        ctx: HiveContext
+        channel_id: Channel to predict
+        hours: Hours into the future to predict (default: 24)
+
+    Returns:
+        Dict with velocity prediction.
+    """
+    if not ctx.yield_metrics_mgr:
+        return {"error": "Yield metrics manager not initialized"}
+
+    if not channel_id:
+        return {"error": "channel_id is required"}
+
+    try:
+        prediction = ctx.yield_metrics_mgr.predict_channel_state(
+            channel_id=channel_id,
+            hours=hours
+        )
+
+        if not prediction:
+            return {"error": "Insufficient data for prediction"}
+
+        return {
+            "status": "ok",
+            **prediction.to_dict()
+        }
+    except Exception as e:
+        return {"error": f"Failed to predict channel state: {e}"}
+
+
+def critical_velocity_channels(ctx: HiveContext,
+                               threshold_hours: int = 24) -> Dict[str, Any]:
+    """
+    Get channels with critical velocity (depleting/filling rapidly).
+
+    These channels need urgent attention (fee changes or rebalancing).
+
+    Args:
+        ctx: HiveContext
+        threshold_hours: Alert if depletion/saturation within this time
+
+    Returns:
+        Dict with critical velocity channels.
+    """
+    if not ctx.yield_metrics_mgr:
+        return {"error": "Yield metrics manager not initialized"}
+
+    try:
+        critical = ctx.yield_metrics_mgr.get_critical_velocity_channels(
+            threshold_hours=threshold_hours
+        )
+
+        return {
+            "status": "ok",
+            "threshold_hours": threshold_hours,
+            "critical_count": len(critical),
+            "channels": [p.to_dict() for p in critical]
+        }
+    except Exception as e:
+        return {"error": f"Failed to get critical velocity channels: {e}"}
+
+
+def internal_competition(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Detect internal competition between fleet members.
+
+    Shows routes where multiple members compete, causing fee undercutting.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with internal competition analysis.
+    """
+    if not ctx.liquidity_coordinator:
+        return {"error": "Liquidity coordinator not initialized"}
+
+    try:
+        summary = ctx.liquidity_coordinator.get_internal_competition_summary()
+        return summary
+    except Exception as e:
+        return {"error": f"Failed to detect internal competition: {e}"}

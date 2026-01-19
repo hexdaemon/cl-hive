@@ -82,6 +82,7 @@ from modules.health_aggregator import HealthScoreAggregator, HealthTier
 from modules.routing_intelligence import HiveRoutingMap
 from modules.peer_reputation import PeerReputationManager
 from modules.routing_pool import RoutingPool
+from modules.yield_metrics import YieldMetricsManager
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -113,6 +114,12 @@ from modules.rpc_commands import (
     pool_distribution as rpc_pool_distribution,
     pool_settle as rpc_pool_settle,
     pool_record_revenue as rpc_pool_record_revenue,
+    # Phase 1: Yield Metrics & Measurement
+    yield_metrics as rpc_yield_metrics,
+    yield_summary as rpc_yield_summary,
+    velocity_prediction as rpc_velocity_prediction,
+    critical_velocity_channels as rpc_critical_velocity_channels,
+    internal_competition as rpc_internal_competition,
 )
 
 # Initialize the plugin
@@ -253,6 +260,8 @@ liquidity_coord: Optional[LiquidityCoordinator] = None
 splice_coord: Optional[SpliceCoordinator] = None
 routing_map: Optional[HiveRoutingMap] = None
 peer_reputation_mgr: Optional[PeerReputationManager] = None
+routing_pool: Optional[RoutingPool] = None
+yield_metrics_mgr: Optional[YieldMetricsManager] = None
 our_pubkey: Optional[str] = None
 
 
@@ -437,6 +446,8 @@ def _get_hive_context() -> HiveContext:
     _coop_expansion = coop_expansion if 'coop_expansion' in globals() else None
     _contribution_mgr = contribution_mgr if 'contribution_mgr' in globals() else None
     _routing_pool = routing_pool if 'routing_pool' in globals() else None
+    _yield_metrics_mgr = yield_metrics_mgr if 'yield_metrics_mgr' in globals() else None
+    _liquidity_coord = liquidity_coord if 'liquidity_coord' in globals() else None
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -456,6 +467,8 @@ def _get_hive_context() -> HiveContext:
         coop_expansion_mgr=_coop_expansion,
         contribution_mgr=_contribution_mgr,
         routing_pool=_routing_pool,
+        yield_metrics_mgr=_yield_metrics_mgr,
+        liquidity_coordinator=_liquidity_coord,
         log=_log,
     )
 
@@ -1028,7 +1041,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database=database,
         plugin=safe_plugin,
         our_pubkey=our_pubkey,
-        fee_intel_mgr=fee_intel_mgr
+        fee_intel_mgr=fee_intel_mgr,
+        state_manager=state_manager
     )
     plugin.log("cl-hive: Liquidity coordinator initialized")
 
@@ -1081,6 +1095,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     routing_pool.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Routing pool initialized (collective economics)")
+
+    # Initialize Yield Metrics Manager (Phase 1 - Metrics & Measurement)
+    global yield_metrics_mgr
+    yield_metrics_mgr = YieldMetricsManager(
+        database=database,
+        plugin=safe_plugin,
+        state_manager=state_manager
+    )
+    yield_metrics_mgr.set_our_pubkey(our_pubkey)
+    plugin.log("cl-hive: Yield metrics manager initialized (Phase 1)")
 
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
@@ -7847,6 +7871,80 @@ def hive_pool_record_revenue(plugin: Plugin, amount_sats: int,
         channel_id=channel_id,
         payment_hash=payment_hash
     )
+
+
+# =============================================================================
+# YIELD METRICS RPC METHODS (Phase 1 - Metrics & Measurement)
+# =============================================================================
+
+@plugin.method("hive-yield-metrics")
+def hive_yield_metrics(plugin: Plugin, channel_id: str = None, period_days: int = 30):
+    """
+    Get yield metrics for channels.
+
+    Args:
+        channel_id: Optional specific channel ID (defaults to all channels)
+        period_days: Analysis period in days (default: 30)
+
+    Returns:
+        Dict with channel yield metrics including ROI, capital efficiency, turn rate.
+    """
+    return rpc_yield_metrics(_get_hive_context(), channel_id=channel_id, period_days=period_days)
+
+
+@plugin.method("hive-yield-summary")
+def hive_yield_summary(plugin: Plugin, period_days: int = 30):
+    """
+    Get fleet-wide yield summary.
+
+    Args:
+        period_days: Analysis period in days (default: 30)
+
+    Returns:
+        Dict with fleet yield summary including total revenue, avg ROI, efficiency.
+    """
+    return rpc_yield_summary(_get_hive_context(), period_days=period_days)
+
+
+@plugin.method("hive-velocity-prediction")
+def hive_velocity_prediction(plugin: Plugin, channel_id: str, hours: int = 24):
+    """
+    Predict channel state based on flow velocity.
+
+    Args:
+        channel_id: Channel ID to predict
+        hours: Prediction horizon in hours (default: 24)
+
+    Returns:
+        Dict with velocity prediction including depletion/saturation risk.
+    """
+    return rpc_velocity_prediction(_get_hive_context(), channel_id=channel_id, hours=hours)
+
+
+@plugin.method("hive-critical-velocity")
+def hive_critical_velocity(plugin: Plugin, threshold_hours: int = 24):
+    """
+    Get channels with critical velocity (depleting/filling rapidly).
+
+    Args:
+        threshold_hours: Alert threshold in hours (default: 24)
+
+    Returns:
+        Dict with channels predicted to deplete or saturate within threshold.
+    """
+    return rpc_critical_velocity_channels(_get_hive_context(), threshold_hours=threshold_hours)
+
+
+@plugin.method("hive-internal-competition")
+def hive_internal_competition(plugin: Plugin):
+    """
+    Detect internal competition between hive members.
+
+    Returns:
+        Dict with competition instances where multiple hive members
+        compete for the same source/destination routes.
+    """
+    return rpc_internal_competition(_get_hive_context())
 
 
 @plugin.method("hive-request-promotion")

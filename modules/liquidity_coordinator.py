@@ -84,7 +84,8 @@ class LiquidityCoordinator:
         database: Any,
         plugin: Any,
         our_pubkey: str,
-        fee_intel_mgr: Any = None
+        fee_intel_mgr: Any = None,
+        state_manager: Any = None
     ):
         """
         Initialize the liquidity coordinator.
@@ -94,11 +95,13 @@ class LiquidityCoordinator:
             plugin: Plugin instance for RPC/logging
             our_pubkey: Our node's pubkey
             fee_intel_mgr: FeeIntelligenceManager for health data
+            state_manager: StateManager for member topology (Phase 1)
         """
         self.database = database
         self.plugin = plugin
         self.our_pubkey = our_pubkey
         self.fee_intel_mgr = fee_intel_mgr
+        self.state_manager = state_manager
 
         # In-memory tracking
         self._liquidity_needs: Dict[str, LiquidityNeed] = {}  # reporter_id -> need
@@ -786,3 +789,274 @@ class LiquidityCoordinator:
                 }
 
         return {"conflict": False}
+
+    # =========================================================================
+    # Internal Competition Detection (Phase 1 - Yield Optimization)
+    # =========================================================================
+
+    def detect_internal_competition(self) -> List[Dict[str, Any]]:
+        """
+        Detect when fleet members compete for the same routes.
+
+        Internal competition occurs when multiple members have channels
+        to the same (source, destination) pair. This leads to:
+        - Fee undercutting between members
+        - Wasted capacity
+        - Lower overall fleet yield
+
+        Returns:
+            List of competition instances with recommendations
+        """
+        if not self.database:
+            return []
+
+        # Get all hive members and their topologies
+        members = self.database.get_all_members()
+        if len(members) < 2:
+            return []
+
+        member_ids = {m.get("peer_id") for m in members}
+
+        # Build topology map: peer_id -> set of connected peers
+        member_topologies: Dict[str, set] = {}
+
+        for member in members:
+            member_id = member.get("peer_id")
+            if not member_id:
+                continue
+
+            # Get member's topology from state manager
+            topology = set()
+            if self.state_manager:
+                state = self.state_manager.get_peer_state(member_id)
+                if state and hasattr(state, 'topology'):
+                    topology = set(state.topology or [])
+
+            # Also check local channels if this is us
+            if member_id == self.our_pubkey:
+                try:
+                    channels = self.plugin.rpc.listpeerchannels()
+                    for ch in channels.get("channels", []):
+                        if ch.get("state") == "CHANNELD_NORMAL":
+                            peer_id = ch.get("peer_id")
+                            if peer_id and peer_id not in member_ids:
+                                topology.add(peer_id)
+                except Exception:
+                    pass
+
+            member_topologies[member_id] = topology
+
+        # Find overlapping peers (peers connected to 2+ members)
+        peer_to_members: Dict[str, List[str]] = defaultdict(list)
+
+        for member_id, topology in member_topologies.items():
+            for peer_id in topology:
+                if peer_id not in member_ids:  # External peer
+                    peer_to_members[peer_id].append(member_id)
+
+        # Identify competition: peers connected to multiple members
+        competitions = []
+
+        # For each pair of external peers, check if multiple members
+        # can route between them (source -> member -> destination)
+        external_peers = list(peer_to_members.keys())
+
+        for i, source_peer in enumerate(external_peers):
+            source_members = set(peer_to_members[source_peer])
+            if len(source_members) < 2:
+                continue
+
+            for dest_peer in external_peers[i+1:]:
+                if dest_peer == source_peer:
+                    continue
+
+                dest_members = set(peer_to_members[dest_peer])
+                if len(dest_members) < 2:
+                    continue
+
+                # Members that can route source -> dest
+                competing_members = list(source_members & dest_members)
+
+                if len(competing_members) >= 2:
+                    # Get peer aliases if possible
+                    source_alias = self._get_peer_alias(source_peer)
+                    dest_alias = self._get_peer_alias(dest_peer)
+
+                    # Estimate capacity
+                    total_capacity = self._estimate_route_capacity(
+                        competing_members, source_peer, dest_peer
+                    )
+
+                    # Determine recommended primary (member with best position)
+                    recommended_primary = self._select_primary_member(
+                        competing_members, source_peer, dest_peer
+                    )
+
+                    # Estimate fee loss from competition
+                    fee_loss_pct = self._estimate_competition_fee_loss(
+                        len(competing_members)
+                    )
+
+                    competitions.append({
+                        "source_peer_id": source_peer,
+                        "destination_peer_id": dest_peer,
+                        "source_alias": source_alias,
+                        "destination_alias": dest_alias,
+                        "competing_members": competing_members,
+                        "member_count": len(competing_members),
+                        "total_fleet_capacity_sats": total_capacity,
+                        "estimated_fee_loss_pct": fee_loss_pct,
+                        "recommendation": "coordinate_fees",
+                        "recommended_primary": recommended_primary
+                    })
+
+        # Sort by number of competing members (most competition first)
+        competitions.sort(key=lambda c: c["member_count"], reverse=True)
+
+        # Limit results
+        return competitions[:50]
+
+    def _get_peer_alias(self, peer_id: str) -> Optional[str]:
+        """Get peer alias from node list."""
+        try:
+            nodes = self.plugin.rpc.listnodes(id=peer_id)
+            if nodes.get("nodes"):
+                return nodes["nodes"][0].get("alias")
+        except Exception:
+            pass
+        return None
+
+    def _estimate_route_capacity(
+        self,
+        members: List[str],
+        source_peer: str,
+        dest_peer: str
+    ) -> int:
+        """Estimate total fleet capacity on a route."""
+        total = 0
+
+        for member_id in members:
+            if member_id == self.our_pubkey:
+                # Get our capacity to these peers
+                try:
+                    for peer in [source_peer, dest_peer]:
+                        channels = self.plugin.rpc.listpeerchannels(id=peer)
+                        for ch in channels.get("channels", []):
+                            if ch.get("state") == "CHANNELD_NORMAL":
+                                total += ch.get("total_msat", 0) // 1000
+                except Exception:
+                    pass
+            else:
+                # Estimate from state manager
+                if self.state_manager:
+                    state = self.state_manager.get_peer_state(member_id)
+                    if state and hasattr(state, 'capacity_sats'):
+                        # Rough estimate: assume average channel size
+                        total += state.capacity_sats // 10  # Rough per-channel estimate
+
+        return total
+
+    def _select_primary_member(
+        self,
+        members: List[str],
+        source_peer: str,
+        dest_peer: str
+    ) -> Optional[str]:
+        """
+        Select the member who should be primary for a route.
+
+        Criteria:
+        - Most capacity to source/dest
+        - Best balance (can actually route)
+        - Highest uptime
+        """
+        best_member = None
+        best_score = 0
+
+        for member_id in members:
+            score = 0
+
+            if member_id == self.our_pubkey:
+                # Calculate our score based on actual channel data
+                try:
+                    for peer in [source_peer, dest_peer]:
+                        channels = self.plugin.rpc.listpeerchannels(id=peer)
+                        for ch in channels.get("channels", []):
+                            if ch.get("state") == "CHANNELD_NORMAL":
+                                capacity = ch.get("total_msat", 0) // 1000
+                                local = ch.get("to_us_msat", 0) // 1000
+                                # Score: capacity + balance score
+                                balance_pct = local / capacity if capacity > 0 else 0.5
+                                balance_score = 1.0 - abs(0.5 - balance_pct) * 2
+                                score += capacity * balance_score / 1_000_000
+                except Exception:
+                    pass
+            else:
+                # Score from state manager
+                if self.state_manager:
+                    state = self.state_manager.get_peer_state(member_id)
+                    if state:
+                        # Use capacity and uptime as proxies
+                        capacity = getattr(state, 'capacity_sats', 0)
+                        score = capacity / 10_000_000  # Normalize
+
+            if score > best_score:
+                best_score = score
+                best_member = member_id
+
+        return best_member
+
+    def _estimate_competition_fee_loss(self, num_competitors: int) -> float:
+        """
+        Estimate fee loss percentage due to competition.
+
+        More competitors = more undercutting = lower fees.
+        """
+        if num_competitors <= 1:
+            return 0.0
+
+        # Simple model: each additional competitor reduces fees by ~15%
+        # 2 competitors: 15% loss
+        # 3 competitors: 27% loss
+        # 4+ competitors: 35-40% loss
+        loss_per_competitor = 0.15
+        max_loss = 0.40
+
+        loss = (num_competitors - 1) * loss_per_competitor
+        return min(loss, max_loss) * 100  # Return as percentage
+
+    def get_internal_competition_summary(self) -> Dict[str, Any]:
+        """
+        Get summary of internal competition in the fleet.
+
+        Returns:
+            Summary with statistics and recommendations
+        """
+        competitions = self.detect_internal_competition()
+
+        if not competitions:
+            return {
+                "status": "ok",
+                "competition_count": 0,
+                "message": "No internal competition detected",
+                "competitions": []
+            }
+
+        # Calculate totals
+        total_capacity_at_risk = sum(c["total_fleet_capacity_sats"] for c in competitions)
+        avg_fee_loss = sum(c["estimated_fee_loss_pct"] for c in competitions) / len(competitions)
+
+        # Count by severity
+        high_competition = len([c for c in competitions if c["member_count"] >= 3])
+        medium_competition = len([c for c in competitions if c["member_count"] == 2])
+
+        return {
+            "status": "warning" if competitions else "ok",
+            "competition_count": len(competitions),
+            "high_competition_routes": high_competition,
+            "medium_competition_routes": medium_competition,
+            "total_capacity_at_risk_sats": total_capacity_at_risk,
+            "avg_estimated_fee_loss_pct": round(avg_fee_loss, 1),
+            "recommendation": "Implement coordinated fee strategy to eliminate undercutting",
+            "competitions": competitions[:10]  # Top 10 for display
+        }

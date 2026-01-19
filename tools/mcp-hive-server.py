@@ -1237,6 +1237,103 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 },
                 "required": ["node"]
             }
+        ),
+        # =======================================================================
+        # Phase 1: Yield Metrics Tools
+        # =======================================================================
+        Tool(
+            name="yield_metrics",
+            description="Get yield metrics for channels including ROI, capital efficiency, turn rate, and flow intensity. Use to identify which channels are performing well.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Specific channel ID (optional, omit for all channels)"
+                    },
+                    "period_days": {
+                        "type": "integer",
+                        "description": "Analysis period in days (default: 30)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="yield_summary",
+            description="Get fleet-wide yield summary including total revenue, average ROI, capital efficiency, and channel health distribution.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "period_days": {
+                        "type": "integer",
+                        "description": "Analysis period in days (default: 30)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="velocity_prediction",
+            description="Predict channel state based on flow velocity. Shows depletion/saturation risk and recommended actions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID to predict"
+                    },
+                    "hours": {
+                        "type": "integer",
+                        "description": "Prediction horizon in hours (default: 24)"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="critical_velocity",
+            description="Get channels with critical velocity - those depleting or filling rapidly. Returns channels predicted to deplete or saturate within threshold.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "threshold_hours": {
+                        "type": "integer",
+                        "description": "Alert threshold in hours (default: 24)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="internal_competition",
+            description="Detect internal competition between hive members. Shows where multiple members compete for the same source/destination routes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
         )
     ]
 
@@ -1343,6 +1440,17 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_pool_snapshot(arguments)
         elif name == "pool_settle":
             result = await handle_pool_settle(arguments)
+        # Phase 1: Yield Metrics tools
+        elif name == "yield_metrics":
+            result = await handle_yield_metrics(arguments)
+        elif name == "yield_summary":
+            result = await handle_yield_summary(arguments)
+        elif name == "velocity_prediction":
+            result = await handle_velocity_prediction(arguments)
+        elif name == "critical_velocity":
+            result = await handle_critical_velocity(arguments)
+        elif name == "internal_competition":
+            result = await handle_internal_competition(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -3165,6 +3273,83 @@ async def handle_pool_settle(args: Dict) -> Dict:
         params["period"] = period
 
     return await node.call("hive-pool-settle", params)
+
+
+# =============================================================================
+# Phase 1: Yield Metrics Handlers
+# =============================================================================
+
+async def handle_yield_metrics(args: Dict) -> Dict:
+    """Get yield metrics for channels."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    period_days = args.get("period_days", 30)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {"period_days": period_days}
+    if channel_id:
+        params["channel_id"] = channel_id
+
+    return await node.call("hive-yield-metrics", params)
+
+
+async def handle_yield_summary(args: Dict) -> Dict:
+    """Get fleet-wide yield summary."""
+    node_name = args.get("node")
+    period_days = args.get("period_days", 30)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-yield-summary", {"period_days": period_days})
+
+
+async def handle_velocity_prediction(args: Dict) -> Dict:
+    """Predict channel state based on flow velocity."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    hours = args.get("hours", 24)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if not channel_id:
+        return {"error": "channel_id is required"}
+
+    return await node.call("hive-velocity-prediction", {
+        "channel_id": channel_id,
+        "hours": hours
+    })
+
+
+async def handle_critical_velocity(args: Dict) -> Dict:
+    """Get channels with critical velocity."""
+    node_name = args.get("node")
+    threshold_hours = args.get("threshold_hours", 24)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-critical-velocity", {
+        "threshold_hours": threshold_hours
+    })
+
+
+async def handle_internal_competition(args: Dict) -> Dict:
+    """Detect internal competition between hive members."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-internal-competition", {})
 
 
 # =============================================================================

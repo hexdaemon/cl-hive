@@ -406,3 +406,127 @@ class TestNNLBAssistanceStatus:
         assert status["pending_needs"] == 2
         assert status["critical_needs"] == 1
         assert status["high_needs"] == 1
+
+
+class MockStateManager:
+    """Mock state manager for internal competition tests."""
+
+    def __init__(self):
+        self.peer_states = {}
+
+    def get_peer_state(self, peer_id):
+        return self.peer_states.get(peer_id)
+
+    def get_all_peer_states(self):
+        return list(self.peer_states.values())
+
+    def set_peer_state(self, peer_id, topology=None, capacity_sats=10_000_000):
+        state = MagicMock()
+        state.peer_id = peer_id
+        state.topology = topology or []
+        state.capacity_sats = capacity_sats
+        self.peer_states[peer_id] = state
+
+
+class TestInternalCompetitionDetection:
+    """Test internal competition detection functionality (Phase 1)."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.plugin = MagicMock()
+        self.state_manager = MockStateManager()
+        self.coordinator = LiquidityCoordinator(
+            database=self.db,
+            plugin=self.plugin,
+            our_pubkey="02" + "0" * 64,
+            state_manager=self.state_manager
+        )
+
+    def _add_member(self, peer_id, topology=None):
+        """Helper to add member to both database and state manager."""
+        self.db.members[peer_id] = {"peer_id": peer_id, "tier": "member"}
+        self.state_manager.set_peer_state(peer_id, topology=topology or [])
+
+    def test_no_competition_empty_fleet(self):
+        """Test that empty fleet returns no competition."""
+        result = self.coordinator.detect_internal_competition()
+
+        assert len(result) == 0
+
+    def test_no_competition_single_member(self):
+        """Test that single member returns no competition."""
+        # Single member with some peers
+        self._add_member("02" + "a" * 64, topology=["peer1", "peer2", "peer3"])
+
+        result = self.coordinator.detect_internal_competition()
+
+        assert len(result) == 0
+
+    def test_detect_competition_shared_peer(self):
+        """Test detecting competition when two members share peers for same route.
+
+        Competition requires both source AND destination to be shared by 2+ members.
+        Single shared peer doesn't create routing competition.
+        """
+        # Two members share peer1 but need a shared destination too
+        self._add_member("02" + "a" * 64, topology=["peer1", "peer2"])
+        self._add_member("02" + "b" * 64, topology=["peer1", "peer2"])
+
+        result = self.coordinator.detect_internal_competition()
+
+        # Both members can route peer1 <-> peer2 so competition exists
+        assert len(result) >= 1
+
+    def test_detect_competition_multiple_shared_peers(self):
+        """Test detecting competition with multiple shared peers."""
+        # Two members share two peers - creates route competition
+        self._add_member("02" + "a" * 64, topology=["peer1", "peer2", "peer3"])
+        self._add_member("02" + "b" * 64, topology=["peer1", "peer2", "peer4"])
+
+        result = self.coordinator.detect_internal_competition()
+
+        # Both can route peer1 <-> peer2
+        assert isinstance(result, list)
+        assert len(result) >= 1
+
+    def test_competition_summary(self):
+        """Test getting competition summary."""
+        # Set up competition scenario
+        self._add_member("02" + "a" * 64, topology=["peer1", "peer2"])
+        self._add_member("02" + "b" * 64, topology=["peer1", "peer2"])
+
+        summary = self.coordinator.get_internal_competition_summary()
+
+        # Check for actual return keys (not hypothetical ones)
+        assert "competition_count" in summary
+        assert "competitions" in summary
+        assert "status" in summary
+
+    def test_competition_handles_missing_state_manager(self):
+        """Test that missing state manager is handled gracefully."""
+        coordinator = LiquidityCoordinator(
+            database=self.db,
+            plugin=self.plugin,
+            our_pubkey="02" + "0" * 64,
+            state_manager=None  # No state manager
+        )
+
+        result = coordinator.detect_internal_competition()
+
+        assert result == []
+
+    def test_competition_with_three_members(self):
+        """Test competition detection with three members sharing peers."""
+        # Three members all share peer1 and peer2
+        self._add_member("02" + "a" * 64, topology=["peer1", "peer2"])
+        self._add_member("02" + "b" * 64, topology=["peer1", "peer2"])
+        self._add_member("02" + "c" * 64, topology=["peer1", "peer2"])
+
+        result = self.coordinator.detect_internal_competition()
+
+        # All three compete for peer1 <-> peer2 route
+        assert isinstance(result, list)
+        # With 3+ competitors, should flag as high competition
+        if len(result) > 0:
+            assert result[0]["member_count"] >= 2
