@@ -41,7 +41,7 @@ from goal_manager import GoalManager, Goal, GoalProgress
 # =============================================================================
 
 # Default log directory (can be overridden via environment)
-LOG_DIR = os.environ.get("ADVISOR_LOG_DIR", "/home/sat/.lightning/bitcoin/advisor_logs")
+LOG_DIR = os.environ.get("ADVISOR_LOG_DIR", "/home/sat/bin/cl-hive/production/logs")
 LOG_FILE = os.path.join(LOG_DIR, "proactive_advisor.log")
 
 # Setup logger
