@@ -1140,6 +1140,103 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                     }
                 }
             }
+        ),
+        # =====================================================================
+        # Routing Pool Tools - Collective Economics (Phase 0)
+        # =====================================================================
+        Tool(
+            name="pool_status",
+            description="Get routing pool status including revenue, contributions, and distributions. Shows collective economics metrics for the hive.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "period": {
+                        "type": "string",
+                        "description": "Period to query (format: YYYY-WW, defaults to current week)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="pool_member_status",
+            description="Get routing pool status for a specific member including contribution scores, revenue share, and distribution history.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Member pubkey (defaults to self)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="pool_distribution",
+            description="Calculate distribution amounts for a period (dry run). Shows what each member would receive if settled now.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "period": {
+                        "type": "string",
+                        "description": "Period to calculate (format: YYYY-WW, defaults to current week)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="pool_snapshot",
+            description="Trigger a contribution snapshot for all hive members. Records current contribution metrics for the period.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "period": {
+                        "type": "string",
+                        "description": "Period to snapshot (format: YYYY-WW, defaults to current week)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="pool_settle",
+            description="Settle a routing pool period and record distributions. Use dry_run=true first to preview.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "period": {
+                        "type": "string",
+                        "description": "Period to settle (format: YYYY-WW, defaults to previous week)"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, calculate but don't record (default: true)"
+                    }
+                },
+                "required": ["node"]
+            }
         )
     ]
 
@@ -1235,6 +1332,17 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_advisor_get_peer_intel(arguments)
         elif name == "advisor_measure_outcomes":
             result = await handle_advisor_measure_outcomes(arguments)
+        # Routing Pool tools
+        elif name == "pool_status":
+            result = await handle_pool_status(arguments)
+        elif name == "pool_member_status":
+            result = await handle_pool_member_status(arguments)
+        elif name == "pool_distribution":
+            result = await handle_pool_distribution(arguments)
+        elif name == "pool_snapshot":
+            result = await handle_pool_snapshot(arguments)
+        elif name == "pool_settle":
+            result = await handle_pool_settle(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -2972,6 +3080,91 @@ async def handle_advisor_measure_outcomes(args: Dict) -> Dict:
         "measured_count": len(outcomes),
         "outcomes": outcomes
     }
+
+
+# =============================================================================
+# Routing Pool Handlers (Phase 0 - Collective Economics)
+# =============================================================================
+
+async def handle_pool_status(args: Dict) -> Dict:
+    """Get routing pool status."""
+    node_name = args.get("node")
+    period = args.get("period")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if period:
+        params["period"] = period
+
+    return await node.call("hive-pool-status", params)
+
+
+async def handle_pool_member_status(args: Dict) -> Dict:
+    """Get pool status for a specific member."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if peer_id:
+        params["peer_id"] = peer_id
+
+    return await node.call("hive-pool-member-status", params)
+
+
+async def handle_pool_distribution(args: Dict) -> Dict:
+    """Calculate distribution for a period."""
+    node_name = args.get("node")
+    period = args.get("period")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if period:
+        params["period"] = period
+
+    return await node.call("hive-pool-distribution", params)
+
+
+async def handle_pool_snapshot(args: Dict) -> Dict:
+    """Trigger contribution snapshot."""
+    node_name = args.get("node")
+    period = args.get("period")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if period:
+        params["period"] = period
+
+    return await node.call("hive-pool-snapshot", params)
+
+
+async def handle_pool_settle(args: Dict) -> Dict:
+    """Settle a routing pool period."""
+    node_name = args.get("node")
+    period = args.get("period")
+    dry_run = args.get("dry_run", True)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {"dry_run": dry_run}
+    if period:
+        params["period"] = period
+
+    return await node.call("hive-pool-settle", params)
 
 
 # =============================================================================

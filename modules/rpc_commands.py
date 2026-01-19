@@ -36,6 +36,7 @@ class HiveContext:
     membership_mgr: Any = None  # MembershipManager
     coop_expansion_mgr: Any = None  # CooperativeExpansionManager
     contribution_mgr: Any = None  # ContributionManager
+    routing_pool: Any = None  # RoutingPool (Phase 0 - Collective Economics)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
 
@@ -1600,3 +1601,223 @@ def expansion_status(ctx: HiveContext, round_id: str = None,
 
     # Get overall status
     return ctx.coop_expansion_mgr.get_status()
+
+
+# =============================================================================
+# ROUTING POOL COMMANDS (Phase 0 - Collective Economics)
+# =============================================================================
+
+def pool_status(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
+    """
+    Get current routing pool status and statistics.
+
+    Shows pool revenue, member contributions, and distribution info.
+
+    Args:
+        ctx: HiveContext
+        period: Optional period to query (format: YYYY-WW, defaults to current week)
+
+    Returns:
+        Dict with pool status including revenue, contributions, and distributions.
+    """
+    if not ctx.routing_pool:
+        return {"error": "Routing pool not initialized"}
+
+    try:
+        status = ctx.routing_pool.get_pool_status(period)
+        return status
+    except Exception as e:
+        return {"error": f"Failed to get pool status: {e}"}
+
+
+def pool_member_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
+    """
+    Get routing pool status for a specific member.
+
+    Shows the member's contribution scores, revenue share, and distribution history.
+
+    Args:
+        ctx: HiveContext
+        peer_id: Member pubkey (defaults to self)
+
+    Returns:
+        Dict with member's pool status and history.
+    """
+    if not ctx.routing_pool:
+        return {"error": "Routing pool not initialized"}
+
+    target_id = peer_id or ctx.our_pubkey
+    if not target_id:
+        return {"error": "No peer specified and our_pubkey not available"}
+
+    try:
+        status = ctx.routing_pool.get_member_status(target_id)
+        return status
+    except Exception as e:
+        return {"error": f"Failed to get member status: {e}"}
+
+
+def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
+    """
+    Trigger a contribution snapshot for all hive members.
+
+    Takes a snapshot of current contribution metrics for all members.
+    This is typically done automatically but can be triggered manually.
+
+    Args:
+        ctx: HiveContext
+        period: Optional period to snapshot (format: YYYY-WW, defaults to current week)
+
+    Returns:
+        Dict with snapshot results.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = check_permission(ctx, 'admin')
+    if perm_error:
+        return perm_error
+
+    if not ctx.routing_pool:
+        return {"error": "Routing pool not initialized"}
+
+    try:
+        result = ctx.routing_pool.snapshot_contributions(period)
+        return {
+            "status": "ok",
+            "period": result.get("period"),
+            "members_snapshotted": result.get("members_snapshotted", 0),
+            "contributions": result.get("contributions", [])
+        }
+    except Exception as e:
+        return {"error": f"Failed to snapshot contributions: {e}"}
+
+
+def pool_distribution(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
+    """
+    Calculate distribution amounts for a period (dry run).
+
+    Shows what each member would receive if the period were settled now.
+    Does NOT actually settle the period - use pool_settle for that.
+
+    Args:
+        ctx: HiveContext
+        period: Optional period to calculate (format: YYYY-WW, defaults to current week)
+
+    Returns:
+        Dict with calculated distribution amounts for each member.
+    """
+    if not ctx.routing_pool:
+        return {"error": "Routing pool not initialized"}
+
+    try:
+        result = ctx.routing_pool.calculate_distribution(period)
+        return {
+            "status": "calculated",
+            "period": result.get("period"),
+            "total_revenue_sats": result.get("total_revenue_sats", 0),
+            "distributions": result.get("distributions", []),
+            "note": "This is a dry run - use pool-settle to actually distribute"
+        }
+    except Exception as e:
+        return {"error": f"Failed to calculate distribution: {e}"}
+
+
+def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> Dict[str, Any]:
+    """
+    Settle a routing pool period and record distributions.
+
+    Calculates final distributions and records them to the database.
+    This marks the period as settled and distributions as finalized.
+
+    Args:
+        ctx: HiveContext
+        period: Period to settle (format: YYYY-WW, defaults to PREVIOUS week)
+        dry_run: If True, calculate but don't actually record (default: True)
+
+    Returns:
+        Dict with settlement results.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = check_permission(ctx, 'admin')
+    if perm_error:
+        return perm_error
+
+    if not ctx.routing_pool:
+        return {"error": "Routing pool not initialized"}
+
+    try:
+        if dry_run:
+            # Just calculate
+            result = ctx.routing_pool.calculate_distribution(period)
+            return {
+                "status": "dry_run",
+                "period": result.get("period"),
+                "total_revenue_sats": result.get("total_revenue_sats", 0),
+                "distributions": result.get("distributions", []),
+                "note": "Set dry_run=false to actually settle this period"
+            }
+        else:
+            # Actually settle
+            result = ctx.routing_pool.settle_period(period)
+            return {
+                "status": "settled",
+                "period": result.get("period"),
+                "total_revenue_sats": result.get("total_revenue_sats", 0),
+                "distributions": result.get("distributions", []),
+                "settled_at": result.get("settled_at")
+            }
+    except Exception as e:
+        return {"error": f"Failed to settle period: {e}"}
+
+
+def pool_record_revenue(ctx: HiveContext, amount_sats: int, channel_id: str = None,
+                        payment_hash: str = None) -> Dict[str, Any]:
+    """
+    Manually record routing revenue to the pool.
+
+    Normally revenue is recorded automatically from forward events,
+    but this allows manual recording for testing or corrections.
+
+    Args:
+        ctx: HiveContext
+        amount_sats: Revenue amount in satoshis
+        channel_id: Optional channel ID (SCID format)
+        payment_hash: Optional payment hash for tracking
+
+    Returns:
+        Dict with recording result.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = check_permission(ctx, 'admin')
+    if perm_error:
+        return perm_error
+
+    if not ctx.routing_pool:
+        return {"error": "Routing pool not initialized"}
+
+    if amount_sats <= 0:
+        return {"error": "Amount must be positive"}
+
+    if amount_sats > 1_000_000_000:  # 10 BTC sanity check
+        return {"error": "Amount exceeds sanity limit (10 BTC)"}
+
+    try:
+        ctx.routing_pool.record_revenue(
+            member_id=ctx.our_pubkey,
+            amount_sats=amount_sats,
+            channel_id=channel_id,
+            payment_hash=payment_hash
+        )
+        return {
+            "status": "ok",
+            "recorded_sats": amount_sats,
+            "member_id": ctx.our_pubkey[:16] + "...",
+            "channel_id": channel_id
+        }
+    except Exception as e:
+        return {"error": f"Failed to record revenue: {e}"}

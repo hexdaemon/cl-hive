@@ -81,6 +81,7 @@ from modules.splice_coordinator import SpliceCoordinator
 from modules.health_aggregator import HealthScoreAggregator, HealthTier
 from modules.routing_intelligence import HiveRoutingMap
 from modules.peer_reputation import PeerReputationManager
+from modules.routing_pool import RoutingPool
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -105,6 +106,13 @@ from modules.rpc_commands import (
     intent_status as rpc_intent_status,
     contribution as rpc_contribution,
     expansion_status as rpc_expansion_status,
+    # Phase 0: Routing Pool (Collective Economics)
+    pool_status as rpc_pool_status,
+    pool_member_status as rpc_pool_member_status,
+    pool_snapshot as rpc_pool_snapshot,
+    pool_distribution as rpc_pool_distribution,
+    pool_settle as rpc_pool_settle,
+    pool_record_revenue as rpc_pool_record_revenue,
 )
 
 # Initialize the plugin
@@ -428,6 +436,7 @@ def _get_hive_context() -> HiveContext:
     # coop_expansion is the global name, not coop_expansion_mgr
     _coop_expansion = coop_expansion if 'coop_expansion' in globals() else None
     _contribution_mgr = contribution_mgr if 'contribution_mgr' in globals() else None
+    _routing_pool = routing_pool if 'routing_pool' in globals() else None
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -446,6 +455,7 @@ def _get_hive_context() -> HiveContext:
         membership_mgr=_membership_mgr,
         coop_expansion_mgr=_coop_expansion,
         contribution_mgr=_contribution_mgr,
+        routing_pool=_routing_pool,
         log=_log,
     )
 
@@ -1061,6 +1071,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Load existing reputation data from database
     peer_reputation_mgr.aggregate_from_database()
     plugin.log("cl-hive: Peer reputation manager initialized")
+
+    # Initialize Routing Pool (Phase 0 - Collective Economics)
+    global routing_pool
+    routing_pool = RoutingPool(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey,
+        state_manager=state_manager
+    )
+    plugin.log("cl-hive: Routing pool initialized (collective economics)")
 
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
@@ -2012,6 +2032,26 @@ def on_forward_event(plugin: Plugin, **payload):
         except Exception as e:
             if safe_plugin:
                 safe_plugin.log(f"Route probe from forward error: {e}", level="debug")
+
+    # Record routing revenue to pool (Phase 0 - Collective Economics)
+    if routing_pool and our_pubkey:
+        try:
+            forward_event = payload.get("forward_event", payload)
+            status = forward_event.get("status")
+            if status == "settled":
+                fee_msat = forward_event.get("fee_msat", 0)
+                if fee_msat > 0:
+                    fee_sats = fee_msat // 1000
+                    if fee_sats > 0:
+                        routing_pool.record_revenue(
+                            member_id=our_pubkey,
+                            amount_sats=fee_sats,
+                            channel_id=forward_event.get("out_channel"),
+                            payment_hash=forward_event.get("payment_hash")
+                        )
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"Pool revenue recording error: {e}", level="debug")
 
 
 def _record_forward_as_route_probe(forward_event: Dict):
@@ -7704,6 +7744,109 @@ def hive_contribution(plugin: Plugin, peer_id: str = None):
         Dict with contribution statistics.
     """
     return rpc_contribution(_get_hive_context(), peer_id=peer_id)
+
+
+# =============================================================================
+# ROUTING POOL COMMANDS (Phase 0 - Collective Economics)
+# =============================================================================
+
+@plugin.method("hive-pool-status")
+def hive_pool_status(plugin: Plugin, period: str = None):
+    """
+    Get current routing pool status and statistics.
+
+    Args:
+        period: Optional period to query (format: YYYY-WW, defaults to current week)
+
+    Returns:
+        Dict with pool status including revenue, contributions, and distributions.
+    """
+    return rpc_pool_status(_get_hive_context(), period=period)
+
+
+@plugin.method("hive-pool-member-status")
+def hive_pool_member_status(plugin: Plugin, peer_id: str = None):
+    """
+    Get routing pool status for a specific member.
+
+    Args:
+        peer_id: Member pubkey (defaults to self)
+
+    Returns:
+        Dict with member's pool status and history.
+    """
+    return rpc_pool_member_status(_get_hive_context(), peer_id=peer_id)
+
+
+@plugin.method("hive-pool-snapshot")
+def hive_pool_snapshot(plugin: Plugin, period: str = None):
+    """
+    Trigger a contribution snapshot for all hive members.
+
+    Permission: Admin only
+
+    Args:
+        period: Optional period (format: YYYY-WW, defaults to current week)
+
+    Returns:
+        Dict with snapshot results.
+    """
+    return rpc_pool_snapshot(_get_hive_context(), period=period)
+
+
+@plugin.method("hive-pool-distribution")
+def hive_pool_distribution(plugin: Plugin, period: str = None):
+    """
+    Calculate distribution amounts for a period (dry run).
+
+    Args:
+        period: Optional period (format: YYYY-WW, defaults to current week)
+
+    Returns:
+        Dict with calculated distribution amounts.
+    """
+    return rpc_pool_distribution(_get_hive_context(), period=period)
+
+
+@plugin.method("hive-pool-settle")
+def hive_pool_settle(plugin: Plugin, period: str = None, dry_run: bool = True):
+    """
+    Settle a routing pool period and record distributions.
+
+    Permission: Admin only
+
+    Args:
+        period: Period to settle (format: YYYY-WW, defaults to PREVIOUS week)
+        dry_run: If True, calculate but don't record (default: True)
+
+    Returns:
+        Dict with settlement results.
+    """
+    return rpc_pool_settle(_get_hive_context(), period=period, dry_run=dry_run)
+
+
+@plugin.method("hive-pool-record-revenue")
+def hive_pool_record_revenue(plugin: Plugin, amount_sats: int,
+                              channel_id: str = None, payment_hash: str = None):
+    """
+    Manually record routing revenue to the pool.
+
+    Permission: Admin only
+
+    Args:
+        amount_sats: Revenue amount in satoshis
+        channel_id: Optional channel ID
+        payment_hash: Optional payment hash
+
+    Returns:
+        Dict with recording result.
+    """
+    return rpc_pool_record_revenue(
+        _get_hive_context(),
+        amount_sats=amount_sats,
+        channel_id=channel_id,
+        payment_hash=payment_hash
+    )
 
 
 @plugin.method("hive-request-promotion")

@@ -629,6 +629,85 @@ class HiveDatabase:
             "ON peer_reputation(reporter_id)"
         )
 
+        # =====================================================================
+        # ROUTING POOL TABLES (Phase 0 - Collective Economics)
+        # =====================================================================
+
+        # Pool contributions - snapshot of member contributions per period
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pool_contributions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                member_id TEXT NOT NULL,
+                period TEXT NOT NULL,
+
+                -- Capital metrics (70% weight)
+                total_capacity_sats INTEGER DEFAULT 0,
+                weighted_capacity_sats INTEGER DEFAULT 0,
+                uptime_pct REAL DEFAULT 0.0,
+
+                -- Position metrics (20% weight)
+                betweenness_centrality REAL DEFAULT 0.0,
+                unique_peers INTEGER DEFAULT 0,
+                bridge_score REAL DEFAULT 0.0,
+
+                -- Operations metrics (10% weight)
+                routing_success_rate REAL DEFAULT 1.0,
+                avg_response_time_ms REAL DEFAULT 0.0,
+
+                -- Computed share
+                pool_share REAL DEFAULT 0.0,
+
+                recorded_at INTEGER NOT NULL,
+                UNIQUE(member_id, period)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pool_contributions_period "
+            "ON pool_contributions(period)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pool_contributions_member "
+            "ON pool_contributions(member_id)"
+        )
+
+        # Pool revenue - individual routing revenue events
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pool_revenue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                member_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                channel_id TEXT,
+                payment_hash TEXT,
+                recorded_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pool_revenue_recorded "
+            "ON pool_revenue(recorded_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pool_revenue_member "
+            "ON pool_revenue(member_id)"
+        )
+
+        # Pool distributions - settlement records
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pool_distributions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period TEXT NOT NULL,
+                member_id TEXT NOT NULL,
+                contribution_share REAL NOT NULL,
+                revenue_share_sats INTEGER NOT NULL,
+                total_pool_revenue_sats INTEGER NOT NULL,
+                settled_at INTEGER NOT NULL,
+                UNIQUE(member_id, period)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pool_distributions_period "
+            "ON pool_distributions(period)"
+        )
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -3401,3 +3480,295 @@ class HiveDatabase:
             DELETE FROM peer_reputation WHERE timestamp < ?
         """, (cutoff,))
         return cursor.rowcount
+
+    # =========================================================================
+    # ROUTING POOL OPERATIONS (Phase 0 - Collective Economics)
+    # =========================================================================
+
+    def record_pool_revenue(
+        self,
+        member_id: str,
+        amount_sats: int,
+        channel_id: str = None,
+        payment_hash: str = None
+    ) -> int:
+        """
+        Record routing revenue for the pool.
+
+        All revenue goes to the collective pool, not individual members.
+        This enables profit sharing based on contributions.
+
+        Args:
+            member_id: Pubkey of member who routed the payment
+            amount_sats: Fee revenue in satoshis
+            channel_id: Channel that earned the fee (optional)
+            payment_hash: Payment hash for deduplication (optional)
+
+        Returns:
+            Row ID of the recorded revenue
+        """
+        conn = self._get_connection()
+        cursor = conn.execute("""
+            INSERT INTO pool_revenue
+            (member_id, amount_sats, channel_id, payment_hash, recorded_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (member_id, amount_sats, channel_id, payment_hash, int(time.time())))
+        return cursor.lastrowid
+
+    def get_pool_revenue(
+        self,
+        period: str = None,
+        start_time: int = None,
+        end_time: int = None
+    ) -> Dict[str, Any]:
+        """
+        Get pool revenue statistics.
+
+        Args:
+            period: Period string (e.g., "2025-W03") - calculates time bounds
+            start_time: Start timestamp (alternative to period)
+            end_time: End timestamp (alternative to period)
+
+        Returns:
+            Dict with total_sats, transaction_count, by_member breakdown
+        """
+        conn = self._get_connection()
+
+        # Calculate time bounds
+        if period:
+            start_time, end_time = self._period_to_timestamps(period)
+        elif start_time is None:
+            # Default to last 7 days
+            end_time = int(time.time())
+            start_time = end_time - (7 * 24 * 3600)
+
+        # Total revenue
+        total = conn.execute("""
+            SELECT COALESCE(SUM(amount_sats), 0) as total,
+                   COUNT(*) as count
+            FROM pool_revenue
+            WHERE recorded_at >= ? AND recorded_at < ?
+        """, (start_time, end_time)).fetchone()
+
+        # By member
+        by_member = conn.execute("""
+            SELECT member_id,
+                   SUM(amount_sats) as revenue_sats,
+                   COUNT(*) as transaction_count
+            FROM pool_revenue
+            WHERE recorded_at >= ? AND recorded_at < ?
+            GROUP BY member_id
+            ORDER BY revenue_sats DESC
+        """, (start_time, end_time)).fetchall()
+
+        return {
+            "total_sats": total["total"],
+            "transaction_count": total["count"],
+            "start_time": start_time,
+            "end_time": end_time,
+            "by_member": [dict(row) for row in by_member]
+        }
+
+    def record_pool_contribution(
+        self,
+        member_id: str,
+        period: str,
+        total_capacity_sats: int,
+        weighted_capacity_sats: int,
+        uptime_pct: float,
+        betweenness_centrality: float,
+        unique_peers: int,
+        bridge_score: float,
+        routing_success_rate: float,
+        avg_response_time_ms: float,
+        pool_share: float
+    ) -> bool:
+        """
+        Record a member's contribution snapshot for a period.
+
+        Args:
+            member_id: Member pubkey
+            period: Period string (e.g., "2025-W03")
+            total_capacity_sats: Total channel capacity
+            weighted_capacity_sats: Capacity weighted by position quality
+            uptime_pct: Uptime percentage (0-1)
+            betweenness_centrality: Network centrality score
+            unique_peers: Number of peers only this member connects to
+            bridge_score: Score for connecting network clusters
+            routing_success_rate: HTLC success rate (0-1)
+            avg_response_time_ms: Average forwarding response time
+            pool_share: Computed share of pool (0-1)
+
+        Returns:
+            True if recorded, False if duplicate
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO pool_contributions
+                (member_id, period, total_capacity_sats, weighted_capacity_sats,
+                 uptime_pct, betweenness_centrality, unique_peers, bridge_score,
+                 routing_success_rate, avg_response_time_ms, pool_share, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (member_id, period, total_capacity_sats, weighted_capacity_sats,
+                  uptime_pct, betweenness_centrality, unique_peers, bridge_score,
+                  routing_success_rate, avg_response_time_ms, pool_share,
+                  int(time.time())))
+            return True
+        except sqlite3.Error as e:
+            self.plugin.log(f"Error recording pool contribution: {e}", level='error')
+            return False
+
+    def get_pool_contributions(self, period: str) -> List[Dict[str, Any]]:
+        """
+        Get all member contributions for a period.
+
+        Args:
+            period: Period string (e.g., "2025-W03")
+
+        Returns:
+            List of contribution dicts sorted by pool_share descending
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM pool_contributions
+            WHERE period = ?
+            ORDER BY pool_share DESC
+        """, (period,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_member_contribution_history(
+        self,
+        member_id: str,
+        limit: int = 12
+    ) -> List[Dict[str, Any]]:
+        """
+        Get contribution history for a member.
+
+        Args:
+            member_id: Member pubkey
+            limit: Max periods to return
+
+        Returns:
+            List of contribution dicts, most recent first
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM pool_contributions
+            WHERE member_id = ?
+            ORDER BY period DESC
+            LIMIT ?
+        """, (member_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_pool_distribution(
+        self,
+        period: str,
+        member_id: str,
+        contribution_share: float,
+        revenue_share_sats: int,
+        total_pool_revenue_sats: int
+    ) -> bool:
+        """
+        Record a distribution settlement for a period.
+
+        Args:
+            period: Period string
+            member_id: Member pubkey
+            contribution_share: Member's share of contributions (0-1)
+            revenue_share_sats: Amount distributed to member
+            total_pool_revenue_sats: Total pool revenue for period
+
+        Returns:
+            True if recorded
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO pool_distributions
+                (period, member_id, contribution_share, revenue_share_sats,
+                 total_pool_revenue_sats, settled_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (period, member_id, contribution_share, revenue_share_sats,
+                  total_pool_revenue_sats, int(time.time())))
+            return True
+        except sqlite3.Error as e:
+            self.plugin.log(f"Error recording distribution: {e}", level='error')
+            return False
+
+    def get_pool_distributions(self, period: str) -> List[Dict[str, Any]]:
+        """
+        Get all distributions for a period.
+
+        Args:
+            period: Period string
+
+        Returns:
+            List of distribution dicts
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM pool_distributions
+            WHERE period = ?
+            ORDER BY revenue_share_sats DESC
+        """, (period,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_member_distribution_history(
+        self,
+        member_id: str,
+        limit: int = 12
+    ) -> List[Dict[str, Any]]:
+        """
+        Get distribution history for a member.
+
+        Args:
+            member_id: Member pubkey
+            limit: Max periods to return
+
+        Returns:
+            List of distribution dicts, most recent first
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM pool_distributions
+            WHERE member_id = ?
+            ORDER BY period DESC
+            LIMIT ?
+        """, (member_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def _period_to_timestamps(self, period: str) -> tuple:
+        """
+        Convert period string to start/end timestamps.
+
+        Supports formats:
+        - "2025-W03" (ISO week)
+        - "2025-01" (month)
+        - "2025-01-15" (day)
+
+        Returns:
+            (start_timestamp, end_timestamp)
+        """
+        import datetime
+
+        if "-W" in period:
+            # ISO week format: 2025-W03
+            year, week = period.split("-W")
+            # Monday of that week
+            start = datetime.datetime.strptime(f"{year}-W{week}-1", "%Y-W%W-%w")
+            end = start + datetime.timedelta(days=7)
+        elif len(period) == 7:
+            # Month format: 2025-01
+            start = datetime.datetime.strptime(f"{period}-01", "%Y-%m-%d")
+            # First of next month
+            if start.month == 12:
+                end = start.replace(year=start.year + 1, month=1)
+            else:
+                end = start.replace(month=start.month + 1)
+        else:
+            # Day format: 2025-01-15
+            start = datetime.datetime.strptime(period, "%Y-%m-%d")
+            end = start + datetime.timedelta(days=1)
+
+        return (int(start.timestamp()), int(end.timestamp()))
