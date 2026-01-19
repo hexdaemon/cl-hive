@@ -4300,13 +4300,10 @@ def fee_intelligence_loop():
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Fee intelligence cleanup error: {e}", level='warn')
 
-            # Step 5: Broadcast liquidity needs (Phase 7.3)
+            # Step 5: Broadcast liquidity needs
             _broadcast_liquidity_needs()
 
-            # Step 6: Look for internal rebalance opportunities
-            _check_rebalance_opportunities()
-
-            # Step 7: Cleanup old liquidity needs
+            # Step 6: Cleanup old liquidity needs
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
                 if deleted_needs > 0:
@@ -4317,7 +4314,7 @@ def fee_intelligence_loop():
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Liquidity needs cleanup error: {e}", level='warn')
 
-            # Step 8: Cleanup old route probes (Phase 7.4 - Routing Intelligence)
+            # Step 7: Cleanup old route probes
             try:
                 if routing_map:
                     # Clean database
@@ -4682,41 +4679,6 @@ def _broadcast_liquidity_needs():
     except Exception as e:
         if safe_plugin:
             safe_plugin.log(f"cl-hive: Liquidity needs broadcast error: {e}", level='warn')
-
-
-def _check_rebalance_opportunities():
-    """
-    Check for internal rebalance opportunities to help other members.
-
-    Looks for opportunities to push liquidity to struggling members
-    via zero-cost internal hive channels.
-    """
-    if not liquidity_coord or not safe_plugin or not database:
-        return
-
-    try:
-        # Get our channel data
-        funds = safe_plugin.rpc.listfunds()
-
-        # Look for opportunity to help
-        proposal = liquidity_coord.find_internal_rebalance_opportunity(funds)
-
-        if proposal:
-            safe_plugin.log(
-                f"cl-hive: Found rebalance opportunity: "
-                f"{proposal.amount_sats} sats to {proposal.to_member[:16]}... "
-                f"(cost={proposal.estimated_cost_sats}, priority={proposal.nnlb_priority:.2f})",
-                level='info'
-            )
-            # Note: Actual execution would be implemented in Phase 4
-            # For now, just log the opportunity
-
-        # Cleanup expired data
-        liquidity_coord.cleanup_expired_data()
-
-    except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Rebalance opportunity check error: {e}", level='warn')
 
 
 # =============================================================================

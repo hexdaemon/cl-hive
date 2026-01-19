@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, patch
 
 from modules.liquidity_coordinator import (
     LiquidityCoordinator,
-    RebalanceProposal,
     LiquidityNeed,
     URGENCY_CRITICAL,
     URGENCY_HIGH,
@@ -24,7 +23,6 @@ from modules.liquidity_coordinator import (
     NEED_INBOUND,
     NEED_OUTBOUND,
     NEED_REBALANCE,
-    MIN_REBALANCE_AMOUNT,
 )
 from modules.protocol import (
     validate_liquidity_need_payload,
@@ -308,37 +306,6 @@ class TestLiquidityCoordinator:
         assert needs[0]["need_type"] == NEED_INBOUND
         assert needs[0]["urgency"] == URGENCY_HIGH
 
-    def test_can_help_with_liquidity(self):
-        """Test calculation of help capacity."""
-        # Add hive member
-        member_id = "02" + "m" * 64
-        self.db.members[member_id] = {"peer_id": member_id, "tier": "member"}
-
-        funds = {
-            "channels": [
-                {
-                    # Hive member channel with excess local
-                    "peer_id": member_id,
-                    "state": "CHANNELD_NORMAL",
-                    "amount_msat": 10_000_000_000,  # 10M sats
-                    "our_amount_msat": 8_000_000_000,  # 8M sats (80%)
-                },
-                {
-                    # External channel (not counted)
-                    "peer_id": "03" + "x" * 64,
-                    "state": "CHANNELD_NORMAL",
-                    "amount_msat": 10_000_000_000,
-                    "our_amount_msat": 8_000_000_000,
-                }
-            ]
-        }
-
-        capacity = self.coordinator.can_help_with_liquidity(funds)
-
-        assert capacity["can_provide_outbound"] > 0
-        assert capacity["can_provide_inbound"] == 0  # No excess remote
-
-
 class TestRateLimiting:
     """Test rate limiting functionality."""
 
@@ -439,102 +406,3 @@ class TestNNLBAssistanceStatus:
         assert status["pending_needs"] == 2
         assert status["critical_needs"] == 1
         assert status["high_needs"] == 1
-
-
-class TestInternalRebalanceOpportunity:
-    """Test internal rebalance opportunity detection."""
-
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.db = MockDatabase()
-        self.coordinator = LiquidityCoordinator(
-            database=self.db,
-            plugin=MagicMock(),
-            our_pubkey="02" + "a" * 64
-        )
-
-    def test_find_opportunity_for_outbound_need(self):
-        """Test finding opportunity when member needs outbound."""
-        now = int(time.time())
-        target_peer = "03" + "t" * 64
-        needy_member = "02" + "n" * 64
-
-        # Member needs outbound to target
-        self.coordinator._liquidity_needs[needy_member] = LiquidityNeed(
-            reporter_id=needy_member,
-            need_type=NEED_OUTBOUND,
-            target_peer_id=target_peer,
-            amount_sats=500000,
-            urgency=URGENCY_HIGH,
-            max_fee_ppm=100,
-            reason="depleted",
-            current_balance_pct=0.1,
-            can_provide_inbound=0,
-            can_provide_outbound=0,
-            timestamp=now,
-            signature="sig"
-        )
-
-        self.db.member_health[needy_member] = {
-            "peer_id": needy_member,
-            "overall_health": 30,  # Struggling
-        }
-
-        # We have excess outbound to that target
-        funds = {
-            "channels": [
-                {
-                    "peer_id": target_peer,
-                    "state": "CHANNELD_NORMAL",
-                    "amount_msat": 10_000_000_000,  # 10M sats
-                    "our_amount_msat": 8_000_000_000,  # 8M sats (80%)
-                }
-            ]
-        }
-
-        proposal = self.coordinator.find_internal_rebalance_opportunity(funds)
-
-        assert proposal is not None
-        assert proposal.to_member == needy_member
-        assert proposal.target_peer == target_peer
-        assert proposal.estimated_cost_sats == 0  # Internal is free
-        assert proposal.amount_sats >= MIN_REBALANCE_AMOUNT
-
-    def test_no_opportunity_when_balanced(self):
-        """Test no opportunity when our channels are balanced."""
-        now = int(time.time())
-        target_peer = "03" + "t" * 64
-        needy_member = "02" + "n" * 64
-
-        # Member needs outbound
-        self.coordinator._liquidity_needs[needy_member] = LiquidityNeed(
-            reporter_id=needy_member,
-            need_type=NEED_OUTBOUND,
-            target_peer_id=target_peer,
-            amount_sats=500000,
-            urgency=URGENCY_HIGH,
-            max_fee_ppm=100,
-            reason="depleted",
-            current_balance_pct=0.1,
-            can_provide_inbound=0,
-            can_provide_outbound=0,
-            timestamp=now,
-            signature="sig"
-        )
-
-        # Our channel to target is balanced (50%)
-        funds = {
-            "channels": [
-                {
-                    "peer_id": target_peer,
-                    "state": "CHANNELD_NORMAL",
-                    "amount_msat": 10_000_000_000,  # 10M sats
-                    "our_amount_msat": 5_000_000_000,  # 5M sats (50%)
-                }
-            ]
-        }
-
-        proposal = self.coordinator.find_internal_rebalance_opportunity(funds)
-
-        # No opportunity because we don't have excess
-        assert proposal is None

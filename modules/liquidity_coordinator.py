@@ -1,10 +1,18 @@
 """
-Liquidity Coordinator Module (Phase 3 - Cooperative Rebalancing)
+Liquidity Coordinator Module
 
-Implements cooperative rebalancing between hive members:
-- Internal hive rebalancing (zero cost via 0-fee channels)
-- Coordinated external rebalancing
-- NNLB-prioritized liquidity assistance
+Coordinates INFORMATION SHARING about liquidity state between hive members.
+Each node manages its own funds independently - no sats transfer between nodes.
+
+Information shared:
+- Which channels are depleted/saturated (liquidity needs)
+- Which peers need more capacity
+- Rebalancing activity (to avoid route conflicts)
+
+How this helps without fund transfer:
+- Fee coordination: Adjust fees to direct public flow toward peers that help struggling members
+- Conflict avoidance: Don't compete for same rebalance routes
+- Topology planning: Open channels that benefit the fleet
 
 Security: All operations use cryptographic signatures.
 """
@@ -40,30 +48,8 @@ REASON_CHANNEL_DEPLETED = "channel_depleted"
 REASON_OPPORTUNITY = "opportunity"
 REASON_NNLB_ASSIST = "nnlb_assist"
 
-# Rebalance proposal types
-PROPOSAL_INTERNAL_PUSH = "internal_push"
-PROPOSAL_EXTERNAL_REBALANCE = "external_rebalance"
-PROPOSAL_FEE_YIELD = "fee_yield"
-
 # Limits
 MAX_PENDING_NEEDS = 100  # Max liquidity needs to track
-MAX_PROPOSAL_AGE = 3600  # 1 hour proposal validity
-MIN_REBALANCE_AMOUNT = 100000  # 100k sats minimum
-
-
-@dataclass
-class RebalanceProposal:
-    """A proposed rebalance operation."""
-    proposal_id: str
-    proposal_type: str
-    from_member: str
-    to_member: str
-    target_peer: Optional[str]
-    amount_sats: int
-    estimated_cost_sats: int
-    nnlb_priority: float
-    created_at: int
-    expires_at: int
 
 
 @dataclass
@@ -85,10 +71,12 @@ class LiquidityNeed:
 
 class LiquidityCoordinator:
     """
-    Coordinates liquidity operations between hive members.
+    Coordinates liquidity INFORMATION between hive members.
 
-    Implements NNLB-prioritized rebalancing where struggling
-    nodes get help from thriving members.
+    Shares information about liquidity state (depleted/saturated channels)
+    so nodes can make better independent decisions about fees and rebalancing.
+
+    No fund transfers between nodes - each node manages its own funds.
     """
 
     def __init__(
@@ -114,9 +102,8 @@ class LiquidityCoordinator:
 
         # In-memory tracking
         self._liquidity_needs: Dict[str, LiquidityNeed] = {}  # reporter_id -> need
-        self._pending_proposals: Dict[str, RebalanceProposal] = {}
 
-        # Phase 2: Liquidity state tracking (information only)
+        # Liquidity state tracking (information only)
         # Stores latest liquidity reports from cl-revenue-ops instances
         self._member_liquidity_state: Dict[str, Dict[str, Any]] = {}
 
@@ -375,164 +362,6 @@ class LiquidityCoordinator:
 
         return sorted(needs, key=nnlb_priority, reverse=True)
 
-    def find_internal_rebalance_opportunity(
-        self,
-        funds: Dict[str, Any]
-    ) -> Optional[RebalanceProposal]:
-        """
-        Find an opportunity to help another member via internal rebalance.
-
-        Since hive members have 0-fee channels to each other,
-        internal rebalancing is essentially free.
-
-        Args:
-            funds: Result of listfunds() call
-
-        Returns:
-            RebalanceProposal if opportunity found, None otherwise
-        """
-        needs = self.get_prioritized_needs()
-        channels = funds.get("channels", [])
-
-        # Build map of our channels
-        our_channels: Dict[str, Dict[str, Any]] = {}
-        for ch in channels:
-            if ch.get("state") != "CHANNELD_NORMAL":
-                continue
-            peer_id = ch.get("peer_id")
-            if peer_id:
-                our_channels[peer_id] = ch
-
-        for need in needs:
-            if need.reporter_id == self.our_pubkey:
-                continue
-
-            target = need.target_peer_id
-
-            if need.need_type == NEED_OUTBOUND:
-                # They need outbound to target
-                # Do we have excess outbound to that target?
-                if target in our_channels:
-                    ch = our_channels[target]
-                    capacity = ch.get("amount_msat", 0) // 1000
-                    local = ch.get("our_amount_msat", 0) // 1000
-                    local_pct = local / capacity if capacity > 0 else 0
-
-                    if local_pct > 0.7:
-                        # We have excess, propose internal rebalance
-                        excess = local - (capacity * 0.5)  # Target 50% balance
-                        amount = min(int(excess), need.amount_sats, 10_000_000)
-
-                        if amount >= MIN_REBALANCE_AMOUNT:
-                            # Get NNLB priority
-                            member_health = self.database.get_member_health(
-                                need.reporter_id
-                            )
-                            priority = 1.0 - (
-                                member_health.get("overall_health", 50) / 100.0
-                            ) if member_health else 0.5
-
-                            proposal_id = f"internal_{int(time.time())}_{need.reporter_id[:8]}"
-
-                            return RebalanceProposal(
-                                proposal_id=proposal_id,
-                                proposal_type=PROPOSAL_INTERNAL_PUSH,
-                                from_member=self.our_pubkey,
-                                to_member=need.reporter_id,
-                                target_peer=target,
-                                amount_sats=amount,
-                                estimated_cost_sats=0,  # Internal is free
-                                nnlb_priority=priority,
-                                created_at=int(time.time()),
-                                expires_at=int(time.time()) + MAX_PROPOSAL_AGE
-                            )
-
-            elif need.need_type == NEED_INBOUND:
-                # They need inbound from target
-                # Check if we have a channel to them and excess local
-                if need.reporter_id in our_channels:
-                    ch = our_channels[need.reporter_id]
-                    capacity = ch.get("amount_msat", 0) // 1000
-                    local = ch.get("our_amount_msat", 0) // 1000
-                    local_pct = local / capacity if capacity > 0 else 0
-
-                    if local_pct > 0.6:
-                        # We can push to them directly
-                        excess = local - (capacity * 0.5)
-                        amount = min(int(excess), need.amount_sats, 10_000_000)
-
-                        if amount >= MIN_REBALANCE_AMOUNT:
-                            member_health = self.database.get_member_health(
-                                need.reporter_id
-                            )
-                            priority = 1.0 - (
-                                member_health.get("overall_health", 50) / 100.0
-                            ) if member_health else 0.5
-
-                            proposal_id = f"direct_{int(time.time())}_{need.reporter_id[:8]}"
-
-                            return RebalanceProposal(
-                                proposal_id=proposal_id,
-                                proposal_type=PROPOSAL_INTERNAL_PUSH,
-                                from_member=self.our_pubkey,
-                                to_member=need.reporter_id,
-                                target_peer=None,  # Direct push
-                                amount_sats=amount,
-                                estimated_cost_sats=0,
-                                nnlb_priority=priority,
-                                created_at=int(time.time()),
-                                expires_at=int(time.time()) + MAX_PROPOSAL_AGE
-                            )
-
-        return None
-
-    def can_help_with_liquidity(
-        self,
-        funds: Dict[str, Any]
-    ) -> Dict[str, int]:
-        """
-        Calculate how much liquidity we can provide to help others.
-
-        Args:
-            funds: Result of listfunds() call
-
-        Returns:
-            Dict with inbound/outbound we can provide
-        """
-        channels = funds.get("channels", [])
-
-        total_inbound = 0
-        total_outbound = 0
-
-        # Get hive members
-        members = self.database.get_all_members()
-        member_ids = {m.get("peer_id") for m in members}
-
-        for ch in channels:
-            if ch.get("state") != "CHANNELD_NORMAL":
-                continue
-
-            peer_id = ch.get("peer_id")
-            if peer_id not in member_ids:
-                continue  # Only count hive channels
-
-            capacity = ch.get("amount_msat", 0) // 1000
-            local = ch.get("our_amount_msat", 0) // 1000
-
-            # Excess local = outbound we can push to member
-            if local > capacity * 0.6:
-                total_outbound += int(local - capacity * 0.5)
-
-            # Excess remote = inbound we can receive from member
-            remote = capacity - local
-            if remote > capacity * 0.6:
-                total_inbound += int(remote - capacity * 0.5)
-
-        return {
-            "can_provide_inbound": total_inbound,
-            "can_provide_outbound": total_outbound
-        }
-
     def assess_our_liquidity_needs(
         self,
         funds: Dict[str, Any]
@@ -605,9 +434,8 @@ class LiquidityCoordinator:
         for need in needs:
             urgency_counts[need.urgency] += 1
 
-        # Get struggling members
+        # Get struggling members (for informational purposes)
         struggling = self.database.get_struggling_members(threshold=40)
-        helpers = self.database.get_helping_members()
 
         return {
             "pending_needs": len(needs),
@@ -615,22 +443,12 @@ class LiquidityCoordinator:
             "high_needs": urgency_counts.get(URGENCY_HIGH, 0),
             "medium_needs": urgency_counts.get(URGENCY_MEDIUM, 0),
             "low_needs": urgency_counts.get(URGENCY_LOW, 0),
-            "struggling_members": len(struggling),
-            "available_helpers": len(helpers),
-            "pending_proposals": len(self._pending_proposals)
+            "struggling_members": len(struggling)
         }
 
     def cleanup_expired_data(self):
-        """Clean up expired proposals and old needs."""
+        """Clean up old liquidity needs."""
         now = time.time()
-
-        # Remove expired proposals
-        expired_proposals = [
-            pid for pid, prop in self._pending_proposals.items()
-            if prop.expires_at < now
-        ]
-        for pid in expired_proposals:
-            del self._pending_proposals[pid]
 
         # Remove old needs (older than 1 hour)
         old_needs = [
@@ -664,12 +482,11 @@ class LiquidityCoordinator:
             "pending_needs": len(self._liquidity_needs),
             "inbound_needs": inbound_needs,
             "outbound_needs": outbound_needs,
-            "pending_proposals": len(self._pending_proposals),
             "nnlb_status": nnlb_status
         }
 
     # =========================================================================
-    # Phase 2: Liquidity Intelligence Sharing (Information Only)
+    # Liquidity Intelligence Sharing (Information Only)
     # =========================================================================
     # These methods coordinate INFORMATION about liquidity state.
     # No fund transfers between nodes - each node manages its own funds.
