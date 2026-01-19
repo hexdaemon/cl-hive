@@ -252,14 +252,6 @@ class SpliceCoordinator:
             except Exception as e:
                 self._log(f"Error getting fleet capacity from state: {e}", level="debug")
 
-        # Also check member liquidity state reports
-        try:
-            all_states = self.database.get_all_member_liquidity_states()
-            # Note: Liquidity state doesn't track per-peer capacity directly
-            # This is informational only
-        except Exception as e:
-            self._log(f"Error getting liquidity states: {e}", level="debug")
-
         return total
 
     def _get_our_capacity_to_peer(self, peer_id: str) -> int:

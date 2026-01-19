@@ -2636,7 +2636,7 @@ class HiveDatabase:
         capacity_score: int,
         revenue_score: int,
         connectivity_score: int,
-        tier: str = 'healthy',
+        tier: str = 'stable',
         needs_help: bool = False,
         can_help_others: bool = False,
         needs_inbound: bool = False,
@@ -2653,7 +2653,7 @@ class HiveDatabase:
             capacity_score: Capacity score (0-100)
             revenue_score: Revenue score (0-100)
             connectivity_score: Connectivity score (0-100)
-            tier: 'thriving', 'healthy', 'struggling', or 'critical'
+            tier: 'struggling', 'vulnerable', 'stable', or 'thriving'
             needs_help: Whether member needs assistance
             can_help_others: Whether member can provide assistance
             needs_inbound: Whether member needs inbound liquidity

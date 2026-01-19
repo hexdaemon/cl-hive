@@ -4649,8 +4649,9 @@ def _broadcast_liquidity_needs():
         # Get hive members
         members = database.get_all_members()
 
-        # Get our capacity to help others
-        can_help = liquidity_coord.can_help_with_liquidity(funds)
+        # Note: Cooperative rebalancing removed - we don't transfer funds between nodes.
+        # Set can_provide values to 0 since we're information-only.
+        # Broadcasting liquidity needs is still useful for fee coordination.
 
         broadcast_count = 0
         for need in needs[:3]:  # Broadcast top 3 needs
@@ -4662,8 +4663,8 @@ def _broadcast_liquidity_needs():
                 max_fee_ppm=100,  # Willing to pay 100ppm
                 reason=need["reason"],
                 current_balance_pct=need["current_balance_pct"],
-                can_provide_inbound=can_help["can_provide_inbound"],
-                can_provide_outbound=can_help["can_provide_outbound"],
+                can_provide_inbound=0,   # No cooperative rebalancing
+                can_provide_outbound=0,  # No cooperative rebalancing
                 rpc=safe_plugin.rpc
             )
 
