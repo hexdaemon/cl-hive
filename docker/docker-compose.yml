@@ -95,12 +95,10 @@ services:
       # Custom configs (optional)
       - ${CUSTOM_CONFIG_PATH:-./config}:/etc/lightning/custom:ro
 
-      # Mount entrypoint and supervisord for development/fixes without rebuilding
+      # Development mounts (optional - allows fixes without rebuilding)
+      # Comment these out for production to use baked-in versions
       - ./docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
       - ./supervisord.conf:/etc/supervisor/conf.d/supervisord.conf:ro
-
-      # Mount bitcoin-cli from host (required for CLN's bcli plugin)
-      - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
 
     ports:
       # Lightning P2P (only needed for clearnet/hybrid modes)

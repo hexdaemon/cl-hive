@@ -395,7 +395,22 @@ docker-compose exec cln lightning-cli revenue-status
 
 ### Bitcoin RPC Connection Failed
 
-See [runbooks/bitcoin-rpc-recovery.md](runbooks/bitcoin-rpc-recovery.md)
+**Common cause: Missing `rpcallowip` in Bitcoin config**
+
+Docker containers use a bridge network (typically 172.17.0.0/16 or 172.20.0.0/16). Your Bitcoin Core must allow connections from this network:
+
+```bash
+# Add to your bitcoin.conf
+rpcallowip=172.16.0.0/12  # Covers all Docker networks
+
+# Or more restrictive (check your Docker network)
+docker network inspect docker_lightning-network | grep Subnet
+rpcallowip=172.20.0.0/16  # Use the subnet shown
+
+# Restart Bitcoin Core after changes
+```
+
+See [runbooks/bitcoin-rpc-recovery.md](runbooks/bitcoin-rpc-recovery.md) for more details
 
 ### Tor Hidden Service Not Created
 
@@ -431,9 +446,9 @@ See [runbooks/emergency-shutdown.md](runbooks/emergency-shutdown.md)
    - Firewall: only expose necessary ports
 
 4. **Container Security**
-   - `no-new-privileges` enabled
-   - Minimal capabilities (cap_drop: ALL)
+   - `NET_ADMIN` and `NET_RAW` capabilities for Tor/WireGuard
    - Resource limits prevent DoS
+   - Processes run as root inside container (required for network config)
 
 5. **Updates**
    - Keep image updated for security fixes

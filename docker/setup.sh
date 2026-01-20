@@ -178,6 +178,13 @@ validate_bitcoin_rpc() {
     else
         print_warning "Could not connect to Bitcoin RPC"
         print_info "Response: $response"
+        echo ""
+        print_info "Common fixes:"
+        print_info "  1. Ensure Bitcoin Core is running"
+        print_info "  2. Check your bitcoin.conf has rpcuser/rpcpassword set"
+        print_info "  3. Add to bitcoin.conf: rpcallowip=172.16.0.0/12"
+        print_info "     (Docker containers need permission to connect)"
+        print_info "  4. Restart Bitcoin Core after changes"
         return 1
     fi
 }
