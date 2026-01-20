@@ -498,10 +498,6 @@ services:
     stop_grace_period: 120s
     stop_signal: SIGTERM
 
-    # Security hardening
-    security_opt:
-      - no-new-privileges:true
-
     # Additional volumes for backups
     volumes:
       - lightning-data:/data/lightning
