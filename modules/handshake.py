@@ -443,18 +443,18 @@ class HandshakeManager:
         if manifest_data.get('nonce') != expected_nonce:
             return (False, "Nonce mismatch")
         
-        # Verify nonce signature
+        # Verify nonce signature (pass pubkey for nodes not in gossip graph)
         try:
-            result = self.rpc.checkmessage(expected_nonce, nonce_sig)
+            result = self.rpc.checkmessage(expected_nonce, nonce_sig, pubkey)
             if not result.get('verified') or result.get('pubkey') != pubkey:
                 return (False, "Invalid nonce signature")
         except Exception as e:
             return (False, f"Nonce verification failed: {e}")
-        
-        # Verify manifest signature
+
+        # Verify manifest signature (pass pubkey for nodes not in gossip graph)
         manifest_json = json.dumps(manifest_data, sort_keys=True, separators=(',', ':'))
         try:
-            result = self.rpc.checkmessage(manifest_json, manifest_sig)
+            result = self.rpc.checkmessage(manifest_json, manifest_sig, pubkey)
             if not result.get('verified') or result.get('pubkey') != pubkey:
                 return (False, "Invalid manifest signature")
         except Exception as e:
