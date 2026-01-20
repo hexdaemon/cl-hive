@@ -468,8 +468,8 @@ Week 5-6: Public launch
 
 ## Decisions Made
 
-1. **Hosting**: VPS at hive.bolverker.com served by nginx
-2. **Domain**: hive.bolverker.com (subdomain)
+1. **Hosting**: VPS at hive.lightning-goats.com served by nginx
+2. **Domain**: hive.lightning-goats.com (subdomain)
 3. **Identity**: TBD (LNURL-auth or signed message)
 4. **Revenue Distribution**: Lightning via BOLT12 offers (all nodes are CLN)
 5. **Release Order**: cl_revenue_ops first, then portal
@@ -730,7 +730,7 @@ license: MIT
 wrapper-repo: https://github.com/lightninggoats/cl-revenue-ops-startos
 upstream-repo: https://github.com/lightninggoats/cl-revenue-ops
 support-site: https://github.com/lightninggoats/cl-revenue-ops/issues
-marketing-site: https://hive.bolverker.com
+marketing-site: https://hive.lightning-goats.com
 description:
   short: Fee optimization for Core Lightning
   long: |
@@ -809,7 +809,7 @@ fi
 
 ### 6.4 Self-Hosted Community App Store (Umbrel)
 
-We can host our own Umbrel community app store at hive.bolverker.com:
+We can host our own Umbrel community app store at hive.lightning-goats.com:
 
 **Structure:**
 ```
@@ -858,7 +858,7 @@ Users add the store URL in Umbrel settings, then can install our apps directly.
 | Week | Tasks |
 |------|-------|
 | **4** | Backend API (FastAPI on VPS) |
-| **5** | Frontend pages, nginx setup at hive.bolverker.com |
+| **5** | Frontend pages, nginx setup at hive.lightning-goats.com |
 | **6** | Integration testing, beta launch |
 
 ### Phase 4: App Store Expansion (Weeks 6-8)
