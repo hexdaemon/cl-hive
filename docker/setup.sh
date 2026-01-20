@@ -395,9 +395,10 @@ main() {
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
-    # Create secrets directory
+    # Create required directories
     mkdir -p secrets
     chmod 700 secrets
+    mkdir -p config
 
     # Write secrets (not in .env)
     echo -n "$BITCOIN_RPCPASSWORD" > secrets/bitcoin_rpc_password
