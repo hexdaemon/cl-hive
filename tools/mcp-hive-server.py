@@ -2104,6 +2104,20 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
+            name="settlement_generate_offer",
+            description="Auto-generate and register a BOLT12 offer for a node. Creates a new BOLT12 offer for receiving settlement payments and registers it automatically. Use this for nodes that joined before automatic offer generation was implemented.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="settlement_list_offers",
             description="List all registered BOLT12 offers for settlement. Shows which members have registered offers and can participate in revenue distribution.",
             inputSchema={
@@ -2394,6 +2408,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
         # Settlement tools (BOLT12 Revenue Distribution)
         elif name == "settlement_register_offer":
             result = await handle_settlement_register_offer(arguments)
+        elif name == "settlement_generate_offer":
+            result = await handle_settlement_generate_offer(arguments)
         elif name == "settlement_list_offers":
             result = await handle_settlement_list_offers(arguments)
         elif name == "settlement_calculate":
@@ -5281,6 +5297,29 @@ async def handle_settlement_register_offer(args: Dict) -> Dict:
             f"Offer registered for {peer_id[:16]}... "
             "This member can now participate in revenue settlement."
         )
+
+    return result
+
+
+async def handle_settlement_generate_offer(args: Dict) -> Dict:
+    """Auto-generate and register a BOLT12 offer for a node."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-settlement-generate-offer", {})
+
+    if "error" not in result:
+        status = result.get("status", "unknown")
+        if status == "already_registered":
+            result["ai_note"] = "This node already has a registered settlement offer."
+        elif status == "generated_and_registered":
+            result["ai_note"] = (
+                "Successfully generated and registered a BOLT12 offer for settlement. "
+                "This node can now participate in revenue distribution."
+            )
 
     return result
 

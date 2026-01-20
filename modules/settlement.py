@@ -256,6 +256,61 @@ class SettlementManager:
         )
         return {"status": "deactivated", "peer_id": peer_id}
 
+    def generate_and_register_offer(self, peer_id: str) -> Dict[str, Any]:
+        """
+        Generate a BOLT12 offer and register it for settlement.
+
+        This is called automatically when a node joins the hive to ensure
+        they can participate in revenue settlement from the start.
+
+        Args:
+            peer_id: The member's node public key (must be our own pubkey)
+
+        Returns:
+            Dict with status, offer details, or error
+        """
+        if not self.rpc:
+            return {"error": "No RPC interface available"}
+
+        # Check if we already have an active offer
+        existing = self.get_offer(peer_id)
+        if existing:
+            self.plugin.log(f"Settlement offer already registered for {peer_id[:16]}...")
+            return {
+                "status": "already_registered",
+                "peer_id": peer_id,
+                "offer": existing[:40] + "..."
+            }
+
+        try:
+            # Generate BOLT12 offer using CLN's offer RPC
+            # 'any' means any amount, description identifies purpose
+            result = self.rpc.offer(
+                amount="any",
+                description="hive settlement"
+            )
+
+            if "bolt12" not in result:
+                return {"error": "Failed to generate BOLT12 offer: no bolt12 in response"}
+
+            bolt12_offer = result["bolt12"]
+
+            # Register the offer
+            reg_result = self.register_offer(peer_id, bolt12_offer)
+
+            self.plugin.log(f"Auto-generated and registered settlement offer for {peer_id[:16]}...")
+
+            return {
+                "status": "generated_and_registered",
+                "peer_id": peer_id,
+                "offer": bolt12_offer[:40] + "...",
+                "offer_id": result.get("offer_id")
+            }
+
+        except Exception as e:
+            self.plugin.log(f"Failed to generate settlement offer: {e}", level='warn')
+            return {"error": f"Failed to generate offer: {e}"}
+
     # =========================================================================
     # FAIR SHARE CALCULATION
     # =========================================================================

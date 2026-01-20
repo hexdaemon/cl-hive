@@ -1725,6 +1725,14 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         # Also add the peer that welcomed us (they're an existing member)
         database.add_member(peer_id, tier='member', joined_at=now)
 
+        # Auto-generate and register BOLT12 offer for settlement
+        if settlement_mgr:
+            offer_result = settlement_mgr.generate_and_register_offer(our_pubkey)
+            if "error" in offer_result:
+                plugin.log(f"cl-hive: Failed to auto-register settlement offer: {offer_result['error']}", level='warn')
+            else:
+                plugin.log(f"cl-hive: Settlement offer auto-registered: {offer_result.get('status')}")
+
     # Initiate state sync with the peer that welcomed us
     if gossip_mgr and safe_plugin:
         state_hash_msg = _create_signed_state_hash_msg()
@@ -8014,6 +8022,27 @@ def hive_settlement_register_offer(plugin: Plugin, peer_id: str, bolt12_offer: s
     return settlement_mgr.register_offer(peer_id, bolt12_offer)
 
 
+@plugin.method("hive-settlement-generate-offer")
+def hive_settlement_generate_offer(plugin: Plugin):
+    """
+    Auto-generate and register a BOLT12 offer for this node.
+
+    This creates a new BOLT12 offer for receiving settlement payments
+    and registers it automatically. Call this if you joined the hive
+    before automatic offer generation was implemented.
+
+    Returns:
+        Dict with offer generation result.
+    """
+    if not settlement_mgr:
+        return {"error": "Settlement manager not initialized"}
+    if not handshake_mgr:
+        return {"error": "Handshake manager not initialized"}
+
+    our_pubkey = handshake_mgr.get_our_pubkey()
+    return settlement_mgr.generate_and_register_offer(our_pubkey)
+
+
 @plugin.method("hive-settlement-list-offers")
 def hive_settlement_list_offers(plugin: Plugin):
     """
@@ -8831,21 +8860,32 @@ def hive_request_promotion(plugin: Plugin):
 def hive_genesis(plugin: Plugin, hive_id: str = None):
     """
     Initialize this node as the Genesis (Admin) node of a new Hive.
-    
+
     This creates the first member record with member privileges and
     generates a self-signed genesis ticket.
-    
+
     Args:
         hive_id: Optional custom Hive identifier (auto-generated if not provided)
-    
+
     Returns:
         Dict with genesis status and member ticket
     """
     if not database or not safe_plugin or not handshake_mgr:
         return {"error": "Hive not initialized"}
-    
+
     try:
         result = handshake_mgr.genesis(hive_id)
+
+        # Auto-generate and register BOLT12 offer for settlement
+        if settlement_mgr:
+            our_pubkey = handshake_mgr.get_our_pubkey()
+            offer_result = settlement_mgr.generate_and_register_offer(our_pubkey)
+            if "error" in offer_result:
+                plugin.log(f"cl-hive: Failed to auto-register settlement offer: {offer_result['error']}", level='warn')
+            else:
+                result["settlement_offer"] = offer_result.get("status")
+                plugin.log(f"cl-hive: Settlement offer auto-registered for genesis member")
+
         return result
     except ValueError as e:
         return {"error": str(e)}
