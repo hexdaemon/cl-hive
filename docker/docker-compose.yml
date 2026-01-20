@@ -103,9 +103,9 @@ services:
       - ./docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
       - ./supervisord.conf:/etc/supervisor/conf.d/supervisord.conf:ro
 
-      # bitcoin-cli mount (optional - only needed if not baked into image)
-      # Copy your host's bitcoin-cli: cp /usr/local/bin/bitcoin-cli ./bitcoin-cli
-      - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
+      # bitcoin-cli mount (uncomment if build fails to download from bitcoincore.org)
+      # Copy your host's bitcoin-cli first: cp /usr/local/bin/bitcoin-cli ./bitcoin-cli
+      # - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
 
     ports:
       # Lightning P2P (only needed for clearnet/hybrid modes)

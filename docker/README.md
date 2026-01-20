@@ -412,6 +412,21 @@ rpcallowip=172.20.0.0/16  # Use the subnet shown
 
 See [runbooks/bitcoin-rpc-recovery.md](runbooks/bitcoin-rpc-recovery.md) for more details
 
+### bitcoin-cli Not Found / Build Timeout
+
+If the Docker build fails downloading bitcoin-cli from bitcoincore.org (timeout), or lightningd fails with "bitcoin-cli exec failed":
+
+```bash
+# Copy bitcoin-cli from your host
+cp /usr/local/bin/bitcoin-cli docker/bitcoin-cli
+
+# Uncomment the mount in docker-compose.yml:
+# - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
+
+# Restart
+docker-compose up -d
+```
+
 ### Tor Hidden Service Not Created
 
 See [runbooks/tor-recovery.md](runbooks/tor-recovery.md)
