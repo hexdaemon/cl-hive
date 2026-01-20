@@ -17,6 +17,9 @@ wireguard/
 config/
 !config/.gitkeep
 
+# Host binaries (mounted from host)
+bitcoin-cli
+
 # Build artifacts
 *.tar
 *.gz

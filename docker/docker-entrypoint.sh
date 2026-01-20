@@ -66,6 +66,13 @@ WIREGUARD_ENABLED="${WIREGUARD_ENABLED:-false}"
 HIVE_GOVERNANCE_MODE="${HIVE_GOVERNANCE_MODE:-advisor}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 
+# Set TOR_ENABLED based on NETWORK_MODE (for supervisord)
+if [[ "$NETWORK_MODE" == "tor" || "$NETWORK_MODE" == "hybrid" ]]; then
+    export TOR_ENABLED=true
+else
+    export TOR_ENABLED=false
+fi
+
 # -----------------------------------------------------------------------------
 # Load Secrets
 # -----------------------------------------------------------------------------
@@ -142,6 +149,9 @@ wallet=sqlite3://$LIGHTNING_DIR/lightningd.sqlite3
 
 # Plugins directory
 plugin-dir=/root/.lightning/plugins
+
+# gRPC plugin (must use different port than Lightning P2P)
+grpc-port=9937
 EOF
 
 # -----------------------------------------------------------------------------
