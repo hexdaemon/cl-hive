@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/sat/bin/cl-hive/.venv/bin/python3
 """
 cl-hive: Distributed Swarm Intelligence for Lightning Node Fleets
 
