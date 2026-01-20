@@ -51,6 +51,7 @@ import logging
 import os
 import ssl
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -2008,6 +2009,113 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 },
                 "required": ["node"]
             }
+        ),
+        # =====================================================================
+        # Settlement Tools (BOLT12 Revenue Distribution)
+        # =====================================================================
+        Tool(
+            name="settlement_register_offer",
+            description="Register a BOLT12 offer for receiving settlement payments. Each hive member must register their offer to participate in revenue distribution.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Member's node public key"
+                    },
+                    "bolt12_offer": {
+                        "type": "string",
+                        "description": "BOLT12 offer string (starts with lno1...)"
+                    }
+                },
+                "required": ["node", "peer_id", "bolt12_offer"]
+            }
+        ),
+        Tool(
+            name="settlement_list_offers",
+            description="List all registered BOLT12 offers for settlement. Shows which members have registered offers and can participate in revenue distribution.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="settlement_calculate",
+            description="Calculate fair shares for the current period without executing. Shows what each member would receive/pay based on: 40% capacity weight, 40% routing volume weight, 20% uptime weight.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="settlement_execute",
+            description="Execute settlement for the current period. Calculates fair shares and generates BOLT12 payments from members with surplus to members with deficit. Requires all participating members to have registered offers.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, calculate but don't execute payments (default: true)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="settlement_history",
+            description="Get settlement history showing past periods, total fees distributed, and member participation.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of periods to return (default: 10)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="settlement_period_details",
+            description="Get detailed information about a specific settlement period including contributions, fair shares, and payments.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "period_id": {
+                        "type": "integer",
+                        "description": "Settlement period ID"
+                    }
+                },
+                "required": ["node", "period_id"]
+            }
         )
     ]
 
@@ -2207,6 +2315,19 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_physarum_cycle(arguments)
         elif name == "physarum_status":
             result = await handle_physarum_status(arguments)
+        # Settlement tools (BOLT12 Revenue Distribution)
+        elif name == "settlement_register_offer":
+            result = await handle_settlement_register_offer(arguments)
+        elif name == "settlement_list_offers":
+            result = await handle_settlement_list_offers(arguments)
+        elif name == "settlement_calculate":
+            result = await handle_settlement_calculate(arguments)
+        elif name == "settlement_execute":
+            result = await handle_settlement_execute(arguments)
+        elif name == "settlement_history":
+            result = await handle_settlement_history(arguments)
+        elif name == "settlement_period_details":
+            result = await handle_settlement_period_details(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -4978,6 +5099,232 @@ async def handle_physarum_status(args: Dict) -> Dict:
         )
 
     return result
+
+
+# =============================================================================
+# Settlement Handlers (BOLT12 Revenue Distribution)
+# =============================================================================
+
+# Global settlement manager (lazily initialized)
+_settlement_manager = None
+
+
+def get_settlement_manager():
+    """Get or create the settlement manager."""
+    global _settlement_manager
+    if _settlement_manager is None:
+        # Import here to avoid circular imports
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from modules.settlement import SettlementManager
+
+        # Use dedicated settlement database
+        class MockPlugin:
+            def log(self, msg, level='info'):
+                logger.log(getattr(logging, level.upper(), logging.INFO), msg)
+
+        class MockDatabase:
+            def __init__(self):
+                self.db_path = os.path.expanduser("~/.lightning/hive_settlement.db")
+                self._local = threading.local()
+
+            def _get_connection(self):
+                if not hasattr(self._local, 'conn') or self._local.conn is None:
+                    import sqlite3
+                    os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+                    self._local.conn = sqlite3.connect(self.db_path, isolation_level=None)
+                    self._local.conn.row_factory = sqlite3.Row
+                    self._local.conn.execute("PRAGMA journal_mode=WAL;")
+                return self._local.conn
+
+        db = MockDatabase()
+        plugin = MockPlugin()
+        _settlement_manager = SettlementManager(db, plugin)
+        _settlement_manager.initialize_tables()
+
+    return _settlement_manager
+
+
+async def handle_settlement_register_offer(args: Dict) -> Dict:
+    """Register a BOLT12 offer for receiving settlement payments."""
+    peer_id = args.get("peer_id")
+    bolt12_offer = args.get("bolt12_offer")
+
+    if not peer_id:
+        return {"error": "peer_id is required"}
+    if not bolt12_offer:
+        return {"error": "bolt12_offer is required"}
+
+    settlement = get_settlement_manager()
+    result = settlement.register_offer(peer_id, bolt12_offer)
+
+    if "error" not in result:
+        result["ai_note"] = (
+            f"Offer registered for {peer_id[:16]}... "
+            "This member can now participate in revenue settlement."
+        )
+
+    return result
+
+
+async def handle_settlement_list_offers(args: Dict) -> Dict:
+    """List all registered BOLT12 offers."""
+    settlement = get_settlement_manager()
+    offers = settlement.list_offers()
+
+    active = [o for o in offers if o.get("active")]
+    inactive = [o for o in offers if not o.get("active")]
+
+    return {
+        "total_offers": len(offers),
+        "active_offers": len(active),
+        "inactive_offers": len(inactive),
+        "offers": offers,
+        "ai_note": (
+            f"{len(active)} members have registered offers and can participate in settlement. "
+            f"{len(inactive)} offers are deactivated."
+        )
+    }
+
+
+async def handle_settlement_calculate(args: Dict) -> Dict:
+    """Calculate fair shares for the current period without executing."""
+    node_name = args.get("node")
+
+    # Import here to avoid circular imports
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from modules.settlement import MemberContribution
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    settlement = get_settlement_manager()
+
+    # Get member data from hive
+    try:
+        members_result = await node.call("hive-members", {})
+        members = members_result.get("members", [])
+    except Exception as e:
+        return {"error": f"Failed to get hive members: {e}"}
+
+    if not members:
+        return {"error": "No hive members found"}
+
+    # Build contribution data
+    contributions = []
+    for member in members:
+        peer_id = member.get("peer_id")
+        offer = settlement.get_offer(peer_id)
+
+        contributions.append(MemberContribution(
+            peer_id=peer_id,
+            capacity_sats=member.get("capacity_sats", 0),
+            forwards_sats=member.get("contribution_sats", 0),
+            fees_earned_sats=member.get("fees_earned_sats", 0),
+            uptime_pct=member.get("uptime_pct", 100.0),
+            bolt12_offer=offer
+        ))
+
+    # Calculate fair shares
+    results = settlement.calculate_fair_shares(contributions)
+
+    # Generate payments
+    payments = settlement.generate_payments(results)
+
+    # Format results
+    total_fees = sum(r.fees_earned for r in results)
+    surplus_members = [r for r in results if r.balance < 0]
+    deficit_members = [r for r in results if r.balance > 0]
+
+    return {
+        "period_summary": {
+            "total_members": len(results),
+            "total_fees_sats": total_fees,
+            "surplus_members": len(surplus_members),
+            "deficit_members": len(deficit_members),
+            "total_payments": len(payments)
+        },
+        "fair_shares": [
+            {
+                "peer_id": r.peer_id[:16] + "...",
+                "fees_earned": r.fees_earned,
+                "fair_share": r.fair_share,
+                "balance": r.balance,
+                "has_offer": r.bolt12_offer is not None,
+                "status": "pays" if r.balance < 0 else ("receives" if r.balance > 0 else "even")
+            }
+            for r in results
+        ],
+        "payments_required": [
+            {
+                "from": p.from_peer[:16] + "...",
+                "to": p.to_peer[:16] + "...",
+                "amount_sats": p.amount_sats
+            }
+            for p in payments
+        ],
+        "ai_note": (
+            f"Settlement calculation complete. {len(surplus_members)} members earned more than fair share "
+            f"and would pay {len(deficit_members)} members who earned less. "
+            f"Total of {len(payments)} payments totaling {sum(p.amount_sats for p in payments)} sats."
+        )
+    }
+
+
+async def handle_settlement_execute(args: Dict) -> Dict:
+    """Execute settlement for the current period."""
+    dry_run = args.get("dry_run", True)  # Default to dry run for safety
+
+    # Calculate first
+    result = await handle_settlement_calculate(args)
+
+    if "error" in result:
+        return result
+
+    if dry_run:
+        result["execution_status"] = "dry_run"
+        result["ai_note"] = (
+            "DRY RUN - No payments executed. "
+            "Set dry_run=false to execute actual payments. "
+            "Ensure all participating members have registered BOLT12 offers first."
+        )
+    else:
+        result["execution_status"] = "not_implemented"
+        result["ai_note"] = (
+            "Actual payment execution requires additional infrastructure. "
+            "This shows what would be settled. Implementation pending."
+        )
+
+    return result
+
+
+async def handle_settlement_history(args: Dict) -> Dict:
+    """Get settlement history."""
+    limit = args.get("limit", 10)
+
+    settlement = get_settlement_manager()
+    history = settlement.get_settlement_history(limit=limit)
+
+    return {
+        "settlement_periods": history,
+        "total_periods": len(history),
+        "ai_note": f"Showing last {len(history)} settlement periods."
+    }
+
+
+async def handle_settlement_period_details(args: Dict) -> Dict:
+    """Get detailed information about a specific settlement period."""
+    period_id = args.get("period_id")
+
+    if period_id is None:
+        return {"error": "period_id is required"}
+
+    settlement = get_settlement_manager()
+    details = settlement.get_period_details(period_id)
+
+    return details
 
 
 # =============================================================================
