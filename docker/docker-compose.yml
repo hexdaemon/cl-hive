@@ -1,9 +1,14 @@
 # cl-hive Production Node - Docker Compose
 #
 # Usage:
-#   1. Copy .env.example to .env and configure
-#   2. docker-compose up -d
-#   3. docker-compose logs -f
+#   1. Run ./setup.sh for interactive configuration, OR
+#   2. Copy .env.example to .env and configure manually
+#   3. docker-compose up -d
+#   4. docker-compose logs -f
+#
+# Production deployment:
+#   ./setup.sh                     # Interactive wizard
+#   docker-compose up -d           # Start with production settings
 #
 # Access lightning-cli:
 #   docker-compose exec cln lightning-cli getinfo
@@ -19,10 +24,30 @@ services:
     container_name: cl-hive-node
     restart: unless-stopped
 
-    # Required for WireGuard
+    # Graceful shutdown configuration
+    stop_grace_period: 120s
+    stop_signal: SIGTERM
+
+    # Resource limits (override via docker-compose.override.yml or .env)
+    deploy:
+      resources:
+        limits:
+          cpus: '${CPU_LIMIT:-4}'
+          memory: ${MEMORY_LIMIT:-8G}
+        reservations:
+          cpus: '${CPU_RESERVATION:-2}'
+          memory: ${MEMORY_RESERVATION:-4G}
+
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Required capabilities for WireGuard and networking
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
+      - NET_RAW
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -100,12 +125,22 @@ services:
       driver: "json-file"
       options:
         max-size: "100m"
-        max-file: "5"
+        max-file: "10"
+        labels: "service,node"
+        tag: "{{.Name}}/{{.ID}}"
+
+    labels:
+      - "com.cl-hive.service=lightning"
+      - "com.cl-hive.backup=true"
 
 volumes:
   lightning-data:
     driver: local
+    labels:
+      - "com.cl-hive.backup=critical"
 
 networks:
   lightning-network:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"

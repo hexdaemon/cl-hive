@@ -25,6 +25,32 @@ echo "=== cl-hive Production Node ==="
 echo "Starting initialization..."
 
 # -----------------------------------------------------------------------------
+# Secret Loading Function
+# -----------------------------------------------------------------------------
+# Reads secrets from Docker secrets files (/run/secrets/) or environment
+load_secret() {
+    local var_name="$1"
+    local file_var="${var_name}_FILE"
+    local secret_value=""
+
+    # Check for _FILE environment variable pointing to secret
+    if [[ -n "${!file_var:-}" && -f "${!file_var}" ]]; then
+        secret_value=$(cat "${!file_var}")
+        echo "Loaded $var_name from file"
+    # Check standard Docker secrets location
+    elif [[ -f "/run/secrets/${var_name,,}" ]]; then
+        secret_value=$(cat "/run/secrets/${var_name,,}")
+        echo "Loaded $var_name from Docker secret"
+    # Fall back to environment variable
+    elif [[ -n "${!var_name:-}" ]]; then
+        secret_value="${!var_name}"
+    fi
+
+    # Export the value
+    export "$var_name"="$secret_value"
+}
+
+# -----------------------------------------------------------------------------
 # Default Values
 # -----------------------------------------------------------------------------
 
@@ -38,6 +64,13 @@ WIREGUARD_ENABLED="${WIREGUARD_ENABLED:-false}"
 HIVE_GOVERNANCE_MODE="${HIVE_GOVERNANCE_MODE:-advisor}"
 CLBOSS_ENABLED="${CLBOSS_ENABLED:-true}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
+
+# -----------------------------------------------------------------------------
+# Load Secrets
+# -----------------------------------------------------------------------------
+echo "Loading secrets..."
+load_secret BITCOIN_RPCPASSWORD
+load_secret WG_PRIVATE_KEY
 
 # Set network-specific defaults
 case "$NETWORK" in
@@ -312,6 +345,26 @@ echo "Hive Mode:      $HIVE_GOVERNANCE_MODE"
 echo "Lightning Dir:  $LIGHTNING_DIR"
 echo "============================="
 echo ""
+
+# -----------------------------------------------------------------------------
+# Pre-flight Validation
+# -----------------------------------------------------------------------------
+
+# Validate critical configuration
+if [ -z "$BITCOIN_RPCPASSWORD" ]; then
+    echo "WARNING: BITCOIN_RPCPASSWORD not loaded - check secrets configuration"
+fi
+
+# Ensure supervisor log directory exists
+mkdir -p /var/log/supervisor
+
+# Copy pre-stop script if not present
+if [ -d /opt/cl-hive/docker/scripts ]; then
+    cp /opt/cl-hive/docker/scripts/pre-stop.sh /usr/local/bin/ 2>/dev/null || true
+    chmod +x /usr/local/bin/pre-stop.sh 2>/dev/null || true
+fi
+
+echo "Initialization complete. Starting services..."
 
 # -----------------------------------------------------------------------------
 # Execute Command

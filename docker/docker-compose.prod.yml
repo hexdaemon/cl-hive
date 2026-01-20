@@ -1,0 +1,113 @@
+# cl-hive Production Overlay with Docker Secrets
+#
+# This file adds production-grade secrets management to the base docker-compose.yml.
+# Use this for production deployments where secrets should not be in environment variables.
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Prerequisites:
+#   1. Run ./setup.sh to create secrets/ directory and files
+#   2. Or manually create:
+#      - secrets/bitcoin_rpc_password
+#      - secrets/wg_private_key (if WireGuard enabled)
+#      - secrets/hive_rune (optional, for API access)
+
+version: '3.8'
+
+services:
+  cln:
+    # Override environment to use secret files
+    environment:
+      # Bitcoin RPC (password from secret)
+      - BITCOIN_RPCHOST=${BITCOIN_RPCHOST:-host.docker.internal}
+      - BITCOIN_RPCPORT=${BITCOIN_RPCPORT:-8332}
+      - BITCOIN_RPCUSER=${BITCOIN_RPCUSER}
+      # Password loaded from secret file in entrypoint
+      - BITCOIN_RPCPASSWORD_FILE=/run/secrets/bitcoin_rpc_password
+
+      # Network
+      - NETWORK=${NETWORK:-bitcoin}
+
+      # Node Identity
+      - ALIAS=${ALIAS:-cl-hive-node}
+      - RGB=${RGB:-FF9900}
+      - ANNOUNCE_ADDR=${ANNOUNCE_ADDR:-}
+
+      # Tor
+      - TOR_ENABLED=${TOR_ENABLED:-true}
+
+      # WireGuard VPN (key from secret)
+      - WIREGUARD_ENABLED=${WIREGUARD_ENABLED:-false}
+      - WG_PRIVATE_KEY_FILE=/run/secrets/wg_private_key
+      - WG_ADDRESS=${WG_ADDRESS:-}
+      - WG_PEER_PUBLIC_KEY=${WG_PEER_PUBLIC_KEY:-}
+      - WG_PEER_ENDPOINT=${WG_PEER_ENDPOINT:-}
+      - WG_DNS=${WG_DNS:-}
+      - WG_PEER_KEEPALIVE=${WG_PEER_KEEPALIVE:-25}
+
+      # CLBOSS
+      - CLBOSS_ENABLED=${CLBOSS_ENABLED:-true}
+
+      # cl-hive
+      - HIVE_GOVERNANCE_MODE=${HIVE_GOVERNANCE_MODE:-advisor}
+
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+
+      # Lightning directory
+      - LIGHTNING_DIR=/data/lightning/${NETWORK:-bitcoin}
+
+    # Mount secrets
+    secrets:
+      - bitcoin_rpc_password
+      - wg_private_key
+      - source: hive_rune
+        mode: 0400
+
+    # Additional production volumes
+    volumes:
+      - lightning-data:/data/lightning
+      - ${WIREGUARD_CONFIG_PATH:-./wireguard}:/etc/wireguard:ro
+      - ${CUSTOM_CONFIG_PATH:-./config}:/etc/lightning/custom:ro
+      # Backup mount point
+      - ${BACKUP_LOCATION:-./backups}:/backups
+
+    # Production resource limits (can be overridden via .env)
+    deploy:
+      resources:
+        limits:
+          cpus: '${CPU_LIMIT:-4}'
+          memory: ${MEMORY_LIMIT:-8G}
+        reservations:
+          cpus: '${CPU_RESERVATION:-2}'
+          memory: ${MEMORY_RESERVATION:-4G}
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+    # Enhanced health check for production
+    healthcheck:
+      test: ["CMD-SHELL", "lightning-cli --lightning-dir=/data/lightning/${NETWORK:-bitcoin} getinfo && lightning-cli --lightning-dir=/data/lightning/${NETWORK:-bitcoin} hive-status"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+
+# Docker secrets definitions
+secrets:
+  bitcoin_rpc_password:
+    file: ./secrets/bitcoin_rpc_password
+  wg_private_key:
+    file: ./secrets/wg_private_key
+  hive_rune:
+    file: ./secrets/hive_rune
+
+# Named volumes with backup labels
+volumes:
+  lightning-data:
+    labels:
+      - "com.cl-hive.backup=critical"
+      - "com.cl-hive.backup.schedule=daily"
