@@ -104,9 +104,6 @@ services:
       # REST API (optional, uncomment if needed)
       # - "8080:8080"
 
-      # WireGuard (only if enabled)
-      - "${WIREGUARD_PORT:-51820}:51820/udp"
-
     networks:
       - lightning-network
 

@@ -508,7 +508,6 @@ EOF
 # PORTS
 # =============================================================================
 LIGHTNING_PORT=$LIGHTNING_PORT
-WIREGUARD_PORT=51820
 EOF
 
     print_success "Created .env"
