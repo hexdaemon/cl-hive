@@ -109,6 +109,7 @@ These are non-negotiable:
 3. **No silent fund actions**: Never move funds unless governance mode explicitly allows
 4. **Identity binding**: Sender peer_id must match claimed pubkey in payload
 5. **DoS protection**: Max 200 remote intents cached, rate limits on all loops
+6. **Hive channels always zero fees**: Channels between hive fleet members MUST have 0 ppm fees (both base and proportional). Never apply static policies to hive channels.
 
 ## Planner Rules
 
