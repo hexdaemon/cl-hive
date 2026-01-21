@@ -89,6 +89,9 @@ class HiveMessageType(IntEnum):
     # Phase 8: Hive-wide Affordability
     EXPANSION_DECLINE = 32819   # Elected member declines, trigger fallback (Phase 8)
 
+    # Phase 9: Settlement
+    SETTLEMENT_OFFER = 32821    # Broadcast BOLT12 offer for settlement
+
     # Phase 7: Cooperative Fee Coordination
     FEE_INTELLIGENCE = 32809    # Share fee observations with hive
     LIQUIDITY_NEED = 32811      # Broadcast rebalancing needs
@@ -2346,3 +2349,48 @@ def create_health_report(
     }
 
     return serialize(HiveMessageType.HEALTH_REPORT, payload)
+
+
+def create_settlement_offer(
+    peer_id: str,
+    bolt12_offer: str,
+    timestamp: int,
+    signature: str
+) -> bytes:
+    """
+    Create a SETTLEMENT_OFFER message to broadcast BOLT12 offer for settlement.
+
+    This message is broadcast when a member registers a settlement offer so
+    all hive members can record the offer for future settlement calculations.
+
+    Args:
+        peer_id: Member's node public key
+        bolt12_offer: BOLT12 offer string (lno1...)
+        timestamp: Unix timestamp of registration
+        signature: zbase-encoded signature from signmessage(peer_id + bolt12_offer)
+
+    Returns:
+        Serialized SETTLEMENT_OFFER message
+    """
+    payload = {
+        "peer_id": peer_id,
+        "bolt12_offer": bolt12_offer,
+        "timestamp": timestamp,
+        "signature": signature,
+    }
+
+    return serialize(HiveMessageType.SETTLEMENT_OFFER, payload)
+
+
+def get_settlement_offer_signing_payload(peer_id: str, bolt12_offer: str) -> str:
+    """
+    Get the canonical payload for signing a settlement offer announcement.
+
+    Args:
+        peer_id: Member's node public key
+        bolt12_offer: BOLT12 offer string
+
+    Returns:
+        String to be signed with signmessage()
+    """
+    return f"settlement_offer:{peer_id}:{bolt12_offer}"

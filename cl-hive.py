@@ -61,6 +61,8 @@ from modules.protocol import (
     get_gossip_signing_payload, get_state_hash_signing_payload,
     get_full_sync_signing_payload, get_intent_abort_signing_payload,
     get_peer_available_signing_payload, compute_states_hash,
+    # Settlement offer broadcast
+    create_settlement_offer, get_settlement_offer_signing_payload,
 )
 from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager
@@ -1423,6 +1425,9 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_route_probe(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.PEER_REPUTATION:
             return handle_peer_reputation(peer_id, msg_payload, plugin)
+        # Phase 9: Settlement
+        elif msg_type == HiveMessageType.SETTLEMENT_OFFER:
+            return handle_settlement_offer(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -1733,6 +1738,11 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                 plugin.log(f"cl-hive: Failed to auto-register settlement offer: {offer_result['error']}", level='warn')
             else:
                 plugin.log(f"cl-hive: Settlement offer auto-registered: {offer_result.get('status')}")
+                # Broadcast to hive members
+                bolt12_offer = settlement_mgr.get_offer(our_pubkey)
+                if bolt12_offer:
+                    broadcast_count = _broadcast_settlement_offer(our_pubkey, bolt12_offer)
+                    plugin.log(f"cl-hive: Broadcast settlement offer to {broadcast_count} member(s)")
 
     # Initiate state sync with the peer that welcomed us
     if gossip_mgr and safe_plugin:
@@ -4359,6 +4369,102 @@ def handle_peer_reputation(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         )
 
     return {"result": "continue"}
+
+
+def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle SETTLEMENT_OFFER message from a hive member.
+
+    Stores the member's BOLT12 offer for use in settlement calculations.
+    """
+    if not settlement_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: SETTLEMENT_OFFER from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Extract payload fields
+    offer_peer_id = payload.get("peer_id")
+    bolt12_offer = payload.get("bolt12_offer")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # Validate required fields
+    if not all([offer_peer_id, bolt12_offer, signature]):
+        plugin.log(f"cl-hive: SETTLEMENT_OFFER missing required fields from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify the offer peer_id matches the sender (you can only broadcast your own offer)
+    if offer_peer_id != peer_id:
+        plugin.log(f"cl-hive: SETTLEMENT_OFFER peer_id mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Verify the signature
+    signing_payload = get_settlement_offer_signing_payload(offer_peer_id, bolt12_offer)
+    try:
+        verify_result = safe_plugin.rpc.call("checkmessage", {
+            "message": signing_payload,
+            "zbase": signature,
+            "pubkey": offer_peer_id
+        })
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: SETTLEMENT_OFFER invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: SETTLEMENT_OFFER signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Store the offer
+    result = settlement_mgr.register_offer(offer_peer_id, bolt12_offer)
+
+    if "error" not in result:
+        plugin.log(f"cl-hive: Stored settlement offer from {peer_id[:16]}...")
+    else:
+        plugin.log(f"cl-hive: Failed to store settlement offer: {result.get('error')}", level='debug')
+
+    return {"result": "continue"}
+
+
+def _broadcast_settlement_offer(peer_id: str, bolt12_offer: str) -> int:
+    """
+    Broadcast a settlement offer to all hive members.
+
+    Args:
+        peer_id: The member's node public key
+        bolt12_offer: The BOLT12 offer string
+
+    Returns:
+        Number of members the message was sent to
+    """
+    if not safe_plugin or not handshake_mgr:
+        return 0
+
+    timestamp = int(time.time())
+
+    # Sign the offer
+    signing_payload = get_settlement_offer_signing_payload(peer_id, bolt12_offer)
+    try:
+        sign_result = safe_plugin.rpc.call("signmessage", {"message": signing_payload})
+        signature = sign_result.get("zbase")
+        if not signature:
+            safe_plugin.log("cl-hive: Failed to sign settlement offer", level='warn')
+            return 0
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: Failed to sign settlement offer: {e}", level='warn')
+        return 0
+
+    # Create the message
+    msg = create_settlement_offer(peer_id, bolt12_offer, timestamp, signature)
+
+    # Broadcast to all members
+    sent = _broadcast_to_members(msg)
+    if sent > 0:
+        safe_plugin.log(f"cl-hive: Broadcast settlement offer to {sent} member(s)")
+
+    return sent
 
 
 # =============================================================================
@@ -8010,6 +8116,7 @@ def hive_settlement_register_offer(plugin: Plugin, peer_id: str, bolt12_offer: s
     Register a BOLT12 offer for receiving settlement payments.
 
     Each hive member must register their offer to participate in revenue distribution.
+    If registering your own offer, it will be broadcast to other hive members.
 
     Args:
         peer_id: Member's node public key
@@ -8020,7 +8127,16 @@ def hive_settlement_register_offer(plugin: Plugin, peer_id: str, bolt12_offer: s
     """
     if not settlement_mgr:
         return {"error": "Settlement manager not initialized"}
-    return settlement_mgr.register_offer(peer_id, bolt12_offer)
+
+    result = settlement_mgr.register_offer(peer_id, bolt12_offer)
+
+    # Broadcast if this is our own offer and registration succeeded
+    if "error" not in result and handshake_mgr:
+        if peer_id == handshake_mgr.get_our_pubkey():
+            broadcast_count = _broadcast_settlement_offer(peer_id, bolt12_offer)
+            result["broadcast_count"] = broadcast_count
+
+    return result
 
 
 @plugin.method("hive-settlement-generate-offer")
@@ -8029,8 +8145,7 @@ def hive_settlement_generate_offer(plugin: Plugin):
     Auto-generate and register a BOLT12 offer for this node.
 
     This creates a new BOLT12 offer for receiving settlement payments
-    and registers it automatically. Call this if you joined the hive
-    before automatic offer generation was implemented.
+    and registers it automatically. The offer is broadcast to all hive members.
 
     Returns:
         Dict with offer generation result.
@@ -8041,7 +8156,17 @@ def hive_settlement_generate_offer(plugin: Plugin):
         return {"error": "Handshake manager not initialized"}
 
     our_pubkey = handshake_mgr.get_our_pubkey()
-    return settlement_mgr.generate_and_register_offer(our_pubkey)
+    result = settlement_mgr.generate_and_register_offer(our_pubkey)
+
+    # Broadcast to hive members if generation succeeded
+    if "error" not in result:
+        # Get the full offer from the database
+        bolt12_offer = settlement_mgr.get_offer(our_pubkey)
+        if bolt12_offer:
+            broadcast_count = _broadcast_settlement_offer(our_pubkey, bolt12_offer)
+            result["broadcast_count"] = broadcast_count
+
+    return result
 
 
 @plugin.method("hive-settlement-list-offers")
