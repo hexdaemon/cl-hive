@@ -306,6 +306,18 @@ strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
 anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
 our_pubkey: Optional[str] = None
 
+# Fee tracking for real-time gossip (Settlement Phase)
+_local_fees_earned_sats: int = 0
+_local_fees_forward_count: int = 0
+_local_fees_period_start: int = 0
+_local_fees_last_broadcast: int = 0
+_local_fees_last_broadcast_amount: int = 0  # Tracks fees at last broadcast
+_local_fees_lock = threading.Lock()
+
+# Fee broadcast thresholds
+FEE_BROADCAST_MIN_SATS = 10  # Minimum cumulative fee change to trigger broadcast
+FEE_BROADCAST_MIN_INTERVAL = 30  # Minimum seconds between broadcasts
+
 
 # =============================================================================
 # RATE LIMITER (Security Enhancement)
@@ -1082,6 +1094,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     fee_intel_thread.start()
     plugin.log("cl-hive: Fee intelligence thread started")
 
+    # Start gossip loop thread (broadcasts capacity/state to hive members)
+    gossip_thread = threading.Thread(
+        target=gossip_loop,
+        name="cl-hive-gossip",
+        daemon=True
+    )
+    gossip_thread.start()
+    plugin.log("cl-hive: Gossip thread started")
+
     # Initialize Liquidity Coordinator (Phase 7.3 - Cooperative Rebalancing)
     global liquidity_coord
     liquidity_coord = LiquidityCoordinator(
@@ -1442,6 +1463,8 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
         # Phase 9: Settlement
         elif msg_type == HiveMessageType.SETTLEMENT_OFFER:
             return handle_settlement_offer(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.FEE_REPORT:
+            return handle_fee_report(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -2288,12 +2311,15 @@ def on_peer_disconnected(**kwargs):
 
 
 @plugin.subscribe("forward_event")
-def on_forward_event(plugin: Plugin, **payload):
+def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     """Track forwarding events for contribution, leech detection, and route probing."""
+    status = forward_event.get("status", "unknown")
+    fee_msat = forward_event.get("fee_msat", 0)
+
     # Handle contribution tracking
     if contribution_mgr:
         try:
-            contribution_mgr.handle_forward_event(payload)
+            contribution_mgr.handle_forward_event({"forward_event": forward_event})
         except Exception as e:
             if safe_plugin:
                 safe_plugin.log(f"Forward event handling error: {e}", level="warn")
@@ -2301,8 +2327,6 @@ def on_forward_event(plugin: Plugin, **payload):
     # Generate route probe data from successful forwards (Phase 7.4)
     if routing_map and database and our_pubkey:
         try:
-            forward_event = payload.get("forward_event", payload)
-            status = forward_event.get("status")
             if status == "settled":
                 _record_forward_as_route_probe(forward_event)
         except Exception as e:
@@ -2312,22 +2336,169 @@ def on_forward_event(plugin: Plugin, **payload):
     # Record routing revenue to pool (Phase 0 - Collective Economics)
     if routing_pool and our_pubkey:
         try:
-            forward_event = payload.get("forward_event", payload)
-            status = forward_event.get("status")
             if status == "settled":
                 fee_msat = forward_event.get("fee_msat", 0)
-                if fee_msat > 0:
-                    fee_sats = fee_msat // 1000
-                    if fee_sats > 0:
-                        routing_pool.record_revenue(
-                            member_id=our_pubkey,
-                            amount_sats=fee_sats,
-                            channel_id=forward_event.get("out_channel"),
-                            payment_hash=forward_event.get("payment_hash")
-                        )
+                fee_sats = fee_msat // 1000
+                if fee_msat > 0 and fee_sats > 0:
+                    routing_pool.record_revenue(
+                        member_id=our_pubkey,
+                        amount_sats=fee_sats,
+                        channel_id=forward_event.get("out_channel"),
+                        payment_hash=forward_event.get("payment_hash")
+                    )
+                    # Broadcast fee report to hive (real-time settlement)
+                    _update_and_broadcast_fees(fee_sats)
         except Exception as e:
             if safe_plugin:
                 safe_plugin.log(f"Pool revenue recording error: {e}", level="debug")
+
+
+def _update_and_broadcast_fees(new_fee_sats: int):
+    """
+    Update local fee tracking and broadcast to hive if threshold met.
+
+    Called on each settled forward to maintain real-time fee gossip
+    for accurate settlement calculations.
+
+    Args:
+        new_fee_sats: Fees earned from this forward
+    """
+    global _local_fees_earned_sats, _local_fees_forward_count
+    global _local_fees_period_start, _local_fees_last_broadcast
+    global _local_fees_last_broadcast_amount
+
+    if not our_pubkey or not database or not safe_plugin:
+        return
+
+    now = int(time.time())
+
+    with _local_fees_lock:
+        # Initialize period start if needed (weekly periods aligned to Monday 00:00 UTC)
+        if _local_fees_period_start == 0:
+            # Calculate start of current week
+            from datetime import datetime, timezone
+            dt = datetime.fromtimestamp(now, tz=timezone.utc)
+            # Monday = 0, so days_since_monday = weekday
+            days_since_monday = dt.weekday()
+            week_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            week_start = week_start.timestamp() - (days_since_monday * 86400)
+            _local_fees_period_start = int(week_start)
+
+        # Update local tracking
+        _local_fees_earned_sats += new_fee_sats
+        _local_fees_forward_count += 1
+
+        # Check if we should broadcast - cumulative change since last broadcast
+        cumulative_fee_change = _local_fees_earned_sats - _local_fees_last_broadcast_amount
+        time_since_broadcast = now - _local_fees_last_broadcast
+
+        should_broadcast = (
+            cumulative_fee_change >= FEE_BROADCAST_MIN_SATS and
+            time_since_broadcast >= FEE_BROADCAST_MIN_INTERVAL
+        )
+
+        if not should_broadcast:
+            if safe_plugin:
+                safe_plugin.log(
+                    f"FEE_GOSSIP: Not broadcasting - cumulative={cumulative_fee_change}sats "
+                    f"(need {FEE_BROADCAST_MIN_SATS}), time={time_since_broadcast}s "
+                    f"(need {FEE_BROADCAST_MIN_INTERVAL})",
+                    level="debug"
+                )
+            return
+
+        # Capture values for broadcast
+        fees_to_broadcast = _local_fees_earned_sats
+        forwards_to_broadcast = _local_fees_forward_count
+        period_start = _local_fees_period_start
+        _local_fees_last_broadcast = now
+        _local_fees_last_broadcast_amount = _local_fees_earned_sats
+
+    # Broadcast outside the lock
+    if safe_plugin:
+        safe_plugin.log(
+            f"FEE_GOSSIP: Broadcasting fee report - {fees_to_broadcast} sats, "
+            f"{forwards_to_broadcast} forwards",
+            level="info"
+        )
+    _broadcast_fee_report(fees_to_broadcast, forwards_to_broadcast, period_start, now)
+
+
+def _broadcast_fee_report(fees_earned: int, forward_count: int,
+                          period_start: int, period_end: int):
+    """
+    Broadcast a FEE_REPORT message to all hive members.
+
+    Args:
+        fees_earned: Cumulative fees earned in period
+        forward_count: Number of forwards in period
+        period_start: Period start timestamp
+        period_end: Current timestamp
+    """
+    from modules.protocol import (
+        create_fee_report, get_fee_report_signing_payload, HiveMessageType
+    )
+
+    if not our_pubkey or not database or not safe_plugin:
+        return
+
+    try:
+        # Sign the fee report
+        signing_payload = get_fee_report_signing_payload(
+            our_pubkey, fees_earned, period_start, period_end, forward_count
+        )
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        signature = sig_result["zbase"]
+
+        # Create the message
+        fee_report_msg = create_fee_report(
+            peer_id=our_pubkey,
+            fees_earned_sats=fees_earned,
+            period_start=period_start,
+            period_end=period_end,
+            forward_count=forward_count,
+            signature=signature
+        )
+
+        # Get hive members
+        members = database.get_all_members()
+
+        # Broadcast to all members
+        broadcast_count = 0
+        for member in members:
+            member_id = member.get("peer_id")
+            if not member_id or member_id == our_pubkey:
+                continue
+
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": member_id,
+                    "msg": fee_report_msg.hex()
+                })
+                broadcast_count += 1
+            except Exception:
+                pass  # Peer may be offline
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Fee report broadcast: {fees_earned} sats, "
+                f"{forward_count} forwards -> {broadcast_count} members",
+                level="debug"
+            )
+
+        # Also update our own state in state_manager
+        if state_manager:
+            state_manager.update_peer_fees(
+                peer_id=our_pubkey,
+                fees_earned_sats=fees_earned,
+                forward_count=forward_count,
+                period_start=period_start,
+                period_end=period_end
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Fee report broadcast error: {e}", level="warn")
 
 
 def _record_forward_as_route_probe(forward_event: Dict):
@@ -4449,6 +4620,78 @@ def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     return {"result": "continue"}
 
 
+def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle FEE_REPORT message from a hive member.
+
+    Stores the member's fee earnings for use in settlement calculations.
+    This enables real-time fee tracking across the fleet.
+    """
+    from modules.protocol import get_fee_report_signing_payload, validate_fee_report
+
+    if not state_manager or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: FEE_REPORT from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload schema
+    if not validate_fee_report(payload):
+        plugin.log(f"cl-hive: FEE_REPORT invalid schema from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Extract payload fields
+    report_peer_id = payload.get("peer_id")
+    fees_earned_sats = payload.get("fees_earned_sats")
+    period_start = payload.get("period_start")
+    period_end = payload.get("period_end")
+    forward_count = payload.get("forward_count")
+    signature = payload.get("signature")
+
+    # Verify the report peer_id matches the sender (you can only report your own fees)
+    if report_peer_id != peer_id:
+        plugin.log(f"cl-hive: FEE_REPORT peer_id mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Verify the signature
+    signing_payload = get_fee_report_signing_payload(
+        report_peer_id, fees_earned_sats, period_start, period_end, forward_count
+    )
+    try:
+        verify_result = safe_plugin.rpc.call("checkmessage", {
+            "message": signing_payload,
+            "zbase": signature,
+            "pubkey": report_peer_id
+        })
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: FEE_REPORT invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: FEE_REPORT signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Update state manager with fee data
+    updated = state_manager.update_peer_fees(
+        peer_id=report_peer_id,
+        fees_earned_sats=fees_earned_sats,
+        forward_count=forward_count,
+        period_start=period_start,
+        period_end=period_end
+    )
+
+    if updated:
+        plugin.log(
+            f"FEE_GOSSIP: Received FEE_REPORT from {peer_id[:16]}...: {fees_earned_sats} sats, "
+            f"{forward_count} forwards",
+            level='info'
+        )
+
+    return {"result": "continue"}
+
+
 def _broadcast_settlement_offer(peer_id: str, bolt12_offer: str) -> int:
     """
     Broadcast a settlement offer to all hive members.
@@ -4841,6 +5084,126 @@ def fee_intelligence_loop():
 
         # Wait for next cycle
         shutdown_event.wait(FEE_INTELLIGENCE_INTERVAL)
+
+
+def gossip_loop():
+    """
+    Background thread for gossiping node state to hive members.
+
+    Runs periodically to:
+    1. Calculate our hive channel capacity and available liquidity
+    2. Gather our external peer topology
+    3. Broadcast GOSSIP message to all hive members (threshold-based)
+
+    This populates state_manager with capacity data needed for fair
+    routing pool distribution (capacity-weighted shares).
+
+    Heartbeat: Every 5 minutes (DEFAULT_HEARTBEAT_INTERVAL)
+    """
+    from modules.gossip import DEFAULT_HEARTBEAT_INTERVAL
+
+    # Wait for initialization
+    shutdown_event.wait(30)
+
+    while not shutdown_event.is_set():
+        try:
+            if not gossip_mgr or not safe_plugin or not database or not our_pubkey:
+                shutdown_event.wait(60)
+                continue
+
+            # Step 1: Get our channel data
+            try:
+                funds = safe_plugin.rpc.listfunds()
+                channels = funds.get("channels", [])
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: gossip_loop listfunds error: {e}", level='warn')
+                shutdown_event.wait(DEFAULT_HEARTBEAT_INTERVAL)
+                continue
+
+            # Get list of hive members
+            members = database.get_all_members()
+            member_ids = {m.get("peer_id") for m in members}
+
+            # Step 2: Calculate hive capacity (channels with hive members)
+            hive_capacity_sats = 0
+            hive_available_sats = 0
+            external_peers = []
+
+            for ch in channels:
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+
+                peer_id = ch.get("peer_id")
+                amount_msat = ch.get("amount_msat", 0)
+                our_amount_msat = ch.get("our_amount_msat", 0)
+
+                if peer_id in member_ids:
+                    # Channel with hive member
+                    hive_capacity_sats += amount_msat // 1000
+                    hive_available_sats += our_amount_msat // 1000
+                else:
+                    # External peer - add to topology
+                    if peer_id and peer_id not in external_peers:
+                        external_peers.append(peer_id)
+
+            # Step 3: Get current fee policy (simplified)
+            fee_policy = {
+                "base_fee": 0,
+                "fee_rate": 0,
+                "min_htlc": 0,
+                "max_htlc": 0,
+                "cltv_delta": 40
+            }
+
+            # Step 4: Check if we should broadcast (threshold-based)
+            should_broadcast = gossip_mgr.should_broadcast(
+                new_capacity=hive_capacity_sats,
+                new_available=hive_available_sats,
+                new_fee_policy=fee_policy,
+                new_topology=external_peers,
+                force_status=False
+            )
+
+            if should_broadcast:
+                # Step 5: Create signed GOSSIP message
+                gossip_msg = _create_signed_gossip_msg(
+                    capacity_sats=hive_capacity_sats,
+                    available_sats=hive_available_sats,
+                    fee_policy=fee_policy,
+                    topology=external_peers
+                )
+
+                if gossip_msg:
+                    # Step 6: Broadcast to all hive members
+                    broadcast_count = 0
+                    for member in members:
+                        member_id = member.get("peer_id")
+                        if not member_id or member_id == our_pubkey:
+                            continue
+
+                        try:
+                            safe_plugin.rpc.call("sendcustommsg", {
+                                "node_id": member_id,
+                                "msg": gossip_msg.hex()
+                            })
+                            broadcast_count += 1
+                        except Exception:
+                            pass  # Peer may be offline
+
+                    if broadcast_count > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Gossip broadcast (capacity={hive_capacity_sats}sats, "
+                            f"available={hive_available_sats}sats, external_peers={len(external_peers)}, "
+                            f"sent to {broadcast_count} members)",
+                            level='debug'
+                        )
+
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"cl-hive: Gossip loop error: {e}", level='warn')
+
+        # Wait for next cycle (5 minutes default)
+        shutdown_event.wait(DEFAULT_HEARTBEAT_INTERVAL)
 
 
 def _broadcast_our_fee_intelligence():
@@ -8325,6 +8688,14 @@ def hive_settlement_calculate(plugin: Plugin):
     if not database:
         return {"error": "Database not initialized"}
 
+    # CRITICAL: Validate cl-revenue-ops is available for fee data
+    warnings = []
+    if not bridge or bridge.status != BridgeStatus.ENABLED:
+        warnings.append(
+            "cl-revenue-ops not available - fees_earned will be 0. "
+            "Settlement requires cl-revenue-ops for accurate fee distribution."
+        )
+
     # Get pool status with member contributions
     pool_status = routing_pool.get_pool_status()
     pool_contributions = pool_status.get("contributions", [])
@@ -8340,15 +8711,30 @@ def hive_settlement_calculate(plugin: Plugin):
         contrib_stats = database.get_contribution_stats(peer_id, window_days=7)
         forwards_sats = contrib_stats.get("forwarded", 0)
 
-        # Get fees earned from cl-revenue-ops if available
+        # Get fees earned from gossiped fee reports or local revenue-ops
         fees_earned = 0
-        if bridge and bridge.status == BridgeStatus.ENABLED:
-            try:
-                peer_report = bridge.safe_call("revenue-report-peer", peer_id=peer_id)
-                if peer_report and "error" not in peer_report:
-                    fees_earned = peer_report.get("fees_earned_sats", 0)
-            except Exception:
-                pass  # Fallback to 0 if revenue-ops unavailable
+        if peer_id == our_pubkey:
+            # For our own node, use local revenue-ops (most accurate)
+            if bridge and bridge.status == BridgeStatus.ENABLED:
+                try:
+                    dashboard = bridge.safe_call("revenue-dashboard", {"window_days": 7})
+                    if dashboard and "error" not in dashboard:
+                        period_data = dashboard.get("period", {})
+                        fees_earned = period_data.get("gross_revenue_sats", 0)
+                except Exception:
+                    pass
+            # Fallback to our own gossiped state
+            if fees_earned == 0 and state_manager:
+                peer_fees = state_manager.get_peer_fees(peer_id)
+                fees_earned = peer_fees.get("fees_earned_sats", 0)
+        else:
+            # For other nodes, use gossiped fee reports from state_manager
+            if state_manager:
+                peer_fees = state_manager.get_peer_fees(peer_id)
+                fees_earned = peer_fees.get("fees_earned_sats", 0)
+            # Fallback to contribution data if available
+            if fees_earned == 0:
+                fees_earned = contrib.get("fees_earned_sats", 0)
 
         # Get BOLT12 offer if registered
         offer = settlement_mgr.get_offer(peer_id)
@@ -8362,6 +8748,26 @@ def hive_settlement_calculate(plugin: Plugin):
             bolt12_offer=offer
         ))
 
+    # Validate state data quality
+    zero_capacity = sum(1 for c in member_contributions if c.capacity_sats == 0)
+    zero_uptime = sum(1 for c in member_contributions if c.uptime_pct == 0)
+    zero_fees = sum(1 for c in member_contributions if c.fees_earned_sats == 0)
+
+    if zero_capacity > 0:
+        warnings.append(
+            f"{zero_capacity} member(s) have 0 capacity. "
+            "Ensure gossip is running and state_manager has current data."
+        )
+    if zero_uptime > 0:
+        warnings.append(
+            f"{zero_uptime} member(s) have 0% uptime. "
+            "Check state_manager or run hive-pool-snapshot to update."
+        )
+    if zero_fees == len(member_contributions) and len(member_contributions) > 0:
+        warnings.append(
+            "All members have 0 fees_earned. cl-revenue-ops is required for fee data."
+        )
+
     # Calculate fair shares
     results = settlement_mgr.calculate_fair_shares(member_contributions)
 
@@ -8369,7 +8775,7 @@ def hive_settlement_calculate(plugin: Plugin):
     payments = settlement_mgr.generate_payments(results)
 
     # Format for JSON response
-    return {
+    response = {
         "period": pool_status.get("period", "unknown"),
         "total_members": len(results),
         "total_fees_sats": sum(r.fees_earned for r in results),
@@ -8398,6 +8804,11 @@ def hive_settlement_calculate(plugin: Plugin):
         ]
     }
 
+    if warnings:
+        response["warnings"] = warnings
+
+    return response
+
 
 @plugin.method("hive-settlement-execute")
 def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
@@ -8422,6 +8833,14 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
     if not database:
         return {"error": "Database not initialized"}
 
+    # CRITICAL: Validate cl-revenue-ops is available for fee data
+    if not bridge or bridge.status != BridgeStatus.ENABLED:
+        return {
+            "error": "cl-revenue-ops is required for settlement",
+            "detail": "Settlement uses fees_earned data from cl-revenue-ops. "
+                      "Ensure cl-revenue-ops plugin is running and bridge is ENABLED."
+        }
+
     # Get pool status with member contributions
     pool_status = routing_pool.get_pool_status()
     pool_contributions = pool_status.get("contributions", [])
@@ -8438,15 +8857,30 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
         contrib_stats = database.get_contribution_stats(peer_id, window_days=7)
         forwards_sats = contrib_stats.get("forwarded", 0)
 
-        # Get fees earned from cl-revenue-ops if available
+        # Get fees earned from gossiped fee reports or local revenue-ops
         fees_earned = 0
-        if bridge and bridge.status == BridgeStatus.ENABLED:
-            try:
-                peer_report = bridge.safe_call("revenue-report-peer", peer_id=peer_id)
-                if peer_report and "error" not in peer_report:
-                    fees_earned = peer_report.get("fees_earned_sats", 0)
-            except Exception:
-                pass  # Fallback to 0 if revenue-ops unavailable
+        if peer_id == our_pubkey:
+            # For our own node, use local revenue-ops (most accurate)
+            if bridge and bridge.status == BridgeStatus.ENABLED:
+                try:
+                    dashboard = bridge.safe_call("revenue-dashboard", {"window_days": 7})
+                    if dashboard and "error" not in dashboard:
+                        period_data = dashboard.get("period", {})
+                        fees_earned = period_data.get("gross_revenue_sats", 0)
+                except Exception:
+                    pass
+            # Fallback to our own gossiped state
+            if fees_earned == 0 and state_manager:
+                peer_fees = state_manager.get_peer_fees(peer_id)
+                fees_earned = peer_fees.get("fees_earned_sats", 0)
+        else:
+            # For other nodes, use gossiped fee reports from state_manager
+            if state_manager:
+                peer_fees = state_manager.get_peer_fees(peer_id)
+                fees_earned = peer_fees.get("fees_earned_sats", 0)
+            # Fallback to contribution data if available
+            if fees_earned == 0:
+                fees_earned = contrib.get("fees_earned_sats", 0)
 
         # Get BOLT12 offer if registered
         offer = settlement_mgr.get_offer(peer_id)

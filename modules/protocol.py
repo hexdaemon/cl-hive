@@ -39,6 +39,9 @@ PROTOCOL_VERSION = 1
 # Maximum message size in bytes (post-hex decode)
 MAX_MESSAGE_BYTES = 65535
 
+# Maximum peer_id length (hex-encoded pubkey should be 66 chars, allow some margin)
+MAX_PEER_ID_LEN = 128
+
 # =============================================================================
 # MESSAGE TYPES
 # =============================================================================
@@ -91,6 +94,7 @@ class HiveMessageType(IntEnum):
 
     # Phase 9: Settlement
     SETTLEMENT_OFFER = 32821    # Broadcast BOLT12 offer for settlement
+    FEE_REPORT = 32823          # Real-time fee earnings report for settlement
 
     # Phase 7: Cooperative Fee Coordination
     FEE_INTELLIGENCE = 32809    # Share fee observations with hive
@@ -2394,3 +2398,111 @@ def get_settlement_offer_signing_payload(peer_id: str, bolt12_offer: str) -> str
         String to be signed with signmessage()
     """
     return f"settlement_offer:{peer_id}:{bolt12_offer}"
+
+
+# =============================================================================
+# FEE REPORT MESSAGES (Real-time fee earnings for settlement)
+# =============================================================================
+
+def create_fee_report(
+    peer_id: str,
+    fees_earned_sats: int,
+    period_start: int,
+    period_end: int,
+    forward_count: int,
+    signature: str
+) -> bytes:
+    """
+    Create a FEE_REPORT message to broadcast fee earnings.
+
+    This message is broadcast when a node earns routing fees to keep
+    fleet settlement calculations accurate in near real-time.
+
+    Args:
+        peer_id: Member's node public key
+        fees_earned_sats: Cumulative fees earned in sats for the period
+        period_start: Unix timestamp of period start
+        period_end: Unix timestamp of period end (current time)
+        forward_count: Number of forwards completed
+        signature: zbase-encoded signature of the fee report payload
+
+    Returns:
+        Serialized FEE_REPORT message
+    """
+    payload = {
+        "peer_id": peer_id,
+        "fees_earned_sats": fees_earned_sats,
+        "period_start": period_start,
+        "period_end": period_end,
+        "forward_count": forward_count,
+        "signature": signature,
+    }
+
+    return serialize(HiveMessageType.FEE_REPORT, payload)
+
+
+def get_fee_report_signing_payload(
+    peer_id: str,
+    fees_earned_sats: int,
+    period_start: int,
+    period_end: int,
+    forward_count: int
+) -> str:
+    """
+    Get the canonical payload for signing a fee report.
+
+    Args:
+        peer_id: Member's node public key
+        fees_earned_sats: Cumulative fees earned
+        period_start: Period start timestamp
+        period_end: Period end timestamp
+        forward_count: Number of forwards
+
+    Returns:
+        String to be signed with signmessage()
+    """
+    return f"fee_report:{peer_id}:{fees_earned_sats}:{period_start}:{period_end}:{forward_count}"
+
+
+def validate_fee_report(payload: Dict[str, Any]) -> bool:
+    """
+    Validate FEE_REPORT payload schema.
+
+    Args:
+        payload: Decoded FEE_REPORT payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    required = ["peer_id", "fees_earned_sats", "period_start", "period_end",
+                "forward_count", "signature"]
+
+    for field in required:
+        if field not in payload:
+            return False
+
+    # Type checks
+    if not isinstance(payload["peer_id"], str):
+        return False
+    if not isinstance(payload["fees_earned_sats"], int):
+        return False
+    if not isinstance(payload["period_start"], int):
+        return False
+    if not isinstance(payload["period_end"], int):
+        return False
+    if not isinstance(payload["forward_count"], int):
+        return False
+    if not isinstance(payload["signature"], str):
+        return False
+
+    # Bounds checks
+    if len(payload["peer_id"]) > MAX_PEER_ID_LEN:
+        return False
+    if payload["fees_earned_sats"] < 0:
+        return False
+    if payload["forward_count"] < 0:
+        return False
+    if payload["period_end"] < payload["period_start"]:
+        return False
+
+    return True

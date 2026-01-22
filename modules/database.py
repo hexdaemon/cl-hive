@@ -3906,8 +3906,8 @@ class HiveDatabase:
         if "-W" in period:
             # ISO week format: 2025-W03
             year, week = period.split("-W")
-            # Monday of that week
-            start = datetime.datetime.strptime(f"{year}-W{week}-1", "%Y-W%W-%w")
+            # Monday of that week (use ISO week format: %G=ISO year, %V=ISO week, %u=ISO weekday)
+            start = datetime.datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u")
             end = start + datetime.timedelta(days=7)
         elif len(period) == 7:
             # Month format: 2025-01

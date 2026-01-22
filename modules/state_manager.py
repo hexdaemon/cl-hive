@@ -60,6 +60,10 @@ class HivePeerState:
         budget_available_sats: Current budget-constrained spendable liquidity
         budget_reserved_until: Unix timestamp when any active budget hold expires
         budget_last_update: Unix timestamp when budget was last calculated
+        fees_earned_sats: Routing fees earned in current settlement period
+        fees_forward_count: Number of forwards in current period
+        fees_period_start: Start of current fee reporting period
+        fees_last_report: Timestamp of last fee report received
     """
     peer_id: str
     capacity_sats: int
@@ -72,6 +76,11 @@ class HivePeerState:
     budget_available_sats: int = 0
     budget_reserved_until: int = 0
     budget_last_update: int = 0
+    # Fee reporting fields for settlement
+    fees_earned_sats: int = 0
+    fees_forward_count: int = 0
+    fees_period_start: int = 0
+    fees_last_report: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -99,6 +108,12 @@ class HivePeerState:
         budget_reserved_until = data.get("budget_reserved_until", 0)
         budget_last_update = data.get("budget_last_update", 0)
 
+        # Fee reporting fields (optional, backward compatible defaults)
+        fees_earned_sats = data.get("fees_earned_sats", 0)
+        fees_forward_count = data.get("fees_forward_count", 0)
+        fees_period_start = data.get("fees_period_start", 0)
+        fees_last_report = data.get("fees_last_report", 0)
+
         return cls(
             peer_id=peer_id,
             capacity_sats=capacity_sats,
@@ -111,6 +126,10 @@ class HivePeerState:
             budget_available_sats=budget_available_sats,
             budget_reserved_until=budget_reserved_until,
             budget_last_update=budget_last_update,
+            fees_earned_sats=fees_earned_sats,
+            fees_forward_count=fees_forward_count,
+            fees_period_start=fees_period_start,
+            fees_last_report=fees_last_report,
         )
     
     def to_hash_tuple(self) -> Dict[str, Any]:
@@ -149,7 +168,7 @@ class StateManager:
     def __init__(self, database, plugin=None):
         """
         Initialize the StateManager.
-        
+
         Args:
             database: HiveDatabase instance for persistence
             plugin: Optional plugin reference for logging
@@ -159,6 +178,9 @@ class StateManager:
         self._local_state: Dict[str, HivePeerState] = {}
         self._last_hash: str = ""
         self._last_hash_time: int = 0
+
+        # Load persisted state from database on startup
+        self._load_state_from_db()
     
     def _log(self, msg: str, level: str = "info") -> None:
         """Log a message if plugin is available."""
@@ -200,11 +222,50 @@ class StateManager:
                 return False
 
         return True
-    
+
+    def _load_state_from_db(self) -> int:
+        """
+        Load persisted state from database into memory on startup.
+
+        This ensures state_manager has data immediately available after
+        plugin restart, rather than waiting for gossip messages.
+
+        Returns:
+            Number of peer states loaded
+        """
+        try:
+            states = self.db.get_all_hive_states()
+            loaded = 0
+            for state_data in states:
+                peer_id = state_data.get('peer_id')
+                if not peer_id:
+                    continue
+
+                # Create HivePeerState from DB data
+                peer_state = HivePeerState(
+                    peer_id=peer_id,
+                    capacity_sats=state_data.get('capacity_sats', 0),
+                    available_sats=state_data.get('available_sats', 0),
+                    fee_policy=state_data.get('fee_policy', {}),
+                    topology=state_data.get('topology', []),
+                    version=state_data.get('version', 0),
+                    last_update=state_data.get('last_gossip', 0),
+                    state_hash=state_data.get('state_hash', ""),
+                )
+                self._local_state[peer_id] = peer_state
+                loaded += 1
+
+            if loaded > 0:
+                self._log(f"Loaded {loaded} peer states from database")
+            return loaded
+        except Exception as e:
+            self._log(f"Failed to load state from DB: {e}", level="warn")
+            return 0
+
     # =========================================================================
     # STATE UPDATES
     # =========================================================================
-    
+
     def update_peer_state(self, peer_id: str, gossip_data: Dict[str, Any]) -> bool:
         """
         Update local cache with received gossip data.
@@ -266,7 +327,111 @@ class StateManager:
         
         self._log(f"Updated state for {peer_id[:16]}... to v{remote_version}")
         return True
-    
+
+    def update_peer_fees(self, peer_id: str, fees_earned_sats: int,
+                         forward_count: int, period_start: int,
+                         period_end: int) -> bool:
+        """
+        Update fee reporting data for a peer from FEE_REPORT message.
+
+        This is called when we receive a FEE_REPORT gossip message from
+        another hive member, allowing settlement calculations to use
+        accurate fee data from all members.
+
+        Args:
+            peer_id: The peer's public key
+            fees_earned_sats: Cumulative fees earned in the period
+            forward_count: Number of forwards in the period
+            period_start: Period start timestamp
+            period_end: Period end timestamp (report time)
+
+        Returns:
+            True if fee data was updated, False if rejected
+        """
+        now = int(time.time())
+
+        # Basic validation
+        if not peer_id or fees_earned_sats < 0 or forward_count < 0:
+            return False
+
+        # Get or create peer state
+        existing = self._local_state.get(peer_id)
+
+        if existing:
+            # Only update if this report is newer
+            if existing.fees_last_report >= period_end:
+                self._log(f"Rejected stale fee report from {peer_id[:16]}...")
+                return False
+
+            # Update fee fields while preserving other state
+            existing.fees_earned_sats = fees_earned_sats
+            existing.fees_forward_count = forward_count
+            existing.fees_period_start = period_start
+            existing.fees_last_report = period_end
+        else:
+            # Create minimal state entry with just fee data
+            new_state = HivePeerState(
+                peer_id=peer_id,
+                capacity_sats=0,
+                available_sats=0,
+                fee_policy={},
+                topology=[],
+                version=0,
+                last_update=now,
+                fees_earned_sats=fees_earned_sats,
+                fees_forward_count=forward_count,
+                fees_period_start=period_start,
+                fees_last_report=period_end
+            )
+            self._local_state[peer_id] = new_state
+
+        self._log(f"Updated fees for {peer_id[:16]}...: {fees_earned_sats} sats, "
+                 f"{forward_count} forwards")
+        return True
+
+    def get_peer_fees(self, peer_id: str) -> Dict[str, int]:
+        """
+        Get fee reporting data for a peer.
+
+        Args:
+            peer_id: The peer's public key
+
+        Returns:
+            Dict with fees_earned_sats, forward_count, period_start, last_report
+        """
+        state = self._local_state.get(peer_id)
+        if not state:
+            return {
+                "fees_earned_sats": 0,
+                "forward_count": 0,
+                "period_start": 0,
+                "last_report": 0
+            }
+
+        return {
+            "fees_earned_sats": state.fees_earned_sats,
+            "forward_count": state.fees_forward_count,
+            "period_start": state.fees_period_start,
+            "last_report": state.fees_last_report
+        }
+
+    def get_all_peer_fees(self) -> Dict[str, Dict[str, int]]:
+        """
+        Get fee reporting data for all peers.
+
+        Returns:
+            Dict mapping peer_id to fee data dict
+        """
+        result = {}
+        for peer_id, state in self._local_state.items():
+            result[peer_id] = {
+                "fees_earned_sats": state.fees_earned_sats,
+                "forward_count": state.fees_forward_count,
+                "period_start": state.fees_period_start,
+                "last_report": state.fees_last_report
+            }
+        return result
+
     def update_local_state(self, capacity_sats: int, available_sats: int,
                            fee_policy: Dict[str, Any], topology: List[str],
                            our_pubkey: str) -> HivePeerState:
@@ -300,8 +465,19 @@ class StateManager:
             last_update=now,
             state_hash=""  # Will be calculated on demand
         )
-        
+
         self._local_state[our_pubkey] = our_state
+
+        # Persist our own state to database (for availability after restart)
+        self.db.update_hive_state(
+            peer_id=our_pubkey,
+            capacity_sats=capacity_sats,
+            available_sats=available_sats,
+            fee_policy=fee_policy,
+            topology=topology,
+            state_hash=""
+        )
+
         return our_state
     
     def get_peer_state(self, peer_id: str) -> Optional[HivePeerState]:

@@ -1765,12 +1765,32 @@ def pool_distribution(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
         return {"error": "Routing pool not initialized"}
 
     try:
-        result = ctx.routing_pool.calculate_distribution(period)
+        import datetime
+
+        # Get current period if not specified
+        if period is None:
+            now = datetime.datetime.now()
+            year, week, _ = now.isocalendar()
+            period = f"{year}-W{week:02d}"
+
+        # Get revenue for the period
+        revenue_info = ctx.routing_pool.db.get_pool_revenue(period=period)
+        total_revenue = revenue_info.get('total_sats', 0)
+
+        # calculate_distribution returns Dict[str, int] mapping member_id to amount
+        distributions_dict = ctx.routing_pool.calculate_distribution(period)
+
+        # Convert to list format for JSON response
+        distributions_list = [
+            {"member_id": mid, "amount_sats": amt}
+            for mid, amt in distributions_dict.items()
+        ]
+
         return {
             "status": "calculated",
-            "period": result.get("period"),
-            "total_revenue_sats": result.get("total_revenue_sats", 0),
-            "distributions": result.get("distributions", []),
+            "period": period,
+            "total_revenue_sats": total_revenue,
+            "distributions": distributions_list,
             "note": "This is a dry run - use pool-settle to actually distribute"
         }
     except Exception as e:
@@ -1803,14 +1823,31 @@ def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> D
         return {"error": "Routing pool not initialized"}
 
     try:
+        import datetime
+
+        # Get period (default to previous week for settlement)
+        if period is None:
+            now = datetime.datetime.now()
+            last_week = now - datetime.timedelta(days=7)
+            year, week, _ = last_week.isocalendar()
+            period = f"{year}-W{week:02d}"
+
         if dry_run:
             # Just calculate
-            result = ctx.routing_pool.calculate_distribution(period)
+            revenue_info = ctx.routing_pool.db.get_pool_revenue(period=period)
+            total_revenue = revenue_info.get('total_sats', 0)
+
+            distributions_dict = ctx.routing_pool.calculate_distribution(period)
+            distributions_list = [
+                {"member_id": mid, "amount_sats": amt}
+                for mid, amt in distributions_dict.items()
+            ]
+
             return {
                 "status": "dry_run",
-                "period": result.get("period"),
-                "total_revenue_sats": result.get("total_revenue_sats", 0),
-                "distributions": result.get("distributions", []),
+                "period": period,
+                "total_revenue_sats": total_revenue,
+                "distributions": distributions_list,
                 "note": "Set dry_run=false to actually settle this period"
             }
         else:
