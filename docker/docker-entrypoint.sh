@@ -175,7 +175,17 @@ plugin-dir=/root/.lightning/plugins
 
 # gRPC plugin (must use different port than Lightning P2P)
 grpc-port=9937
+
+# clnrest REST API (built-in, for RTL)
+clnrest-port=3001
+clnrest-protocol=https
+clnrest-host=0.0.0.0
 EOF
+
+# Disable CLBOSS if requested
+if [ "${CLBOSS_ENABLED:-true}" != "true" ]; then
+    echo "disable-plugin=clboss" >> "$CONFIG_FILE"
+fi
 
 # SECURITY: Restrict config file permissions (contains RPC password)
 chmod 600 "$CONFIG_FILE"
@@ -363,12 +373,16 @@ fi
 
 echo "Verifying required plugins..."
 
-# CLBOSS is required for automated channel management
-if [ -x /usr/local/bin/clboss ]; then
-    echo "CLBOSS: installed"
+# CLBOSS is optional - can be disabled via CLBOSS_ENABLED=false
+CLBOSS_ENABLED="${CLBOSS_ENABLED:-true}"
+if [ "$CLBOSS_ENABLED" = "true" ]; then
+    if [ -x /usr/local/bin/clboss ]; then
+        echo "CLBOSS: installed (enabled)"
+    else
+        echo "WARNING: CLBOSS not found but enabled - some features may not work"
+    fi
 else
-    echo "ERROR: CLBOSS not found - required for cl-hive"
-    exit 1
+    echo "CLBOSS: disabled"
 fi
 
 # Sling is required for rebalancing (used by cl-revenue-ops)
@@ -484,7 +498,11 @@ if [ -n "$ANNOUNCE_ADDR" ]; then
 fi
 echo ""
 echo "Required Plugins:"
-echo "  CLBOSS:       installed"
+if [ "$CLBOSS_ENABLED" = "true" ]; then
+    echo "  CLBOSS:       enabled"
+else
+    echo "  CLBOSS:       disabled"
+fi
 echo "  Sling:        installed"
 echo "  cl-hive:      installed"
 echo "  cl-revenue-ops: installed"

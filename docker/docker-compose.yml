@@ -79,6 +79,9 @@ services:
       # cl-hive
       - HIVE_GOVERNANCE_MODE=${HIVE_GOVERNANCE_MODE:-advisor}
 
+      # CLBOSS (optional - set to false to disable)
+      - CLBOSS_ENABLED=${CLBOSS_ENABLED:-true}
+
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-info}
 
@@ -106,6 +109,7 @@ services:
       # cl-hive plugin mount (for development - updates without rebuild)
       - ../cl-hive.py:/opt/cl-hive/cl-hive.py:ro
       - ../modules:/opt/cl-hive/modules:ro
+      - ../cl-hive.conf.sample:/etc/lightning/cl-hive.conf:ro
 
       # bitcoin-cli mount (needed when build fails to download from bitcoincore.org)
       # Copy your host's bitcoin-cli first: cp /usr/local/bin/bitcoin-cli ./bitcoin-cli
@@ -128,8 +132,8 @@ services:
       # Lightning P2P (only needed for clearnet/hybrid modes)
       - "${LIGHTNING_PORT:-9736}:${LIGHTNING_PORT:-9736}"
 
-      # REST API (optional, uncomment if needed)
-      # - "8080:8080"
+      # c-lightning-REST API (for RTL)
+      - "3001:3001"
 
     networks:
       - lightning-network

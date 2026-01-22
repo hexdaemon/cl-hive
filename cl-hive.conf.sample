@@ -78,8 +78,7 @@ hive-heartbeat-interval=300
 hive-planner-interval=3600
 
 # Enable expansion proposals (new channel openings)
-# WARNING: Set to false until you trust the algorithm
-hive-planner-enable-expansions=false
+hive-planner-enable-expansions=true
 
 # ============================================================================
 # DATABASE
