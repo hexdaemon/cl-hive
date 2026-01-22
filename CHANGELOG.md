@@ -2,6 +2,15 @@
 
 All notable changes to cl-hive will be documented in this file.
 
+## [1.7.1] - 2026-01-22
+
+### Fixed
+- **State Version Persistence**: Fixed gossip version resetting to 1 after plugin restart
+- **Fee Tracking Persistence**: Local fee tracking now survives restarts for accurate settlement calculations
+- **Contribution Rate Limits**: Per-peer and daily rate limits now persist across restarts
+- **Bridge Policy Sync**: Bridge policies automatically sync with database state on startup
+- **State Change Detection**: State version only increments when state actually changes
+
 ## [1.7.0] - 2026-01-22
 
 ### Added
