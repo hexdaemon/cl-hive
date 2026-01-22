@@ -1098,6 +1098,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     membership_thread.start()
     plugin.log("cl-hive: Membership maintenance thread started")
 
+    # Sync bridge policies with database state on startup
+    # This ensures members have correct 0 ppm policy even if previous set_tier failed
+    try:
+        synced = membership_mgr.sync_bridge_policies()
+        if synced > 0:
+            plugin.log(f"cl-hive: Synced bridge policies for {synced} members")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sync bridge policies: {e}", level="warn")
+
     # Initialize DecisionEngine (Phase 7)
     global decision_engine
     decision_engine = DecisionEngine(database=database, plugin=safe_plugin)

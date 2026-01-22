@@ -66,6 +66,51 @@ class MembershipManager:
 
         return True
 
+    def sync_bridge_policies(self) -> int:
+        """
+        Sync bridge policies with database membership state.
+
+        Call this on startup to ensure all members have correct 0 ppm
+        fee policy applied, even if a previous set_tier() bridge call failed.
+
+        Returns:
+            Number of policies synced
+        """
+        if not self.bridge:
+            return 0
+
+        # Check if bridge is enabled
+        if not (hasattr(self.bridge, "status") and
+                self.bridge.status and
+                self.bridge.status.value == "enabled"):
+            self._log("Bridge not enabled, skipping policy sync")
+            return 0
+
+        synced = 0
+        members = self.db.get_all_members()
+
+        for member in members:
+            peer_id = member.get("peer_id")
+            tier = member.get("tier")
+            if not peer_id:
+                continue
+
+            is_full_member = tier == MembershipTier.MEMBER.value
+            try:
+                # Bypass rate limit on startup sync
+                success = self.bridge.set_hive_policy(
+                    peer_id, is_member=is_full_member, bypass_rate_limit=True
+                )
+                if success:
+                    synced += 1
+            except Exception as exc:
+                self._log(f"Failed to sync policy for {peer_id[:16]}...: {exc}", level="warn")
+
+        if synced > 0:
+            self._log(f"Synced bridge policies for {synced} members")
+
+        return synced
+
     def is_probation_complete(self, peer_id: str) -> bool:
         member = self.db.get_member(peer_id)
         if not member:
