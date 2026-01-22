@@ -314,17 +314,18 @@ class StateManager:
         
         # Update in-memory cache
         self._local_state[peer_id] = new_state
-        
-        # Persist to database
+
+        # Persist to database with the remote version
         self.db.update_hive_state(
             peer_id=peer_id,
             capacity_sats=new_state.capacity_sats,
             available_sats=new_state.available_sats,
             fee_policy=new_state.fee_policy,
             topology=new_state.topology,
-            state_hash=new_state.state_hash
+            state_hash=new_state.state_hash,
+            version=remote_version
         )
-        
+
         self._log(f"Updated state for {peer_id[:16]}... to v{remote_version}")
         return True
 
@@ -497,7 +498,8 @@ class StateManager:
                 available_sats=available_sats,
                 fee_policy=fee_policy,
                 topology=topology,
-                state_hash=""
+                state_hash="",
+                version=new_version  # Persist the version we calculated
             )
 
         return our_state
@@ -680,17 +682,18 @@ class StateManager:
             if not local_state or local_state.version < remote_version:
                 new_state = HivePeerState.from_dict(state_dict)
                 self._local_state[peer_id] = new_state
-                
-                # Persist to database
+
+                # Persist to database with the remote version
                 self.db.update_hive_state(
                     peer_id=peer_id,
                     capacity_sats=new_state.capacity_sats,
                     available_sats=new_state.available_sats,
                     fee_policy=new_state.fee_policy,
                     topology=new_state.topology,
-                    state_hash=new_state.state_hash
+                    state_hash=new_state.state_hash,
+                    version=remote_version
                 )
-                
+
                 updated_count += 1
         
         self._log(f"FULL_SYNC applied: {updated_count} states updated")

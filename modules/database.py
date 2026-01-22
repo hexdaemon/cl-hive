@@ -969,22 +969,37 @@ class HiveDatabase:
     
     def update_hive_state(self, peer_id: str, capacity_sats: int,
                           available_sats: int, fee_policy: Dict,
-                          topology: List[str], state_hash: str) -> None:
+                          topology: List[str], state_hash: str,
+                          version: Optional[int] = None) -> None:
         """Update local cache of a peer's Hive state."""
         conn = self._get_connection()
         now = int(time.time())
-        
-        conn.execute("""
-            INSERT OR REPLACE INTO hive_state 
-            (peer_id, capacity_sats, available_sats, fee_policy, topology, 
-             last_gossip, state_hash, version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 
-                    COALESCE((SELECT version FROM hive_state WHERE peer_id = ?), 0) + 1)
-        """, (
-            peer_id, capacity_sats, available_sats,
-            json.dumps(fee_policy), json.dumps(topology),
-            now, state_hash, peer_id
-        ))
+
+        if version is not None:
+            # Use the provided version (from state_manager)
+            conn.execute("""
+                INSERT OR REPLACE INTO hive_state
+                (peer_id, capacity_sats, available_sats, fee_policy, topology,
+                 last_gossip, state_hash, version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                peer_id, capacity_sats, available_sats,
+                json.dumps(fee_policy), json.dumps(topology),
+                now, state_hash, version
+            ))
+        else:
+            # Auto-increment for backward compatibility
+            conn.execute("""
+                INSERT OR REPLACE INTO hive_state
+                (peer_id, capacity_sats, available_sats, fee_policy, topology,
+                 last_gossip, state_hash, version)
+                VALUES (?, ?, ?, ?, ?, ?, ?,
+                        COALESCE((SELECT version FROM hive_state WHERE peer_id = ?), 0) + 1)
+            """, (
+                peer_id, capacity_sats, available_sats,
+                json.dumps(fee_policy), json.dumps(topology),
+                now, state_hash, peer_id
+            ))
     
     def get_hive_state(self, peer_id: str) -> Optional[Dict]:
         """Get cached state for a Hive peer."""
