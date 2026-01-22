@@ -437,24 +437,45 @@ class StateManager:
                            our_pubkey: str) -> HivePeerState:
         """
         Update our own node's state in the HiveMap.
-        
+
         Called after local changes (fee updates, channel opens, etc.)
         to prepare for outbound gossip.
-        
+
+        Only increments version if state has actually changed to avoid
+        unnecessary gossip traffic and version inflation.
+
         Args:
             capacity_sats: Our total Hive channel capacity
             available_sats: Our available outbound liquidity
             fee_policy: Our current fee policy dict
             topology: List of our external peer connections
             our_pubkey: Our node's public key
-            
+
         Returns:
             The updated HivePeerState for our node
         """
         now = int(time.time())
         existing = self._local_state.get(our_pubkey)
-        new_version = (existing.version + 1) if existing else 1
-        
+
+        # Check if state has actually changed
+        state_changed = True
+        if existing:
+            # Compare relevant fields (not version, timestamp, or state_hash)
+            state_changed = (
+                existing.capacity_sats != capacity_sats or
+                existing.available_sats != available_sats or
+                existing.fee_policy != fee_policy or
+                set(existing.topology) != set(topology)
+            )
+
+        # Only increment version if state changed
+        if state_changed:
+            new_version = (existing.version + 1) if existing else 1
+            self._log(f"State changed for {our_pubkey[:16]}..., incrementing to v{new_version}")
+        else:
+            # No change - keep existing version
+            new_version = existing.version if existing else 1
+
         our_state = HivePeerState(
             peer_id=our_pubkey,
             capacity_sats=capacity_sats,
@@ -468,15 +489,16 @@ class StateManager:
 
         self._local_state[our_pubkey] = our_state
 
-        # Persist our own state to database (for availability after restart)
-        self.db.update_hive_state(
-            peer_id=our_pubkey,
-            capacity_sats=capacity_sats,
-            available_sats=available_sats,
-            fee_policy=fee_policy,
-            topology=topology,
-            state_hash=""
-        )
+        # Only persist to database if state changed
+        if state_changed:
+            self.db.update_hive_state(
+                peer_id=our_pubkey,
+                capacity_sats=capacity_sats,
+                available_sats=available_sats,
+                fee_policy=fee_policy,
+                topology=topology,
+                state_hash=""
+            )
 
         return our_state
     
