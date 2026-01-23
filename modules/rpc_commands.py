@@ -647,6 +647,7 @@ def _execute_channel_open(
     intent_id = context.get('intent_id') or payload.get('intent_id')
 
     # Get channel size from context (planner) or top-level (cooperative expansion)
+    # Ensure we get an int - JSON parsing can sometimes return strings
     proposed_size = (
         context.get('channel_size_sats') or
         context.get('amount_sats') or
@@ -654,10 +655,11 @@ def _execute_channel_open(
         payload.get('channel_size_sats') or
         1_000_000  # Default 1M sats
     )
+    proposed_size = int(proposed_size)  # Ensure int type
 
     # Apply member override if provided
     if amount_sats is not None:
-        channel_size_sats = amount_sats
+        channel_size_sats = int(amount_sats)
         override_applied = True
     else:
         channel_size_sats = proposed_size
