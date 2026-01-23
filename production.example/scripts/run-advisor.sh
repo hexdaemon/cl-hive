@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# Hive AI Advisor Runner Script
-# Runs Claude Code with MCP server to review pending actions
+# Hive Proactive AI Advisor Runner Script
+# Runs Claude Code with MCP server to execute the proactive advisor cycle on ALL nodes
 #
 set -euo pipefail
 
@@ -63,9 +63,12 @@ cat > "$MCP_CONFIG_TMP" << MCPEOF
 MCPEOF
 
 # Run Claude with MCP server
-# Note: prompt must come immediately after -p flag
+# The proactive advisor runs a complete 9-phase optimization cycle on ALL nodes:
+# 1) Record snapshot 2) Analyze state 3) Check goals 4) Scan opportunities
+# 5) Score with learning 6) Auto-execute safe actions 7) Queue risky actions
+# 8) Measure outcomes 9) Plan next cycle
 # --allowedTools restricts to only hive/revenue/advisor tools for safety
-claude -p "Run the advisor checklist for mainnet: 1) advisor_record_snapshot to capture state 2) advisor_get_recent_decisions to check past decisions 3) hive_status to verify node online 4) hive_pending_actions - approve/reject each, then advisor_record_decision for each 5) revenue_dashboard for financial health 6) revenue_profitability to flag zombie/bleeder/unprofitable channels 7) advisor_get_velocities to find channels depleting rapidly 8) Report summary with actions taken, velocity alerts, and channel health warnings" \
+claude -p "Run the proactive advisor cycle on ALL nodes using advisor_run_cycle_all. After the cycle completes, provide a summary report FOR EACH NODE including: 1) Node state (capacity, channels, ROC%, underwater%) 2) Goals progress and any strategy adjustments needed 3) Opportunities found by type and actions taken/queued 4) Learning outcomes (success rate of past decisions) 5) Next cycle priorities. Also check hive_pending_actions for any actions needing human review on each node - list them with your recommendations. Include goat feeder P&L from revenue_dashboard if available." \
     --mcp-config "$MCP_CONFIG_TMP" \
     --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
