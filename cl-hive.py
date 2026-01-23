@@ -8002,6 +8002,55 @@ def hive_bump_version(plugin: Plugin, version: int):
     }
 
 
+@plugin.method("hive-gossip-stats")
+def hive_gossip_stats(plugin: Plugin):
+    """
+    Get gossip statistics and state versions for all peers.
+
+    Shows version numbers for debugging state synchronization issues.
+    Useful to verify that nodes have consistent views of each other's state.
+
+    Returns:
+        Dict with our state, gossip manager state, and all peer states.
+    """
+    if not state_manager or not gossip_mgr or not our_pubkey:
+        return {"error": "state_manager_unavailable"}
+
+    # Get gossip manager internal state
+    gossip_state = gossip_mgr.get_gossip_stats()
+
+    # Get our own state from state manager
+    our_state = state_manager.get_peer_state(our_pubkey)
+
+    # Get all peer states
+    all_states = state_manager.get_all_peer_states()
+    peer_versions = {}
+    for state in all_states:
+        peer_versions[state.peer_id[:16] + "..."] = {
+            "version": state.version,
+            "last_update": state.last_update,
+            "capacity_sats": state.capacity_sats,
+            "available_sats": state.available_sats,
+            "is_self": state.peer_id == our_pubkey
+        }
+
+    return {
+        "our_pubkey": our_pubkey[:16] + "...",
+        "gossip_manager": {
+            "broadcast_version": gossip_state["version"],
+            "last_broadcast_ago": gossip_state["last_broadcast_ago"],
+            "heartbeat_interval": gossip_state["heartbeat_interval"],
+            "active_peers": gossip_state["active_peers"]
+        },
+        "our_state": {
+            "version": our_state.version if our_state else None,
+            "capacity_sats": our_state.capacity_sats if our_state else 0,
+            "available_sats": our_state.available_sats if our_state else 0
+        },
+        "peer_states": peer_versions
+    }
+
+
 @plugin.method("hive-vouch")
 def hive_vouch(plugin: Plugin, peer_id: str):
     """

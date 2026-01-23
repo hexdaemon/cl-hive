@@ -576,6 +576,20 @@ async def list_tools() -> List[Tool]:
                 "required": ["node"]
             }
         ),
+        Tool(
+            name="hive_gossip_stats",
+            description="Get gossip statistics and state versions for debugging. Shows version numbers for each peer to verify state synchronization is working correctly.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
         # =====================================================================
         # Splice Coordination Tools (Phase 3)
         # =====================================================================
@@ -2483,6 +2497,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_expansion_mode(arguments)
         elif name == "hive_bump_version":
             result = await handle_bump_version(arguments)
+        elif name == "hive_gossip_stats":
+            result = await handle_gossip_stats(arguments)
         # Splice coordination tools
         elif name == "hive_splice_check":
             result = await handle_splice_check(arguments)
@@ -3041,6 +3057,17 @@ async def handle_bump_version(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-bump-version", {"version": version})
+
+
+async def handle_gossip_stats(args: Dict) -> Dict:
+    """Get gossip statistics and state versions for debugging."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-gossip-stats", {})
 
 
 # =============================================================================
