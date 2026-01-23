@@ -435,7 +435,7 @@ class StateManager:
 
     def update_local_state(self, capacity_sats: int, available_sats: int,
                            fee_policy: Dict[str, Any], topology: List[str],
-                           our_pubkey: str) -> HivePeerState:
+                           our_pubkey: str, force_version: Optional[int] = None) -> HivePeerState:
         """
         Update our own node's state in the HiveMap.
 
@@ -443,7 +443,9 @@ class StateManager:
         to prepare for outbound gossip.
 
         Only increments version if state has actually changed to avoid
-        unnecessary gossip traffic and version inflation.
+        unnecessary gossip traffic and version inflation, unless force_version
+        is provided (used by GossipManager to ensure persisted version matches
+        the version sent in gossip messages, critical for restart recovery).
 
         Args:
             capacity_sats: Our total Hive channel capacity
@@ -451,6 +453,8 @@ class StateManager:
             fee_policy: Our current fee policy dict
             topology: List of our external peer connections
             our_pubkey: Our node's public key
+            force_version: If provided, use this version instead of calculating.
+                           Used by GossipManager to sync gossip version to DB.
 
         Returns:
             The updated HivePeerState for our node
@@ -469,8 +473,11 @@ class StateManager:
                 set(existing.topology) != set(topology)
             )
 
-        # Only increment version if state changed
-        if state_changed:
+        # Use forced version from GossipManager if provided (ensures persistence matches gossip)
+        # Otherwise, only increment version if state changed
+        if force_version is not None:
+            new_version = force_version
+        elif state_changed:
             new_version = (existing.version + 1) if existing else 1
             self._log(f"State changed for {our_pubkey[:16]}..., incrementing to v{new_version}")
         else:
@@ -490,8 +497,9 @@ class StateManager:
 
         self._local_state[our_pubkey] = our_state
 
-        # Only persist to database if state changed
-        if state_changed:
+        # Persist to database if state changed OR if force_version provided
+        # (force_version means GossipManager wants to ensure version is saved for restart)
+        if state_changed or force_version is not None:
             self.db.update_hive_state(
                 peer_id=our_pubkey,
                 capacity_sats=capacity_sats,

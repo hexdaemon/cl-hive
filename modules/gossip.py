@@ -245,12 +245,14 @@ class GossipManager:
         )
 
         # Also update the state manager with our local state
+        # Pass the gossip version to ensure it gets persisted for restart recovery
         self.state_manager.update_local_state(
             capacity_sats=capacity_sats,
             available_sats=available_sats,
             fee_policy=fee_policy,
             topology=topology,
-            our_pubkey=our_pubkey
+            our_pubkey=our_pubkey,
+            force_version=new_version
         )
 
         return {
