@@ -999,118 +999,26 @@ def _attempt_channel_open_delegation(
     """
     Attempt to delegate a failed channel open to another hive member.
 
-    Uses AI Oracle task delegation if available, otherwise broadcasts
-    a TASK_REQUEST message to capable members.
+    NOTE: Task delegation protocol not yet implemented. This function
+    returns a placeholder status. Future implementation will use
+    AI_TASK_REQUEST messages to coordinate channel opens across the fleet.
 
     Returns:
-        Dict with delegation status, or None if delegation not possible
+        Dict with delegation status indicating feature not yet available
     """
-    if not ctx.database or not ctx.safe_plugin:
-        return None
-
-    # Find hive members who might be able to help
-    members = ctx.database.get_all_members()
-    capable_members = []
-
-    for member in members:
-        member_id = member.get('peer_id')
-        if not member_id or member_id == ctx.our_pubkey:
-            continue
-
-        # Check member health - only delegate to healthy members
-        health = ctx.database.get_member_health(member_id)
-        if health:
-            overall_health = health.get('overall_health', 0)
-            can_help = health.get('can_help_others', False)
-            if overall_health >= 50 and can_help:
-                capable_members.append({
-                    "peer_id": member_id,
-                    "health": overall_health,
-                    "tier": health.get('tier', 'unknown')
-                })
-
-    if not capable_members:
-        if ctx.log:
-            ctx.log(
-                f"cl-hive: No capable members available for delegation",
-                'debug'
-            )
-        return {"status": "no_capable_members"}
-
-    # Sort by health (highest first)
-    capable_members.sort(key=lambda m: m['health'], reverse=True)
-
-    # Try to send delegation request to top candidates
-    from modules.protocol import HiveMessageType, serialize, create_ai_task_request
-    import time as time_module
-
-    delegation_sent = 0
-    max_delegation_attempts = 3
-    now = int(time_module.time())
-
-    for member in capable_members[:max_delegation_attempts]:
-        member_id = member['peer_id']
-        try:
-            # Create AI task request for channel open delegation
-            request_id = f"delegate_{original_action_id}_{now}"
-            deadline = now + 3600  # 1 hour to complete
-
-            msg = create_ai_task_request(
-                node_id=ctx.our_pubkey,
-                target_node=member_id,
-                timestamp=now,
-                request_id=request_id,
-                task_type="expand_to",
-                task_target=target,
-                rpc=ctx.safe_plugin.rpc,
-                task_priority="normal",
-                task_deadline_timestamp=deadline,
-                amount_sats=channel_size_sats,
-                selection_factors=["delegation", "peer_rejected_opener"],
-                compensation_offer_type="reciprocal",
-                fallback_if_rejected="will_handle_self",
-                fallback_if_timeout="will_handle_self"
-            )
-
-            if msg:
-                ctx.safe_plugin.rpc.call("sendcustommsg", {
-                    "node_id": member_id,
-                    "msg": msg.hex()
-                })
-                delegation_sent += 1
-
-                if ctx.log:
-                    ctx.log(
-                        f"cl-hive: Sent channel open delegation request to "
-                        f"{member_id[:16]}... (health={member['health']})",
-                        'info'
-                    )
-
-        except Exception as e:
-            if ctx.log:
-                ctx.log(
-                    f"cl-hive: Failed to send delegation to {member_id[:16]}...: {e}",
-                    'debug'
-                )
-
-    if delegation_sent > 0:
-        # Record the delegation attempt
-        ctx.database.record_delegation_attempt(
-            original_action_id=original_action_id,
-            target=target,
-            delegation_count=delegation_sent,
-            failure_type=failure_info["type"]
+    if ctx.log:
+        ctx.log(
+            f"cl-hive: Channel open delegation not yet implemented "
+            f"(target={target[:16]}..., failure={failure_info.get('type', 'unknown')})",
+            'debug'
         )
 
-        return {
-            "status": "delegation_requested",
-            "requests_sent": delegation_sent,
-            "candidates": [m['peer_id'][:16] + "..." for m in capable_members[:max_delegation_attempts]],
-            "failure_type": failure_info["type"],
-            "message": f"Requested {delegation_sent} hive member(s) to attempt channel open"
-        }
-
-    return {"status": "delegation_failed", "message": "Could not send delegation requests"}
+    return {
+        "status": "delegation_not_implemented",
+        "message": "Channel open delegation to other hive members not yet available",
+        "failure_type": failure_info.get("type", "unknown"),
+        "suggestion": "Retry later or open channel manually from another node"
+    }
 
 
 # =============================================================================
