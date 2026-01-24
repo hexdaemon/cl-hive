@@ -56,7 +56,7 @@ Contact an existing hive member and request their connection info:
 | Node | Connection String |
 |------|-------------------|
 | Hive-Nexus-01 | `0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3@45.76.234.192:9735` |
-| Hive-Nexus-02 | `03fe48e8a64f14fa0aa7d9d16500754b3b906c729acfb867c00423fd4b0b9b56c2@45.76.234.192:9736` |
+| Hive-Nexus-02 | `03fe48e8a64f14fa0aa7d9d16500754b3b906c729acfb867c00423fd4b0b9b56c2@vxykasr6vdl77ph6hvo4a3mxfj2wbirwujdyrg4scowuhix7pp53l7yd.onion:9736` |
 
 You can also find active members via Lightning network explorers or community channels.
 
