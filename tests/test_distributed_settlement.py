@@ -25,7 +25,8 @@ from modules.settlement import (
     MemberContribution,
     SettlementResult,
     SettlementPayment,
-    MIN_PAYMENT_SATS,
+    MIN_PAYMENT_FLOOR_SATS,
+    calculate_min_payment,
 )
 from modules.protocol import (
     HiveMessageType,

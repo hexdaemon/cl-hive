@@ -10036,15 +10036,16 @@ def hive_settlement_calculate(plugin: Plugin):
 
     # Calculate fair shares
     results = settlement_mgr.calculate_fair_shares(member_contributions)
+    total_fees = sum(r.fees_earned for r in results)
 
     # Generate payments that would be required
-    payments = settlement_mgr.generate_payments(results)
+    payments = settlement_mgr.generate_payments(results, total_fees=total_fees)
 
     # Format for JSON response
     response = {
         "period": pool_status.get("period", "unknown"),
         "total_members": len(results),
-        "total_fees_sats": sum(r.fees_earned for r in results),
+        "total_fees_sats": total_fees,
         "fair_shares": [
             {
                 "peer_id": r.peer_id[:16] + "...",
@@ -10174,15 +10175,16 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
 
     # Calculate fair shares
     results = settlement_mgr.calculate_fair_shares(member_contributions)
+    total_fees = sum(r.fees_earned for r in results)
 
     # Generate payments from results
-    payments = settlement_mgr.generate_payments(results)
+    payments = settlement_mgr.generate_payments(results, total_fees=total_fees)
 
     # Build response
     response = {
         "period": period,
         "total_members": len(results),
-        "total_fees_sats": sum(r.fees_earned for r in results),
+        "total_fees_sats": total_fees,
         "fair_shares": [
             {
                 "peer_id": r.peer_id[:16] + "...",

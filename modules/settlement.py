@@ -31,8 +31,30 @@ from decimal import Decimal, ROUND_DOWN
 # Settlement period (weekly)
 SETTLEMENT_PERIOD_SECONDS = 7 * 24 * 60 * 60  # 1 week
 
-# Minimum payment threshold (don't send dust)
-MIN_PAYMENT_SATS = 1000
+# Minimum payment threshold floor (absolute minimum to avoid dust)
+MIN_PAYMENT_FLOOR_SATS = 100
+
+
+def calculate_min_payment(total_fees: int, member_count: int) -> int:
+    """
+    Calculate dynamic minimum payment threshold.
+
+    Formula: max(FLOOR, total_fees / (members * 10))
+
+    This ensures:
+    - Small fleets with small fees can still settle (100 sat floor)
+    - Larger fleets don't spam tiny payments
+    - Scales with fee volume
+
+    Examples:
+    - 307 sats, 2 members: max(100, 307/20) = 100 sats
+    - 10000 sats, 5 members: max(100, 10000/50) = 200 sats
+    - 100000 sats, 10 members: max(100, 100000/100) = 1000 sats
+    """
+    if member_count <= 0:
+        return MIN_PAYMENT_FLOOR_SATS
+    dynamic_min = total_fees // (member_count * 10)
+    return max(MIN_PAYMENT_FLOOR_SATS, dynamic_min)
 
 # Fair share weights
 WEIGHT_CAPACITY = 0.30
@@ -409,7 +431,8 @@ class SettlementManager:
 
     def generate_payments(
         self,
-        results: List[SettlementResult]
+        results: List[SettlementResult],
+        total_fees: int = 0
     ) -> List[SettlementPayment]:
         """
         Generate payment list from settlement results.
@@ -419,13 +442,18 @@ class SettlementManager:
 
         Args:
             results: List of settlement results
+            total_fees: Total fees for dynamic minimum calculation
 
         Returns:
             List of payments to execute
         """
+        # Calculate dynamic minimum payment threshold
+        member_count = len(results)
+        min_payment = calculate_min_payment(total_fees, member_count)
+
         # Separate into payers (owe money) and receivers (owed money)
-        payers = [r for r in results if r.balance < -MIN_PAYMENT_SATS and r.bolt12_offer]
-        receivers = [r for r in results if r.balance > MIN_PAYMENT_SATS and r.bolt12_offer]
+        payers = [r for r in results if r.balance < -min_payment and r.bolt12_offer]
+        receivers = [r for r in results if r.balance > min_payment and r.bolt12_offer]
 
         if not payers or not receivers:
             return []
@@ -453,7 +481,7 @@ class SettlementManager:
                     receiver_remaining[receiver.peer_id]
                 )
 
-                if amount < MIN_PAYMENT_SATS:
+                if amount < min_payment:
                     continue
 
                 payments.append(SettlementPayment(
@@ -1017,7 +1045,7 @@ class SettlementManager:
         proposal: Dict[str, Any],
         contributions: List[Dict[str, Any]],
         our_peer_id: str
-    ) -> Tuple[int, Optional[str]]:
+    ) -> Tuple[int, Optional[str], int]:
         """
         Calculate our balance in a settlement (positive = owed, negative = owe).
 
@@ -1027,7 +1055,7 @@ class SettlementManager:
             our_peer_id: Our node's public key
 
         Returns:
-            Tuple of (balance_sats, creditor_peer_id or None)
+            Tuple of (balance_sats, creditor_peer_id or None, min_payment_threshold)
         """
         # Convert to MemberContribution objects
         member_contributions = [
@@ -1044,6 +1072,11 @@ class SettlementManager:
         # Calculate fair shares
         results = self.calculate_fair_shares(member_contributions)
 
+        # Calculate dynamic minimum payment
+        total_fees = sum(c.get('fees_earned', 0) for c in contributions)
+        member_count = len(contributions)
+        min_payment = calculate_min_payment(total_fees, member_count)
+
         # Find our result
         our_result = None
         for result in results:
@@ -1052,17 +1085,17 @@ class SettlementManager:
                 break
 
         if not our_result:
-            return (0, None)
+            return (0, None, min_payment)
 
         # If we owe money (negative balance), find who to pay
-        if our_result.balance < -MIN_PAYMENT_SATS:
+        if our_result.balance < -min_payment:
             # Find member with highest positive balance (most owed)
-            creditors = [r for r in results if r.balance > MIN_PAYMENT_SATS]
+            creditors = [r for r in results if r.balance > min_payment]
             if creditors:
                 creditors.sort(key=lambda x: x.balance, reverse=True)
-                return (our_result.balance, creditors[0].peer_id)
+                return (our_result.balance, creditors[0].peer_id, min_payment)
 
-        return (our_result.balance, None)
+        return (our_result.balance, None, min_payment)
 
     async def execute_our_settlement(
         self,
@@ -1093,14 +1126,14 @@ class SettlementManager:
             )
             return None
 
-        # Calculate our balance
-        balance, creditor_peer_id = self.calculate_our_balance(
+        # Calculate our balance (returns balance, creditor, min_payment)
+        balance, creditor_peer_id, min_payment = self.calculate_our_balance(
             proposal, contributions, our_peer_id
         )
 
         timestamp = int(time.time())
 
-        if balance >= -MIN_PAYMENT_SATS:
+        if balance >= -min_payment:
             # We don't owe money (or owe less than dust)
             # Still record execution to confirm participation
             from modules.protocol import get_settlement_executed_signing_payload
