@@ -450,58 +450,12 @@ class SpliceManager:
         )
         self.db.update_splice_session(session_id, status=SPLICE_STATUS_INIT_RECEIVED, psbt=psbt)
 
-        # Call splice_update with their PSBT - use full hex channel_id
-        # Retry with delays because the HIVE custom message may arrive before
-        # CLN's internal splice handshake (STFU + splice_init) completes
-        max_retries = 10
-        retry_delay = 0.5  # seconds
-        our_psbt = None
-        commitments_secured = False
-        last_error = None
+        # NOTE: The responder does NOT call splice_update here.
+        # CLN handles the PSBT exchange internally via the Lightning protocol.
+        # The HIVE message is just for membership verification and coordination.
+        # The initiator will drive the splice_update loop on their side.
 
-        for attempt in range(max_retries):
-            try:
-                update_result = rpc.call("splice_update", {
-                    "channel_id": full_channel_id,
-                    "psbt": psbt
-                })
-                our_psbt = update_result.get("psbt")
-                commitments_secured = update_result.get("commitments_secured", False)
-
-                if not our_psbt:
-                    raise Exception("No PSBT returned from splice_update")
-                break  # Success
-
-            except Exception as e:
-                last_error = e
-                error_str = str(e)
-                # Check if CLN is still busy with splice handshake
-                if "waiting on previous splice command" in error_str.lower() or "code': 355" in error_str:
-                    if attempt < max_retries - 1:
-                        self._log(f"splice_update: CLN busy, retry {attempt + 1}/{max_retries} in {retry_delay}s")
-                        time.sleep(retry_delay)
-                        continue
-                # Other error - don't retry
-                break
-
-        if our_psbt is None:
-            self._log(f"splice_update failed after {max_retries} retries: {last_error}", level='error')
-            self.db.update_splice_session(
-                session_id,
-                status=SPLICE_STATUS_FAILED,
-                error_message=str(last_error)
-            )
-            self._send_reject(sender_id, session_id, SPLICE_REJECT_DECLINED, rpc)
-            return {"error": "splice_update_failed", "message": str(last_error)}
-
-        # Update session with our PSBT
-        self.db.update_splice_session(
-            session_id,
-            psbt=our_psbt,
-            commitments_secured=commitments_secured
-        )
-
-        # Send acceptance response
+        # Send acceptance response (no PSBT - CLN handles that internally)
         now = int(time.time())
         response = create_splice_init_response(
             responder_id=self.our_pubkey,
@@ -509,20 +463,16 @@ class SpliceManager:
             accepted=True,
             timestamp=now,
             rpc=rpc,
-            psbt=our_psbt
+            psbt=None  # CLN handles PSBT exchange, not the HIVE protocol
         )
 
         if not response or not self._send_message(sender_id, response, rpc):
             self._log("Failed to send splice init response")
             return {"error": "response_failed"}
 
-        self._log(f"Accepted splice {session_id}, commitments_secured={commitments_secured}")
+        self._log(f"Accepted splice {session_id} - CLN will handle PSBT exchange")
 
-        # If commitments are secured, proceed to signing
-        if commitments_secured:
-            return self._proceed_to_signing(session_id, sender_id, full_channel_id, our_psbt, rpc)
-
-        return {"success": True, "session_id": session_id, "status": SPLICE_STATUS_UPDATING}
+        return {"success": True, "session_id": session_id, "status": SPLICE_STATUS_INIT_RECEIVED}
 
     def handle_splice_init_response(
         self,
@@ -586,58 +536,63 @@ class SpliceManager:
             )
             return {"success": False, "rejected": True, "reason": reason}
 
-        # Update with peer's PSBT
-        peer_psbt = payload.get("psbt")
-        if not peer_psbt:
-            self._log("No PSBT in acceptance response")
-            return {"error": "no_psbt"}
+        # Peer accepted - now drive the splice_update loop
+        # CLN handles the actual PSBT exchange with the peer via Lightning protocol
+        # We just need to call splice_update until commitments_secured
+        self._log(f"Peer accepted splice {session_id}, driving splice_update loop")
 
-        # Continue splice_update loop
-        try:
-            update_result = rpc.call("splice_update", {
-                "channel_id": session.get("channel_id"),
-                "psbt": peer_psbt
-            })
-            our_psbt = update_result.get("psbt")
-            commitments_secured = update_result.get("commitments_secured", False)
+        current_psbt = session.get("psbt")
+        channel_id = session.get("channel_id")
+        max_update_rounds = 10
+        our_psbt = None
+        commitments_secured = False
 
-        except Exception as e:
-            self._log(f"splice_update failed: {e}", level='error')
+        for round_num in range(max_update_rounds):
+            try:
+                update_result = rpc.call("splice_update", {
+                    "channel_id": channel_id,
+                    "psbt": current_psbt
+                })
+                our_psbt = update_result.get("psbt")
+                commitments_secured = update_result.get("commitments_secured", False)
+
+                if commitments_secured:
+                    self._log(f"Commitments secured after {round_num + 1} rounds")
+                    break
+
+                # Update PSBT for next round
+                current_psbt = our_psbt
+                self._log(f"splice_update round {round_num + 1}: not yet secured, continuing...")
+
+            except Exception as e:
+                self._log(f"splice_update failed: {e}", level='error')
+                self._send_abort(sender_id, session_id, SPLICE_ABORT_RPC_ERROR, rpc)
+                self.db.update_splice_session(
+                    session_id,
+                    status=SPLICE_STATUS_FAILED,
+                    error_message=str(e)
+                )
+                return {"error": "splice_update_failed", "message": str(e)}
+
+        if not commitments_secured:
+            self._log(f"Failed to secure commitments after {max_update_rounds} rounds", level='error')
             self._send_abort(sender_id, session_id, SPLICE_ABORT_RPC_ERROR, rpc)
             self.db.update_splice_session(
                 session_id,
                 status=SPLICE_STATUS_FAILED,
-                error_message=str(e)
+                error_message="Failed to secure commitments"
             )
-            return {"error": "splice_update_failed", "message": str(e)}
+            return {"error": "commitments_not_secured"}
 
         self.db.update_splice_session(
             session_id,
-            status=SPLICE_STATUS_UPDATING,
+            status=SPLICE_STATUS_SIGNING,
             psbt=our_psbt,
-            commitments_secured=commitments_secured
+            commitments_secured=True
         )
 
-        if commitments_secured:
-            return self._proceed_to_signing(
-                session_id, sender_id, session.get("channel_id"), our_psbt, rpc
-            )
-
-        # Send update
-        now = int(time.time())
-        update_msg = create_splice_update(
-            sender_id=self.our_pubkey,
-            session_id=session_id,
-            psbt=our_psbt,
-            commitments_secured=False,
-            timestamp=now,
-            rpc=rpc
-        )
-
-        if update_msg:
-            self._send_message(sender_id, update_msg, rpc)
-
-        return {"success": True, "session_id": session_id, "status": SPLICE_STATUS_UPDATING}
+        # Proceed to signing
+        return self._proceed_to_signing(session_id, sender_id, channel_id, our_psbt, rpc)
 
     def handle_splice_update(
         self,

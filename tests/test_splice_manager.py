@@ -261,7 +261,7 @@ class TestSpliceInitResponseValidation:
         assert validate_splice_init_response_payload(payload) is True
 
     def test_accepted_without_psbt(self, sample_pubkey, sample_session_id):
-        """Accepted response without PSBT should fail validation."""
+        """Accepted response without PSBT should pass validation (PSBT is optional, CLN handles exchange)."""
         payload = {
             "responder_id": sample_pubkey,
             "session_id": sample_session_id,
@@ -269,7 +269,8 @@ class TestSpliceInitResponseValidation:
             "timestamp": int(time.time()),
             "signature": "valid_signature"
         }
-        assert validate_splice_init_response_payload(payload) is False
+        # PSBT is optional - CLN handles PSBT exchange internally via Lightning protocol
+        assert validate_splice_init_response_payload(payload) is True
 
 
 class TestSpliceUpdateValidation:

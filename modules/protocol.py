@@ -3357,10 +3357,10 @@ def validate_splice_init_response_payload(payload: Dict[str, Any]) -> bool:
     if not isinstance(accepted, bool):
         return False
 
-    # If accepted, psbt must be present
+    # If accepted, psbt is optional (CLN handles PSBT exchange internally)
     if accepted:
         psbt = payload.get("psbt")
-        if not isinstance(psbt, str) or not psbt or len(psbt) > MAX_PSBT_SIZE:
+        if psbt is not None and (not isinstance(psbt, str) or len(psbt) > MAX_PSBT_SIZE):
             return False
 
     # If rejected, reason should be present
