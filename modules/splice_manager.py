@@ -297,9 +297,10 @@ class SpliceManager:
         session_id = self._generate_session_id()
         now = int(time.time())
 
+        # Store full hex channel_id in session - CLN RPC calls require this format
         self.db.create_splice_session(
             session_id=session_id,
-            channel_id=channel_id,
+            channel_id=full_channel_id,
             peer_id=peer_id,
             initiator="local",
             splice_type=splice_type,
@@ -418,24 +419,29 @@ class SpliceManager:
             self._send_reject(sender_id, session_id, SPLICE_REJECT_NO_CHANNEL, rpc)
             return {"error": "no_channel"}
 
-        # Verify channel ID matches
-        actual_channel_id = channel.get("short_channel_id", channel.get("channel_id"))
-        if channel_id != actual_channel_id:
+        # Get both channel ID formats
+        short_channel_id = channel.get("short_channel_id")
+        full_channel_id = channel.get("channel_id")  # 32-byte hex format needed for CLN RPC
+
+        # Verify channel ID matches (accept either format from remote)
+        if channel_id != short_channel_id and channel_id != full_channel_id:
             self._log(f"Channel ID mismatch in splice request")
             self._send_reject(sender_id, session_id, SPLICE_REJECT_NO_CHANNEL, rpc)
             return {"error": "channel_mismatch"}
 
-        # Check for existing active splice
-        existing = self.db.get_active_splice_for_channel(channel_id)
+        # Check for existing active splice (check both formats)
+        existing = self.db.get_active_splice_for_channel(full_channel_id)
+        if not existing:
+            existing = self.db.get_active_splice_for_channel(short_channel_id)
         if existing:
             self._log(f"Channel {channel_id} already has active splice")
             self._send_reject(sender_id, session_id, SPLICE_REJECT_CHANNEL_BUSY, rpc)
             return {"error": "channel_busy"}
 
-        # Create session for tracking
+        # Create session for tracking - use full hex channel_id for CLN RPC compatibility
         self.db.create_splice_session(
             session_id=session_id,
-            channel_id=channel_id,
+            channel_id=full_channel_id,
             peer_id=sender_id,
             initiator="remote",
             splice_type=splice_type,
@@ -444,10 +450,10 @@ class SpliceManager:
         )
         self.db.update_splice_session(session_id, status=SPLICE_STATUS_INIT_RECEIVED, psbt=psbt)
 
-        # Call splice_update with their PSBT
+        # Call splice_update with their PSBT - use full hex channel_id
         try:
             update_result = rpc.call("splice_update", {
-                "channel_id": channel_id,
+                "channel_id": full_channel_id,
                 "psbt": psbt
             })
             our_psbt = update_result.get("psbt")
@@ -492,7 +498,7 @@ class SpliceManager:
 
         # If commitments are secured, proceed to signing
         if commitments_secured:
-            return self._proceed_to_signing(session_id, sender_id, channel_id, our_psbt, rpc)
+            return self._proceed_to_signing(session_id, sender_id, full_channel_id, our_psbt, rpc)
 
         return {"success": True, "session_id": session_id, "status": SPLICE_STATUS_UPDATING}
 
