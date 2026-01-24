@@ -41,6 +41,9 @@ Fleet-wide fee intelligence sharing and aggregation for coordinated fee strategi
 ### No Node Left Behind (NNLB)
 Health monitoring and liquidity needs detection across the fleet.
 
+### Coordinated Splicing (Phase 11)
+Automated splice operations between hive members with full PSBT exchange workflow. Resize channels without closing them - splice-in to add capacity, splice-out to remove.
+
 ### VPN Transport Support
 Optional WireGuard VPN integration for secure fleet communication.
 
@@ -186,6 +189,16 @@ lightningd --plugin=/path/to/cl-hive/cl-hive.py
 | `hive-peer-events` | View recent peer events |
 | `hive-channel-opened <scid>` | Record channel open event |
 | `hive-channel-closed <scid>` | Record channel close event |
+
+### Splice Coordination
+
+| Command | Description |
+|---------|-------------|
+| `hive-splice <channel_id> <amount>` | Execute coordinated splice with hive member (positive=in, negative=out) |
+| `hive-splice-status [session_id]` | View active splice sessions |
+| `hive-splice-abort <session_id>` | Abort an active splice session |
+| `hive-splice-check <peer_id> <type> <amount>` | Check if splice is safe for fleet connectivity |
+| `hive-splice-recommendations <peer_id>` | Get splice recommendations for a peer |
 
 ### VPN Transport
 

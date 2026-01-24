@@ -43,7 +43,7 @@ Core Lightning
 
 | Module | Purpose |
 |--------|---------|
-| `protocol.py` | BOLT 8 custom messages (magic: "HIVE" = 0x48495645, types 32769-32843) |
+| `protocol.py` | BOLT 8 custom messages (magic: "HIVE" = 0x48495645, types 32769-32845) |
 | `handshake.py` | PKI auth using CLN signmessage/checkmessage |
 | `state_manager.py` | HiveMap distributed state + anti-entropy sync |
 | `gossip.py` | Threshold-based gossip (10% capacity change) with 5-min heartbeat |
@@ -53,6 +53,7 @@ Core Lightning
 | `membership.py` | Three-tier system: Admin → Member → Neophyte with vouch-based promotion |
 | `contribution.py` | Forwarding stats and anti-leech detection |
 | `planner.py` | Topology optimization - saturation analysis, expansion election, feerate gate |
+| `splice_manager.py` | Coordinated splice operations between hive members (Phase 11) |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
 | `database.py` | SQLite with WAL mode, thread-local connections |
 
@@ -99,6 +100,7 @@ Core Lightning
 | `promotion_requests` | Pending promotion requests |
 | `hive_planner_log` | Planner decision audit log |
 | `pending_actions` | Actions awaiting approval (advisor mode) |
+| `splice_sessions` | Active and historical splice operations (Phase 11) |
 
 ## Safety Constraints
 
@@ -179,6 +181,7 @@ cl-hive/
 │   ├── membership.py       # Member management
 │   ├── contribution.py     # Contribution tracking
 │   ├── planner.py          # Topology planner
+│   ├── splice_manager.py   # Coordinated splice operations
 │   ├── governance.py       # Decision engine (advisor/failsafe)
 │   ├── config.py           # Configuration
 │   └── database.py         # Database layer
