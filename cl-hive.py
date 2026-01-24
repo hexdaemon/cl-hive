@@ -1111,6 +1111,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sync bridge policies: {e}", level="warn")
 
+    # Sync uptime from presence data to hive_members on startup
+    try:
+        uptime_synced = database.sync_uptime_from_presence(window_seconds=30 * 86400)
+        if uptime_synced > 0:
+            plugin.log(f"cl-hive: Synced uptime for {uptime_synced} member(s)")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sync uptime: {e}", level="warn")
+
     # Initialize DecisionEngine (Phase 7)
     global decision_engine
     decision_engine = DecisionEngine(database=database, plugin=safe_plugin)
@@ -5651,6 +5659,11 @@ def membership_maintenance_loop():
                 database.prune_old_contributions(older_than_days=45)
                 database.prune_old_vouches(older_than_seconds=VOUCH_TTL_SECONDS)
                 database.prune_presence(window_seconds=PRESENCE_WINDOW_SECONDS)
+
+                # Sync uptime from presence data to hive_members
+                updated = database.sync_uptime_from_presence(window_seconds=PRESENCE_WINDOW_SECONDS)
+                if updated > 0 and safe_plugin:
+                    safe_plugin.log(f"Synced uptime for {updated} member(s)", level='debug')
 
                 # Phase 9: Planner and governance data pruning
                 database.cleanup_expired_actions()  # Mark expired as 'expired'

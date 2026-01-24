@@ -1727,6 +1727,11 @@ def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
             year, week, _ = now.isocalendar()
             period = f"{year}-W{week:02d}"
 
+        # Sync uptime from presence data before snapshotting
+        # This ensures uptime_pct in hive_members is current
+        if ctx.database:
+            ctx.database.sync_uptime_from_presence(window_seconds=30 * 86400)
+
         # snapshot_contributions returns List[MemberContribution]
         contributions = ctx.routing_pool.snapshot_contributions(period)
 

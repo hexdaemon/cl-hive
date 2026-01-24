@@ -1726,6 +1726,68 @@ class HiveDatabase:
         """, (cutoff, window_seconds, window_seconds, cutoff))
         return result.rowcount
 
+    def sync_uptime_from_presence(self, window_seconds: int = 30 * 86400) -> int:
+        """
+        Calculate uptime percentage from peer_presence and update hive_members.
+
+        For each member with presence data, calculates:
+        uptime_pct = online_seconds_rolling / elapsed_window_time
+
+        Args:
+            window_seconds: Rolling window size (default 30 days)
+
+        Returns:
+            Number of members updated
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        # Get all members
+        members = conn.execute(
+            "SELECT peer_id FROM hive_members"
+        ).fetchall()
+
+        updated = 0
+        for row in members:
+            peer_id = row['peer_id']
+            presence = self.get_presence(peer_id)
+
+            if not presence:
+                # No presence data, assume 0% uptime
+                continue
+
+            online_seconds = presence['online_seconds_rolling']
+            window_start = presence['window_start_ts']
+            is_online = bool(presence['is_online'])
+            last_change = presence['last_change_ts']
+
+            # If currently online, add time since last state change
+            if is_online:
+                online_seconds += max(0, now - last_change)
+
+            # Calculate window elapsed time
+            elapsed = now - window_start
+            if elapsed <= 0:
+                elapsed = 1  # Avoid division by zero
+
+            # Cap at window size
+            if elapsed > window_seconds:
+                elapsed = window_seconds
+            if online_seconds > elapsed:
+                online_seconds = elapsed
+
+            # Calculate percentage (0.0 to 1.0)
+            uptime_pct = online_seconds / elapsed
+
+            # Update hive_members
+            conn.execute(
+                "UPDATE hive_members SET uptime_pct = ? WHERE peer_id = ?",
+                (uptime_pct, peer_id)
+            )
+            updated += 1
+
+        return updated
+
     # =========================================================================
     # LEECH FLAGS
     # =========================================================================
