@@ -226,11 +226,15 @@ class SpliceManager:
         if not channel:
             return {"error": "no_channel", "message": f"No active channel with peer {peer_id[:16]}..."}
 
-        actual_channel_id = channel.get("short_channel_id", channel.get("channel_id"))
-        if channel_id != actual_channel_id:
+        # Get both short_channel_id and full channel_id
+        short_channel_id = channel.get("short_channel_id")
+        full_channel_id = channel.get("channel_id")  # 32-byte hex format needed for splice_init
+
+        # User can provide either format
+        if channel_id != short_channel_id and channel_id != full_channel_id:
             return {
                 "error": "channel_mismatch",
-                "message": f"Channel ID mismatch: {channel_id} != {actual_channel_id}"
+                "message": f"Channel ID mismatch: {channel_id} not found (scid={short_channel_id})"
             }
 
         # Check for active splice on this channel
@@ -274,9 +278,10 @@ class SpliceManager:
             }
 
         # Call splice_init to get initial PSBT
+        # Note: splice_init requires the full 32-byte hex channel_id, not short_channel_id
         try:
             splice_result = rpc.call("splice_init", {
-                "channel_id": channel_id,
+                "channel_id": full_channel_id,
                 "relative_amount": relative_amount,
                 "feerate_per_kw": feerate_perkw,
                 "force_feerate": False
