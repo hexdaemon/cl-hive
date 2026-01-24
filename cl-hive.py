@@ -10001,11 +10001,19 @@ def hive_settlement_calculate(plugin: Plugin):
                 peer_fees = state_manager.get_peer_fees(peer_id)
                 fees_earned = peer_fees.get("fees_earned_sats", 0)
         else:
-            # For other nodes, use gossiped fee reports from state_manager
-            if state_manager:
+            # For other nodes, check persisted fee_reports first (survives restarts)
+            from modules.settlement import SettlementManager
+            current_period = SettlementManager.get_period_string()
+            db_reports = database.get_fee_reports_for_period(current_period)
+            for report in db_reports:
+                if report.get('peer_id') == peer_id:
+                    fees_earned = report.get('fees_earned_sats', 0)
+                    break
+            # Fallback to in-memory state_manager
+            if fees_earned == 0 and state_manager:
                 peer_fees = state_manager.get_peer_fees(peer_id)
                 fees_earned = peer_fees.get("fees_earned_sats", 0)
-            # Fallback to contribution data if available
+            # Final fallback to contribution data
             if fees_earned == 0:
                 fees_earned = contrib.get("fees_earned_sats", 0)
 
@@ -10157,11 +10165,19 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
                 peer_fees = state_manager.get_peer_fees(peer_id)
                 fees_earned = peer_fees.get("fees_earned_sats", 0)
         else:
-            # For other nodes, use gossiped fee reports from state_manager
-            if state_manager:
+            # For other nodes, check persisted fee_reports first (survives restarts)
+            from modules.settlement import SettlementManager
+            current_period = SettlementManager.get_period_string()
+            db_reports = database.get_fee_reports_for_period(current_period)
+            for report in db_reports:
+                if report.get('peer_id') == peer_id:
+                    fees_earned = report.get('fees_earned_sats', 0)
+                    break
+            # Fallback to in-memory state_manager
+            if fees_earned == 0 and state_manager:
                 peer_fees = state_manager.get_peer_fees(peer_id)
                 fees_earned = peer_fees.get("fees_earned_sats", 0)
-            # Fallback to contribution data if available
+            # Final fallback to contribution data
             if fees_earned == 0:
                 fees_earned = contrib.get("fees_earned_sats", 0)
 
