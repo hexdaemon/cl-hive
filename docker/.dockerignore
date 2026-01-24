@@ -1,0 +1,6 @@
+backups/
+secrets/
+wireguard/
+.env
+.env.*
+*.log
