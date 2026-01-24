@@ -85,6 +85,9 @@ services:
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-info}
 
+      # Experimental features
+      - EXPERIMENTAL_SPLICING=${EXPERIMENTAL_SPLICING:-false}
+
       # Lightning directory (used by supervisord)
       - LIGHTNING_DIR=/data/lightning/${NETWORK:-bitcoin}
 

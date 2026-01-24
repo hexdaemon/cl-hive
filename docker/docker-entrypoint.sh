@@ -182,6 +182,14 @@ clnrest-protocol=https
 clnrest-host=0.0.0.0
 EOF
 
+# Enable experimental splicing if requested
+if [ "${EXPERIMENTAL_SPLICING:-false}" = "true" ]; then
+    echo "" >> "$CONFIG_FILE"
+    echo "# Experimental Features" >> "$CONFIG_FILE"
+    echo "experimental-splicing" >> "$CONFIG_FILE"
+    echo "Experimental splicing enabled"
+fi
+
 # Disable CLBOSS if requested
 if [ "${CLBOSS_ENABLED:-true}" != "true" ]; then
     echo "disable-plugin=clboss" >> "$CONFIG_FILE"
