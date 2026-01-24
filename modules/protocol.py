@@ -109,6 +109,13 @@ class HiveMessageType(IntEnum):
     TASK_REQUEST = 32833        # Request another member to perform a task
     TASK_RESPONSE = 32835       # Response to task request (accept/reject/complete)
 
+    # Phase 11: Hive-Splice Coordination
+    SPLICE_INIT_REQUEST = 32837   # Request peer to participate in splice
+    SPLICE_INIT_RESPONSE = 32839  # Accept/reject splice with PSBT
+    SPLICE_UPDATE = 32841         # Exchange updated PSBT during splice
+    SPLICE_SIGNED = 32843         # Final signed PSBT/txid
+    SPLICE_ABORT = 32845          # Abort splice operation
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -3190,3 +3197,594 @@ def create_task_response(
         return None
 
     return serialize(HiveMessageType.TASK_RESPONSE, payload)
+
+
+# =============================================================================
+# PHASE 11: SPLICE COORDINATION CONSTANTS
+# =============================================================================
+
+# Splice session timeout (5 minutes)
+SPLICE_SESSION_TIMEOUT_SECONDS = 300
+
+# Valid splice types
+SPLICE_TYPE_IN = "splice_in"
+SPLICE_TYPE_OUT = "splice_out"
+VALID_SPLICE_TYPES = {SPLICE_TYPE_IN, SPLICE_TYPE_OUT}
+
+# Splice session statuses
+SPLICE_STATUS_PENDING = "pending"
+SPLICE_STATUS_INIT_SENT = "init_sent"
+SPLICE_STATUS_INIT_RECEIVED = "init_received"
+SPLICE_STATUS_UPDATING = "updating"
+SPLICE_STATUS_SIGNING = "signing"
+SPLICE_STATUS_COMPLETED = "completed"
+SPLICE_STATUS_ABORTED = "aborted"
+SPLICE_STATUS_FAILED = "failed"
+VALID_SPLICE_STATUSES = {
+    SPLICE_STATUS_PENDING, SPLICE_STATUS_INIT_SENT, SPLICE_STATUS_INIT_RECEIVED,
+    SPLICE_STATUS_UPDATING, SPLICE_STATUS_SIGNING, SPLICE_STATUS_COMPLETED,
+    SPLICE_STATUS_ABORTED, SPLICE_STATUS_FAILED
+}
+
+# Splice rejection reasons
+SPLICE_REJECT_NOT_MEMBER = "not_member"
+SPLICE_REJECT_NO_CHANNEL = "no_channel"
+SPLICE_REJECT_CHANNEL_BUSY = "channel_busy"
+SPLICE_REJECT_SAFETY_BLOCKED = "safety_blocked"
+SPLICE_REJECT_NO_SPLICING = "no_splicing_enabled"
+SPLICE_REJECT_INSUFFICIENT_FUNDS = "insufficient_funds"
+SPLICE_REJECT_INVALID_AMOUNT = "invalid_amount"
+SPLICE_REJECT_SESSION_EXISTS = "session_exists"
+SPLICE_REJECT_DECLINED = "declined"
+
+# Splice abort reasons
+SPLICE_ABORT_TIMEOUT = "timeout"
+SPLICE_ABORT_USER_CANCELLED = "user_cancelled"
+SPLICE_ABORT_RPC_ERROR = "rpc_error"
+SPLICE_ABORT_INVALID_PSBT = "invalid_psbt"
+SPLICE_ABORT_SIGNATURE_FAILED = "signature_failed"
+
+# Rate limits
+SPLICE_INIT_REQUEST_RATE_LIMIT = (5, 3600)  # 5 per hour per sender
+SPLICE_MESSAGE_RATE_LIMIT = (20, 3600)  # 20 per hour per session
+
+# Maximum PSBT size (500KB base64 encoded)
+MAX_PSBT_SIZE = 500_000
+
+
+# =============================================================================
+# PHASE 11: SPLICE VALIDATION FUNCTIONS
+# =============================================================================
+
+def validate_splice_init_request_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate SPLICE_INIT_REQUEST payload schema.
+
+    SECURITY: Requires cryptographic signature from the initiator.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    initiator_id = payload.get("initiator_id")
+    session_id = payload.get("session_id")
+    channel_id = payload.get("channel_id")
+    splice_type = payload.get("splice_type")
+    amount_sats = payload.get("amount_sats")
+    feerate_perkw = payload.get("feerate_perkw")
+    psbt = payload.get("psbt")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # initiator_id must be valid pubkey
+    if not _valid_pubkey(initiator_id):
+        return False
+
+    # session_id must be valid hex string
+    if not isinstance(session_id, str) or not session_id or len(session_id) > MAX_REQUEST_ID_LEN:
+        return False
+
+    # channel_id must be present
+    if not isinstance(channel_id, str) or not channel_id:
+        return False
+
+    # splice_type must be valid
+    if splice_type not in VALID_SPLICE_TYPES:
+        return False
+
+    # amount_sats must be positive integer
+    if not isinstance(amount_sats, int) or amount_sats <= 0:
+        return False
+
+    # feerate_perkw is optional but must be positive if present
+    if feerate_perkw is not None:
+        if not isinstance(feerate_perkw, int) or feerate_perkw <= 0:
+            return False
+
+    # psbt must be present and within size limit
+    if not isinstance(psbt, str) or not psbt or len(psbt) > MAX_PSBT_SIZE:
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    return True
+
+
+def get_splice_init_request_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing SPLICE_INIT_REQUEST messages.
+    """
+    signing_fields = {
+        "initiator_id": payload.get("initiator_id", ""),
+        "session_id": payload.get("session_id", ""),
+        "channel_id": payload.get("channel_id", ""),
+        "splice_type": payload.get("splice_type", ""),
+        "amount_sats": payload.get("amount_sats", 0),
+        "timestamp": payload.get("timestamp", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def validate_splice_init_response_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate SPLICE_INIT_RESPONSE payload schema.
+
+    SECURITY: Requires cryptographic signature from the responder.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    responder_id = payload.get("responder_id")
+    session_id = payload.get("session_id")
+    accepted = payload.get("accepted")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # responder_id must be valid pubkey
+    if not _valid_pubkey(responder_id):
+        return False
+
+    # session_id must be present
+    if not isinstance(session_id, str) or not session_id:
+        return False
+
+    # accepted must be boolean
+    if not isinstance(accepted, bool):
+        return False
+
+    # If accepted, psbt must be present
+    if accepted:
+        psbt = payload.get("psbt")
+        if not isinstance(psbt, str) or not psbt or len(psbt) > MAX_PSBT_SIZE:
+            return False
+
+    # If rejected, reason should be present
+    if not accepted:
+        reason = payload.get("reason")
+        if reason is not None and (not isinstance(reason, str) or len(reason) > 200):
+            return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    return True
+
+
+def get_splice_init_response_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing SPLICE_INIT_RESPONSE messages.
+    """
+    signing_fields = {
+        "responder_id": payload.get("responder_id", ""),
+        "session_id": payload.get("session_id", ""),
+        "accepted": payload.get("accepted", False),
+        "timestamp": payload.get("timestamp", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def validate_splice_update_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate SPLICE_UPDATE payload schema.
+
+    SECURITY: Requires cryptographic signature.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    session_id = payload.get("session_id")
+    psbt = payload.get("psbt")
+    commitments_secured = payload.get("commitments_secured")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # sender_id must be valid pubkey
+    if not _valid_pubkey(sender_id):
+        return False
+
+    # session_id must be present
+    if not isinstance(session_id, str) or not session_id:
+        return False
+
+    # psbt must be present and within size limit
+    if not isinstance(psbt, str) or not psbt or len(psbt) > MAX_PSBT_SIZE:
+        return False
+
+    # commitments_secured must be boolean
+    if not isinstance(commitments_secured, bool):
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    return True
+
+
+def get_splice_update_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing SPLICE_UPDATE messages.
+    """
+    signing_fields = {
+        "sender_id": payload.get("sender_id", ""),
+        "session_id": payload.get("session_id", ""),
+        "commitments_secured": payload.get("commitments_secured", False),
+        "timestamp": payload.get("timestamp", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def validate_splice_signed_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate SPLICE_SIGNED payload schema.
+
+    SECURITY: Requires cryptographic signature.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    session_id = payload.get("session_id")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # sender_id must be valid pubkey
+    if not _valid_pubkey(sender_id):
+        return False
+
+    # session_id must be present
+    if not isinstance(session_id, str) or not session_id:
+        return False
+
+    # Either signed_psbt or txid must be present
+    signed_psbt = payload.get("signed_psbt")
+    txid = payload.get("txid")
+
+    if signed_psbt is not None:
+        if not isinstance(signed_psbt, str) or len(signed_psbt) > MAX_PSBT_SIZE:
+            return False
+    elif txid is not None:
+        if not isinstance(txid, str) or len(txid) != 64:
+            return False
+    else:
+        return False  # At least one must be present
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    return True
+
+
+def get_splice_signed_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing SPLICE_SIGNED messages.
+    """
+    signing_fields = {
+        "sender_id": payload.get("sender_id", ""),
+        "session_id": payload.get("session_id", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "has_txid": payload.get("txid") is not None,
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def validate_splice_abort_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate SPLICE_ABORT payload schema.
+
+    SECURITY: Requires cryptographic signature.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    session_id = payload.get("session_id")
+    reason = payload.get("reason")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # sender_id must be valid pubkey
+    if not _valid_pubkey(sender_id):
+        return False
+
+    # session_id must be present
+    if not isinstance(session_id, str) or not session_id:
+        return False
+
+    # reason must be a string
+    if not isinstance(reason, str) or len(reason) > 500:
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    return True
+
+
+def get_splice_abort_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing SPLICE_ABORT messages.
+    """
+    signing_fields = {
+        "sender_id": payload.get("sender_id", ""),
+        "session_id": payload.get("session_id", ""),
+        "reason": payload.get("reason", ""),
+        "timestamp": payload.get("timestamp", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+# =============================================================================
+# PHASE 11: SPLICE MESSAGE CREATION FUNCTIONS
+# =============================================================================
+
+def create_splice_init_request(
+    initiator_id: str,
+    session_id: str,
+    channel_id: str,
+    splice_type: str,
+    amount_sats: int,
+    psbt: str,
+    timestamp: int,
+    rpc,
+    feerate_perkw: Optional[int] = None
+) -> Optional[bytes]:
+    """
+    Create a signed SPLICE_INIT_REQUEST message.
+
+    Args:
+        initiator_id: Our node pubkey
+        session_id: Unique session identifier
+        channel_id: Channel to splice
+        splice_type: 'splice_in' or 'splice_out'
+        amount_sats: Amount to splice (positive)
+        psbt: Initial PSBT from splice_init
+        timestamp: Unix timestamp
+        rpc: RPC proxy for signmessage
+        feerate_perkw: Optional feerate
+
+    Returns:
+        Serialized message bytes, or None on error
+    """
+    payload = {
+        "initiator_id": initiator_id,
+        "session_id": session_id,
+        "channel_id": channel_id,
+        "splice_type": splice_type,
+        "amount_sats": amount_sats,
+        "psbt": psbt,
+        "timestamp": timestamp,
+        "signature": ""  # Placeholder
+    }
+
+    if feerate_perkw is not None:
+        payload["feerate_perkw"] = feerate_perkw
+
+    # Sign the message (validation happens on receipt)
+    signing_payload = get_splice_init_request_signing_payload(payload)
+    try:
+        sign_result = rpc.signmessage(signing_payload)
+        payload["signature"] = sign_result.get("signature", "")
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.SPLICE_INIT_REQUEST, payload)
+
+
+def create_splice_init_response(
+    responder_id: str,
+    session_id: str,
+    accepted: bool,
+    timestamp: int,
+    rpc,
+    psbt: Optional[str] = None,
+    reason: Optional[str] = None
+) -> Optional[bytes]:
+    """
+    Create a signed SPLICE_INIT_RESPONSE message.
+
+    Args:
+        responder_id: Our node pubkey
+        session_id: Session we're responding to
+        accepted: Whether we accept the splice
+        timestamp: Unix timestamp
+        rpc: RPC proxy for signmessage
+        psbt: Updated PSBT (required if accepted)
+        reason: Rejection reason (if not accepted)
+
+    Returns:
+        Serialized message bytes, or None on error
+    """
+    payload = {
+        "responder_id": responder_id,
+        "session_id": session_id,
+        "accepted": accepted,
+        "timestamp": timestamp,
+        "signature": ""  # Placeholder
+    }
+
+    if accepted and psbt:
+        payload["psbt"] = psbt
+    if not accepted and reason:
+        payload["reason"] = reason
+
+    # Sign the message (validation happens on receipt)
+    signing_payload = get_splice_init_response_signing_payload(payload)
+    try:
+        sign_result = rpc.signmessage(signing_payload)
+        payload["signature"] = sign_result.get("signature", "")
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.SPLICE_INIT_RESPONSE, payload)
+
+
+def create_splice_update(
+    sender_id: str,
+    session_id: str,
+    psbt: str,
+    commitments_secured: bool,
+    timestamp: int,
+    rpc
+) -> Optional[bytes]:
+    """
+    Create a signed SPLICE_UPDATE message.
+
+    Args:
+        sender_id: Our node pubkey
+        session_id: Session ID
+        psbt: Updated PSBT
+        commitments_secured: Whether commitments are secured
+        timestamp: Unix timestamp
+        rpc: RPC proxy for signmessage
+
+    Returns:
+        Serialized message bytes, or None on error
+    """
+    payload = {
+        "sender_id": sender_id,
+        "session_id": session_id,
+        "psbt": psbt,
+        "commitments_secured": commitments_secured,
+        "timestamp": timestamp,
+        "signature": ""  # Placeholder
+    }
+
+    # Sign the message (validation happens on receipt)
+    signing_payload = get_splice_update_signing_payload(payload)
+    try:
+        sign_result = rpc.signmessage(signing_payload)
+        payload["signature"] = sign_result.get("signature", "")
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.SPLICE_UPDATE, payload)
+
+
+def create_splice_signed(
+    sender_id: str,
+    session_id: str,
+    timestamp: int,
+    rpc,
+    signed_psbt: Optional[str] = None,
+    txid: Optional[str] = None
+) -> Optional[bytes]:
+    """
+    Create a signed SPLICE_SIGNED message.
+
+    Args:
+        sender_id: Our node pubkey
+        session_id: Session ID
+        timestamp: Unix timestamp
+        rpc: RPC proxy for signmessage
+        signed_psbt: Final signed PSBT
+        txid: Transaction ID if already broadcast
+
+    Returns:
+        Serialized message bytes, or None on error
+    """
+    payload = {
+        "sender_id": sender_id,
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "signature": ""  # Placeholder
+    }
+
+    if signed_psbt:
+        payload["signed_psbt"] = signed_psbt
+    if txid:
+        payload["txid"] = txid
+
+    # Sign the message (validation happens on receipt)
+    signing_payload = get_splice_signed_signing_payload(payload)
+    try:
+        sign_result = rpc.signmessage(signing_payload)
+        payload["signature"] = sign_result.get("signature", "")
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.SPLICE_SIGNED, payload)
+
+
+def create_splice_abort(
+    sender_id: str,
+    session_id: str,
+    reason: str,
+    timestamp: int,
+    rpc
+) -> Optional[bytes]:
+    """
+    Create a signed SPLICE_ABORT message.
+
+    Args:
+        sender_id: Our node pubkey
+        session_id: Session to abort
+        reason: Abort reason
+        timestamp: Unix timestamp
+        rpc: RPC proxy for signmessage
+
+    Returns:
+        Serialized message bytes, or None on error
+    """
+    payload = {
+        "sender_id": sender_id,
+        "session_id": session_id,
+        "reason": reason,
+        "timestamp": timestamp,
+        "signature": ""  # Placeholder
+    }
+
+    # Sign the message (validation happens on receipt)
+    signing_payload = get_splice_abort_signing_payload(payload)
+    try:
+        sign_result = rpc.signmessage(signing_payload)
+        payload["signature"] = sign_result.get("signature", "")
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.SPLICE_ABORT, payload)

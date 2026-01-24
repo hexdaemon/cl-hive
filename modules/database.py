@@ -866,6 +866,46 @@ class HiveDatabase:
             "ON temporal_patterns(channel_id)"
         )
 
+        # =====================================================================
+        # SPLICE SESSIONS TABLE (Phase 11 - Hive-Splice Coordination)
+        # =====================================================================
+        # Tracks splice operations coordinated between hive members
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS splice_sessions (
+                session_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                initiator TEXT NOT NULL,
+                splice_type TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                psbt TEXT,
+                commitments_secured INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                txid TEXT,
+                error_message TEXT,
+                timeout_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_splice_sessions_channel "
+            "ON splice_sessions(channel_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_splice_sessions_peer "
+            "ON splice_sessions(peer_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_splice_sessions_status "
+            "ON splice_sessions(status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_splice_sessions_timeout "
+            "ON splice_sessions(timeout_at) WHERE status NOT IN ('completed', 'aborted', 'failed')"
+        )
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -4709,3 +4749,208 @@ class HiveDatabase:
         """, (cutoff,))
 
         return result.rowcount
+
+    # =========================================================================
+    # SPLICE SESSION OPERATIONS (Phase 11)
+    # =========================================================================
+
+    def create_splice_session(
+        self,
+        session_id: str,
+        channel_id: str,
+        peer_id: str,
+        initiator: str,
+        splice_type: str,
+        amount_sats: int,
+        timeout_seconds: int = 300
+    ) -> bool:
+        """
+        Create a new splice session.
+
+        Args:
+            session_id: Unique session identifier
+            channel_id: Channel being spliced
+            peer_id: Hive member we're splicing with
+            initiator: 'local' or 'remote'
+            splice_type: 'splice_in' or 'splice_out'
+            amount_sats: Amount to splice
+            timeout_seconds: Session timeout (default 5 min)
+
+        Returns:
+            True if created successfully
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        timeout_at = now + timeout_seconds
+
+        try:
+            conn.execute("""
+                INSERT INTO splice_sessions
+                (session_id, channel_id, peer_id, initiator, splice_type,
+                 amount_sats, status, created_at, updated_at, timeout_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """, (session_id, channel_id, peer_id, initiator, splice_type,
+                  amount_sats, now, now, timeout_at))
+            return True
+        except Exception as e:
+            self.plugin.log(f"Failed to create splice session: {e}", level='debug')
+            return False
+
+    def get_splice_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a splice session by ID.
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            Session data dict, or None if not found
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM splice_sessions WHERE session_id = ?
+        """, (session_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_active_splice_for_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get active splice session for a channel.
+
+        Args:
+            channel_id: Channel ID
+
+        Returns:
+            Active session data, or None if no active session
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM splice_sessions
+            WHERE channel_id = ?
+            AND status NOT IN ('completed', 'aborted', 'failed')
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (channel_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_active_splice_for_peer(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get active splice session for a peer.
+
+        Args:
+            peer_id: Peer pubkey
+
+        Returns:
+            Active session data, or None if no active session
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM splice_sessions
+            WHERE peer_id = ?
+            AND status NOT IN ('completed', 'aborted', 'failed')
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (peer_id,)).fetchone()
+        return dict(row) if row else None
+
+    def update_splice_session(
+        self,
+        session_id: str,
+        status: Optional[str] = None,
+        psbt: Optional[str] = None,
+        commitments_secured: Optional[bool] = None,
+        txid: Optional[str] = None,
+        error_message: Optional[str] = None
+    ) -> bool:
+        """
+        Update a splice session.
+
+        Args:
+            session_id: Session identifier
+            status: New status
+            psbt: Updated PSBT
+            commitments_secured: Whether commitments are secured
+            txid: Transaction ID if broadcast
+            error_message: Error message if failed
+
+        Returns:
+            True if updated
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        updates = {"updated_at": now}
+        if status is not None:
+            updates["status"] = status
+            if status in ('completed', 'aborted', 'failed'):
+                updates["completed_at"] = now
+        if psbt is not None:
+            updates["psbt"] = psbt
+        if commitments_secured is not None:
+            updates["commitments_secured"] = 1 if commitments_secured else 0
+        if txid is not None:
+            updates["txid"] = txid
+        if error_message is not None:
+            updates["error_message"] = error_message
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        values = list(updates.values()) + [session_id]
+
+        try:
+            result = conn.execute(
+                f"UPDATE splice_sessions SET {set_clause} WHERE session_id = ?",
+                values
+            )
+            return result.rowcount > 0
+        except Exception as e:
+            self.plugin.log(f"Failed to update splice session: {e}", level='debug')
+            return False
+
+    def cleanup_expired_splice_sessions(self) -> int:
+        """
+        Mark expired splice sessions as failed.
+
+        Returns:
+            Number of sessions cleaned up
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        result = conn.execute("""
+            UPDATE splice_sessions
+            SET status = 'failed', error_message = 'timeout', completed_at = ?
+            WHERE status NOT IN ('completed', 'aborted', 'failed')
+            AND timeout_at < ?
+        """, (now, now))
+
+        return result.rowcount
+
+    def get_pending_splice_sessions(self) -> List[Dict[str, Any]]:
+        """
+        Get all pending/active splice sessions.
+
+        Returns:
+            List of active session dicts
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM splice_sessions
+            WHERE status NOT IN ('completed', 'aborted', 'failed')
+            ORDER BY created_at ASC
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_splice_session(self, session_id: str) -> bool:
+        """
+        Delete a splice session.
+
+        Args:
+            session_id: Session to delete
+
+        Returns:
+            True if deleted
+        """
+        conn = self._get_connection()
+        result = conn.execute("""
+            DELETE FROM splice_sessions WHERE session_id = ?
+        """, (session_id,))
+        return result.rowcount > 0

@@ -92,6 +92,7 @@ from modules.channel_rationalization import RationalizationManager
 from modules.strategic_positioning import StrategicPositioningManager
 from modules.anticipatory_liquidity import AnticipatoryLiquidityManager
 from modules.task_manager import TaskManager
+from modules.splice_manager import SpliceManager
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -306,6 +307,7 @@ rationalization_mgr: Optional[RationalizationManager] = None
 strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
 anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
 task_mgr: Optional[TaskManager] = None
+splice_mgr: Optional[SpliceManager] = None
 our_pubkey: Optional[str] = None
 
 # Fee tracking for real-time gossip (Settlement Phase)
@@ -1356,6 +1358,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Task manager initialized (Phase 10)")
 
+    # Initialize Splice Manager (Phase 11 - Hive-Splice Coordination)
+    global splice_mgr
+    splice_mgr = SpliceManager(
+        database=database,
+        plugin=safe_plugin,
+        splice_coordinator=splice_coord,
+        our_pubkey=our_pubkey
+    )
+    plugin.log("cl-hive: Splice manager initialized (Phase 11)")
+
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
@@ -1582,6 +1594,17 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_task_request(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.TASK_RESPONSE:
             return handle_task_response(peer_id, msg_payload, plugin)
+        # Phase 11: Hive-Splice Coordination
+        elif msg_type == HiveMessageType.SPLICE_INIT_REQUEST:
+            return handle_splice_init_request(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.SPLICE_INIT_RESPONSE:
+            return handle_splice_init_response(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.SPLICE_UPDATE:
+            return handle_splice_update(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.SPLICE_SIGNED:
+            return handle_splice_signed(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.SPLICE_ABORT:
+            return handle_splice_abort(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -4957,6 +4980,151 @@ def handle_task_response(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(
             f"cl-hive: TASK_RESPONSE error from {peer_id[:16]}...: {result.get('error')}",
             level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+# =============================================================================
+# PHASE 11: HIVE-SPLICE MESSAGE HANDLERS
+# =============================================================================
+
+def handle_splice_init_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle SPLICE_INIT_REQUEST message from a hive member.
+
+    When another member wants to initiate a splice with us.
+    """
+    if not splice_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: SPLICE_INIT_REQUEST from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to splice manager
+    result = splice_mgr.handle_splice_init_request(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Accepted splice {result.get('session_id', '')} from {peer_id[:16]}...",
+            level='info'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: SPLICE_INIT_REQUEST error from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_splice_init_response(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle SPLICE_INIT_RESPONSE message from a hive member.
+
+    When a peer responds to our splice init request.
+    """
+    if not splice_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member
+    sender = database.get_member(peer_id)
+    if not sender:
+        plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to splice manager
+    result = splice_mgr.handle_splice_init_response(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("rejected"):
+        plugin.log(
+            f"cl-hive: Splice rejected by {peer_id[:16]}...: {result.get('reason', 'unknown')}",
+            level='info'
+        )
+    elif result.get("success"):
+        plugin.log(
+            f"cl-hive: Splice {result.get('session_id', '')} response received",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_splice_update(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle SPLICE_UPDATE message during splice negotiation.
+    """
+    if not splice_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member
+    sender = database.get_member(peer_id)
+    if not sender:
+        return {"result": "continue"}
+
+    # Delegate to splice manager
+    result = splice_mgr.handle_splice_update(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("error"):
+        plugin.log(
+            f"cl-hive: SPLICE_UPDATE error: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_splice_signed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle SPLICE_SIGNED message with final PSBT or txid.
+    """
+    if not splice_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member
+    sender = database.get_member(peer_id)
+    if not sender:
+        return {"result": "continue"}
+
+    # Delegate to splice manager
+    result = splice_mgr.handle_splice_signed(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("txid"):
+        plugin.log(
+            f"cl-hive: Splice {result.get('session_id', '')} completed: txid={result.get('txid')[:16]}...",
+            level='info'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: SPLICE_SIGNED error: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle SPLICE_ABORT message when peer aborts splice.
+    """
+    if not splice_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member
+    sender = database.get_member(peer_id)
+    if not sender:
+        return {"result": "continue"}
+
+    # Delegate to splice manager
+    result = splice_mgr.handle_splice_abort(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("aborted"):
+        plugin.log(
+            f"cl-hive: Splice aborted by {peer_id[:16]}...: {result.get('reason', 'unknown')}",
+            level='info'
         )
 
     return {"result": "continue"}
@@ -10636,6 +10804,132 @@ def hive_time_low_hours(plugin: Plugin, channel_id: str):
         "low_hours": low_hours,
         "count": len(low_hours)
     }
+
+
+# =============================================================================
+# PHASE 11: HIVE-SPLICE COORDINATION
+# =============================================================================
+
+@plugin.method("hive-splice")
+def hive_splice(
+    plugin: Plugin,
+    channel_id: str,
+    relative_amount: int,
+    feerate_per_kw: int = None,
+    dry_run: bool = False,
+    force: bool = False
+):
+    """
+    Execute a coordinated splice operation with a hive member.
+
+    Splices must be with channels to other hive members. This command handles
+    the full splice coordination workflow between nodes.
+
+    Args:
+        channel_id: Channel ID to splice (must be with a hive member)
+        relative_amount: Positive = splice-in, Negative = splice-out (satoshis)
+        feerate_per_kw: Optional feerate (default: use urgent rate)
+        dry_run: If true, preview the operation without executing
+        force: If true, skip safety warnings for splice-out
+
+    Returns:
+        Dict with splice result including session_id, status, and txid when complete.
+
+    Examples:
+        # Splice in 1M sats (add to channel)
+        lightning-cli hive-splice 123x456x0 1000000
+
+        # Splice out 500k sats (remove from channel)
+        lightning-cli hive-splice 123x456x0 -500000
+
+        # Preview a splice without executing
+        lightning-cli hive-splice 123x456x0 1000000 dry_run=true
+    """
+    if not splice_mgr:
+        return {"error": "Splice manager not initialized"}
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Find the peer for this channel
+    try:
+        peer_id = None
+        result = safe_plugin.rpc.listpeerchannels()
+        for ch in result.get("channels", []):
+            scid = ch.get("short_channel_id", ch.get("channel_id"))
+            if scid == channel_id:
+                peer_id = ch.get("peer_id")
+                break
+
+        if not peer_id:
+            return {"error": "channel_not_found", "message": f"Channel {channel_id} not found"}
+
+    except Exception as e:
+        return {"error": "rpc_error", "message": str(e)}
+
+    # Verify peer is a hive member
+    member = database.get_member(peer_id)
+    if not member:
+        return {
+            "error": "not_hive_member",
+            "message": f"Channel peer {peer_id[:16]}... is not a hive member. "
+                      "Splices are only supported with hive members."
+        }
+
+    # Initiate the splice
+    return splice_mgr.initiate_splice(
+        peer_id=peer_id,
+        channel_id=channel_id,
+        relative_amount=relative_amount,
+        rpc=safe_plugin.rpc,
+        feerate_perkw=feerate_per_kw,
+        dry_run=dry_run,
+        force=force
+    )
+
+
+@plugin.method("hive-splice-status")
+def hive_splice_status(plugin: Plugin, session_id: str = None):
+    """
+    Get status of splice sessions.
+
+    Args:
+        session_id: Optional specific session ID. If not provided, returns all active sessions.
+
+    Returns:
+        Session details or list of active sessions.
+    """
+    if not splice_mgr:
+        return {"error": "Splice manager not initialized"}
+
+    if session_id:
+        session = splice_mgr.get_session_status(session_id)
+        if not session:
+            return {"error": "unknown_session", "message": f"Session {session_id} not found"}
+        return session
+
+    sessions = splice_mgr.get_active_sessions()
+    return {
+        "active_sessions": sessions,
+        "count": len(sessions)
+    }
+
+
+@plugin.method("hive-splice-abort")
+def hive_splice_abort(plugin: Plugin, session_id: str):
+    """
+    Abort an active splice session.
+
+    Args:
+        session_id: Session ID to abort.
+
+    Returns:
+        Abort result.
+    """
+    if not splice_mgr:
+        return {"error": "Splice manager not initialized"}
+
+    return splice_mgr.abort_session(session_id, safe_plugin.rpc)
 
 
 # =============================================================================
