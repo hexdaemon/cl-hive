@@ -10091,7 +10091,7 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
     Returns:
         Dict with settlement execution result.
     """
-    from modules.settlement import MemberContribution, SettlementResult, MIN_PAYMENT_SATS
+    from modules.settlement import MemberContribution, SettlementResult
 
     if not settlement_mgr:
         return {"error": "Settlement manager not initialized"}
