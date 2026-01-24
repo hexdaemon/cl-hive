@@ -1,0 +1,196 @@
+# --- CL-REVENUE-OPS v2.0 CONFIGURATION ---
+# Copy to ~/.lightning/config or include via `include cl-revenue-ops.conf`
+#
+# QUICK START (Production):
+#   revenue-ops-dry-run=false
+#   revenue-ops-clboss-enabled=true
+#   revenue-ops-min-fee-ppm=100
+#
+# All options shown with defaults (commented out)
+
+# ============================================================================
+# INTEGRATION
+# ============================================================================
+
+# Enable integration with CLBOSS (REQUIRED if running CLBOSS - prevents conflicts)
+#revenue-ops-clboss-enabled=false
+
+# Safety switch - log actions but don't execute (set false for production)
+#revenue-ops-dry-run=true
+
+# ============================================================================
+# CL-HIVE INTEGRATION
+# ============================================================================
+
+# Fee rate for hive member channels (0 = free routing between fleet)
+# When cl-hive sets a peer's strategy to HIVE, this fee is applied
+#revenue-ops-hive-fee-ppm=0
+
+# ============================================================================
+# FLOW ANALYSIS
+# ============================================================================
+
+# Target daily flow per channel in sats (used for liquidity scoring)
+#revenue-ops-target-flow=250000
+
+# Flow analysis interval in seconds (1 hour default)
+#revenue-ops-flow-interval=3600
+
+# Historical window for flow averaging (days)
+#revenue-ops-flow-window-days=7
+
+# ============================================================================
+# FEE MANAGEMENT (Hill Climbing Algorithm v2.0)
+# ============================================================================
+
+# Fee adjustment interval in seconds
+# RECOMMENDATION: 1800 (30 min) for active nodes, 3600 (1 hour) for calm markets
+# The algorithm uses dynamic observation windows, so faster intervals are safe
+#revenue-ops-fee-interval=1800
+
+# Fee floor - minimum fee rate (protects against L1 fee spikes)
+# RECOMMENDATION: 100 ppm for competitive markets, 50 ppm for volume focus
+#revenue-ops-min-fee-ppm=100
+
+# Fee ceiling - maximum fee rate
+# RECOMMENDATION: 2500-5000 ppm depending on channel positioning
+#revenue-ops-max-fee-ppm=2500
+
+# --- Scarcity Pricing (v2.0) ---
+# Apply fee multiplier when outbound liquidity is scarce
+# Protects valuable liquidity from being underpriced
+
+# Enable scarcity pricing
+#revenue-ops-scarcity-pricing=true
+
+# Outbound ratio below which scarcity pricing kicks in (0.15 = 15%)
+#revenue-ops-scarcity-threshold=0.15
+
+# --- Vegas Reflex (v2.0) ---
+# Dynamically raise fee floor during mempool congestion
+# Protects against underpricing when on-chain costs spike
+
+# Enable Vegas Reflex mempool-aware floor adjustment
+#revenue-ops-vegas-reflex=true
+
+# ============================================================================
+# REBALANCING
+# ============================================================================
+
+# Rebalance candidate evaluation interval in seconds
+#revenue-ops-rebalance-interval=900
+
+# Minimum expected profit in sats to trigger rebalance
+# RECOMMENDATION: 50-100 sats for active rebalancing, 200+ for conservative
+#revenue-ops-rebalance-min-profit=50
+
+# Rebalancer backend (only 'sling' supported)
+#revenue-ops-rebalancer=sling
+
+# ============================================================================
+# CAPITAL SAFETY (Global Capital Controls)
+# ============================================================================
+
+# Daily budget for rebalancing fees - acts as floor when proportional enabled
+# RECOMMENDATION: Start conservative (2000-5000), increase as you learn
+#revenue-ops-daily-budget-sats=5000
+
+# On-chain + Off-chain reserve threshold (abort rebalancing if below)
+#revenue-ops-min-wallet-reserve=500000
+
+# --- Revenue-Proportional Budget ---
+# Scale daily budget as percentage of trailing 24h routing revenue
+# Formula: effective_budget = max(daily-budget-sats, revenue_24h * pct)
+
+# Enable revenue-proportional budget scaling
+#revenue-ops-proportional-budget=true
+
+# Percentage of 24h revenue to use as budget (0.10 = 10%)
+# RECOMMENDATION: 5-15% depending on risk tolerance
+#revenue-ops-proportional-budget-pct=0.10
+
+# ============================================================================
+# RISK MANAGEMENT (Kelly Criterion)
+# ============================================================================
+
+# Scale rebalance budget based on historical success rate
+#revenue-ops-enable-kelly=true
+
+# Kelly fraction multiplier (0.5 = Half Kelly = conservative)
+# RECOMMENDATION: 0.5 for stable nodes, 0.3 for conservative
+#revenue-ops-kelly-fraction=0.5
+
+# ============================================================================
+# TRAFFIC INTELLIGENCE (Reputation System)
+# ============================================================================
+
+# Discount volume from peers with high failure rates ("Spam Shield")
+#revenue-ops-enable-reputation=true
+
+# Decay factor per flow interval (0.98^24 ~ 0.61 = ~40% weight loss daily)
+#revenue-ops-reputation-decay=0.98
+
+# HTLC Congestion Guard: Skip rebalancing into channels with stressed slots
+#revenue-ops-htlc-congestion-threshold=0.8
+
+# ============================================================================
+# LIQUIDITY THRESHOLDS
+# ============================================================================
+
+# Below this ratio, channel is considered depleted (rebalance target)
+#revenue-ops-low-liquidity-threshold=0.2
+
+# Above this ratio, channel is a source for rebalancing
+#revenue-ops-high-liquidity-threshold=0.8
+
+# ============================================================================
+# DATABASE
+# ============================================================================
+
+# Path to SQLite database
+#revenue-ops-db-path=~/.lightning/revenue-ops.db
+
+# ============================================================================
+# EXAMPLE CONFIGURATIONS
+# ============================================================================
+
+# --- AGGRESSIVE ROUTING NODE ---
+# Maximize volume and market share
+#
+# revenue-ops-dry-run=false
+# revenue-ops-clboss-enabled=true
+# revenue-ops-min-fee-ppm=50
+# revenue-ops-max-fee-ppm=1500
+# revenue-ops-fee-interval=1800
+# revenue-ops-scarcity-pricing=true
+# revenue-ops-proportional-budget=true
+# revenue-ops-proportional-budget-pct=0.15
+# revenue-ops-enable-kelly=true
+# revenue-ops-kelly-fraction=0.6
+
+# --- CONSERVATIVE ROUTING NODE ---
+# Prioritize profitability over volume
+#
+# revenue-ops-dry-run=false
+# revenue-ops-clboss-enabled=true
+# revenue-ops-min-fee-ppm=150
+# revenue-ops-max-fee-ppm=5000
+# revenue-ops-fee-interval=3600
+# revenue-ops-scarcity-pricing=true
+# revenue-ops-daily-budget-sats=2000
+# revenue-ops-proportional-budget=false
+# revenue-ops-enable-kelly=true
+# revenue-ops-kelly-fraction=0.3
+
+# --- CL-HIVE FLEET MEMBER ---
+# Optimized for coordinated hive routing
+#
+# revenue-ops-dry-run=false
+# revenue-ops-clboss-enabled=true
+# revenue-ops-hive-fee-ppm=0
+# revenue-ops-min-fee-ppm=100
+# revenue-ops-max-fee-ppm=2500
+# revenue-ops-fee-interval=1800
+# revenue-ops-scarcity-pricing=true
+# revenue-ops-proportional-budget=true
+# revenue-ops-proportional-budget-pct=0.10
