@@ -5204,7 +5204,7 @@ def handle_circular_flow_alert(peer_id: str, payload: Dict, plugin: Plugin) -> D
 
     # Store the circular flow alert
     try:
-        result = cost_reduction_mgr.circular_flow_detector.receive_circular_flow_alert(
+        result = cost_reduction_mgr.circular_detector.receive_circular_flow_alert(
             reporter_id=peer_id,
             alert_data=payload
         )
@@ -7633,7 +7633,7 @@ def _broadcast_circular_flow_alerts():
         )
 
         # Get shareable circular flows
-        shareable_flows = cost_reduction_mgr.circular_flow_detector.get_shareable_circular_flows(
+        shareable_flows = cost_reduction_mgr.circular_detector.get_shareable_circular_flows(
             min_cost_sats=MIN_CIRCULAR_FLOW_COST_SATS,
             min_amount_sats=MIN_CIRCULAR_FLOW_SATS
         )

@@ -60,6 +60,12 @@ class OpportunityType(Enum):
     STIGMERGIC_COORDINATION = "stigmergic_coordination"
     ROUTING_INTELLIGENCE = "routing_intelligence"
 
+    # Fleet consensus (Phase 14.2) - Multiple fleet members agree
+    FLEET_CONSENSUS_FEE = "fleet_consensus_fee"          # Fleet agrees on fee direction
+    FLEET_CONSENSUS_CLOSE = "fleet_consensus_close"      # Fleet agrees we should close
+    FLEET_CONSENSUS_CORRIDOR = "fleet_consensus_corridor" # Fleet identifies valuable corridor
+    FLEET_DEFENSIVE_ACTION = "fleet_defensive_action"    # Fleet warns about peer
+
 
 class ActionType(Enum):
     """Types of actions the advisor can take."""
@@ -249,6 +255,8 @@ class OpportunityScanner:
             self._scan_new_member_opportunities(node_name, state),
             # Routing intelligence scanner (pheromones + stigmergic markers)
             self._scan_routing_intelligence(node_name, state),
+            # Fleet consensus scanner (Phase 14.2 - shared intelligence)
+            self._scan_fleet_consensus(node_name, state),
             return_exceptions=True
         )
 
@@ -1540,6 +1548,229 @@ class OpportunityScanner:
                     }
                 )
                 opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_fleet_consensus(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """
+        Scan for fleet consensus opportunities (Phase 14.2).
+
+        When multiple fleet members agree on an action, we can safely automate:
+        - Close recommendations with consensus -> auto-execute safe if we're clear underperformer
+        - Corridor value consensus -> boost confidence for channel opens
+        - Fleet defensive warnings -> auto-execute fee increases
+
+        Key insight: Fleet consensus significantly reduces risk of bad decisions.
+        If 2+ independent nodes agree, confidence is boosted and auto-execution enabled.
+        """
+        opportunities = []
+
+        # Get fleet data from state
+        fleet_corridors = state.get("fleet_corridor_consensus", {})
+        fleet_close_proposals = state.get("fleet_close_proposals", [])
+        defense_status = state.get("defense_status", {})
+        channels = state.get("channels", [])
+
+        # Build peer-to-channel lookup
+        peer_to_channel = {}
+        for ch in channels:
+            peer_id = ch.get("peer_id")
+            ch_id = ch.get("short_channel_id") or ch.get("channel_id")
+            if peer_id and ch_id:
+                peer_to_channel[peer_id] = ch
+
+        # === Fleet Close Proposals (Rationalization) ===
+        # If the fleet says we should close a redundant channel, check consensus
+        our_pubkey = state.get("our_pubkey", "")
+        for proposal in fleet_close_proposals:
+            target_member = proposal.get("target_member", "")
+            target_peer = proposal.get("target_peer", "")
+            our_share = proposal.get("their_routing_share", 0)  # Our share in their perspective
+            their_share = proposal.get("our_routing_share", 0)  # Owner's share
+            reporters = proposal.get("reporters", [])
+
+            # Only care about proposals targeting us
+            if target_member != our_pubkey:
+                continue
+
+            # Check if we have a channel to this peer
+            ch = peer_to_channel.get(target_peer)
+            if not ch:
+                continue
+
+            ch_id = ch.get("short_channel_id") or ch.get("channel_id")
+            reporter_count = len(reporters) if isinstance(reporters, list) else 1
+
+            # Consensus: 2+ reporters and we're clearly the underperformer (<10% of owner's share)
+            is_consensus = reporter_count >= 2
+            is_clear_underperformer = our_share < (their_share * 0.1)
+
+            # Safe to auto-execute if consensus AND clear underperformer AND low capacity
+            capacity = ch.get("capacity_sats", 0)
+            if not capacity:
+                total_msat = ch.get("total_msat", 0)
+                if isinstance(total_msat, str):
+                    total_msat = int(total_msat.replace("msat", ""))
+                capacity = total_msat // 1000
+
+            # Only auto-execute for small channels (<3M sats) with strong consensus
+            auto_safe = is_consensus and is_clear_underperformer and capacity < 3_000_000
+
+            confidence = 0.6 + (0.1 * reporter_count)  # Boost confidence with consensus
+            if is_clear_underperformer:
+                confidence += 0.1
+
+            opp = Opportunity(
+                opportunity_type=OpportunityType.FLEET_CONSENSUS_CLOSE,
+                action_type=ActionType.CHANNEL_CLOSE,
+                channel_id=ch_id,
+                peer_id=target_peer,
+                node_name=node_name,
+                priority_score=0.7 if is_consensus else 0.5,
+                confidence_score=min(0.95, confidence),
+                roi_estimate=0.5,
+                description=f"Fleet consensus: close redundant channel to {target_peer[:16]}...",
+                reasoning=f"{reporter_count} fleet members report we're underperformer "
+                          f"({our_share:.1%} vs owner's {their_share:.1%}). "
+                          f"Channel capacity: {capacity:,} sats.",
+                recommended_action="Close channel to free capital for better placement",
+                predicted_benefit=int(capacity * 0.001),  # Freed capital benefit
+                classification=ActionClassification.AUTO_EXECUTE if auto_safe
+                              else ActionClassification.QUEUE_FOR_REVIEW,
+                auto_execute_safe=auto_safe,
+                current_state={
+                    "reporter_count": reporter_count,
+                    "our_routing_share": our_share,
+                    "owner_routing_share": their_share,
+                    "capacity": capacity
+                }
+            )
+            opportunities.append(opp)
+
+        # === Fleet Defensive Warnings ===
+        # When fleet warns about a peer we have a channel with, raise fees defensively
+        warnings = defense_status.get("warnings", [])
+        for warning in warnings:
+            peer_id = warning.get("peer_id", "")
+            severity = warning.get("severity", "info")
+            warning_type = warning.get("type", "")
+            sources = warning.get("sources", [])
+
+            ch = peer_to_channel.get(peer_id)
+            if not ch:
+                continue
+
+            ch_id = ch.get("short_channel_id") or ch.get("channel_id")
+            current_fee = ch.get("fee_per_millionth", 0)
+            source_count = len(sources) if isinstance(sources, list) else 1
+
+            # Fleet consensus on threat: 2+ sources reporting the same warning
+            is_consensus = source_count >= 2
+            is_serious = severity in ("high", "critical")
+
+            # Safe to auto-execute defensive fee increase if consensus AND serious
+            auto_safe = is_consensus and is_serious and current_fee < 1500
+
+            # Suggested defensive fee based on severity
+            if severity == "critical":
+                suggested_fee = min(2000, max(1000, current_fee * 2))
+            elif severity == "high":
+                suggested_fee = min(1500, max(500, int(current_fee * 1.5)))
+            else:
+                suggested_fee = min(1000, max(300, int(current_fee * 1.25)))
+
+            confidence = 0.7 + (0.1 * source_count)
+            if is_serious:
+                confidence += 0.1
+
+            opp = Opportunity(
+                opportunity_type=OpportunityType.FLEET_DEFENSIVE_ACTION,
+                action_type=ActionType.FEE_CHANGE,
+                channel_id=ch_id,
+                peer_id=peer_id,
+                node_name=node_name,
+                priority_score=0.8 if is_serious else 0.6,
+                confidence_score=min(0.95, confidence),
+                roi_estimate=0.3,
+                description=f"Fleet defense: {severity} {warning_type} warning for {peer_id[:16]}...",
+                reasoning=f"{source_count} fleet sources report {warning_type} threat. "
+                          f"Current fee: {current_fee} ppm.",
+                recommended_action=f"Raise fee defensively to {suggested_fee} ppm",
+                predicted_benefit=500,
+                classification=ActionClassification.AUTO_EXECUTE if auto_safe
+                              else ActionClassification.QUEUE_FOR_REVIEW,
+                auto_execute_safe=auto_safe,
+                current_state={
+                    "source_count": source_count,
+                    "severity": severity,
+                    "warning_type": warning_type,
+                    "current_fee": current_fee,
+                    "suggested_fee": suggested_fee
+                }
+            )
+            opportunities.append(opp)
+
+        # === Fleet Corridor Value Consensus ===
+        # When fleet agrees on high-value corridors, suggest channel opens
+        for corridor_key, corridor_data in fleet_corridors.items():
+            reporters = corridor_data.get("reporters", [])
+            value_scores = corridor_data.get("value_scores", [])
+            source = corridor_data.get("source", "")
+            dest = corridor_data.get("dest", "")
+
+            if len(reporters) < 2:  # Need consensus
+                continue
+
+            # Calculate consensus value score
+            if value_scores:
+                avg_score = sum(value_scores) / len(value_scores)
+            else:
+                avg_score = 0.5
+
+            if avg_score < 0.3:  # Not valuable enough
+                continue
+
+            # Check if we already have connectivity to either endpoint
+            have_source = source in peer_to_channel
+            have_dest = dest in peer_to_channel
+
+            if have_source and have_dest:
+                continue  # Already covered
+
+            # Suggest opening channel to missing endpoint
+            target = dest if have_source else source
+            confidence = 0.6 + (0.1 * len(reporters)) + (avg_score * 0.2)
+
+            opp = Opportunity(
+                opportunity_type=OpportunityType.FLEET_CONSENSUS_CORRIDOR,
+                action_type=ActionType.CHANNEL_OPEN,
+                channel_id=None,
+                peer_id=target,
+                node_name=node_name,
+                priority_score=avg_score,
+                confidence_score=min(0.9, confidence),
+                roi_estimate=avg_score,
+                description=f"Fleet identifies valuable corridor: {source[:8]}...→{dest[:8]}...",
+                reasoning=f"{len(reporters)} fleet members report high-value corridor "
+                          f"(avg score: {avg_score:.2f}). We're missing connection to {target[:16]}...",
+                recommended_action=f"Open channel to {target[:16]}... to capture corridor value",
+                predicted_benefit=int(avg_score * 2000),
+                classification=ActionClassification.QUEUE_FOR_REVIEW,  # Channel opens need review
+                auto_execute_safe=False,  # Never auto-execute channel opens
+                current_state={
+                    "reporter_count": len(reporters),
+                    "avg_value_score": avg_score,
+                    "source": source,
+                    "dest": dest,
+                    "have_source": have_source,
+                    "have_dest": have_dest
+                }
+            )
+            opportunities.append(opp)
 
         return opportunities
 

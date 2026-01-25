@@ -382,23 +382,30 @@ MAX_CIRCULAR_FLOW_MEMBERS = 10               # Maximum members in one circular f
 # Temporal pattern sharing constants (Phase 14)
 TEMPORAL_PATTERN_BATCH_RATE_LIMIT = (4, 86400)  # 4 batches per day (every 6 hours)
 MAX_PATTERNS_IN_BATCH = 500                     # Maximum patterns in one batch
+MAX_TEMPORAL_PATTERNS_IN_BATCH = MAX_PATTERNS_IN_BATCH  # Alias for consistency
 MIN_PATTERN_CONFIDENCE = 0.6                    # Minimum confidence to share
 MIN_PATTERN_SAMPLES = 10                        # Minimum samples for pattern validity
+MIN_TEMPORAL_PATTERN_CONFIDENCE = MIN_PATTERN_CONFIDENCE  # Alias
+MIN_TEMPORAL_PATTERN_SAMPLES = MIN_PATTERN_SAMPLES        # Alias
 
 # Strategic positioning sharing constants (Phase 14.2)
 CORRIDOR_VALUE_BATCH_RATE_LIMIT = (2, 86400)    # 2 batches per day (every 12 hours)
 MAX_CORRIDORS_IN_BATCH = 100                    # Maximum corridors in one batch
 MIN_CORRIDOR_VALUE_SCORE = 0.05                 # Minimum value score to share
 POSITIONING_PROPOSAL_RATE_LIMIT = (5, 86400)    # 5 proposals per day
+MAX_POSITIONING_PROPOSALS_PER_CYCLE = 5         # Alias for broadcast function
 PHYSARUM_RECOMMENDATION_RATE_LIMIT = (10, 86400) # 10 recommendations per day
+MAX_PHYSARUM_RECOMMENDATIONS_PER_CYCLE = 10     # Alias for broadcast function
 VALID_PHYSARUM_ACTIONS = {"strengthen", "atrophy", "stimulate", "hold"}
 VALID_PRIORITY_TIERS = {"critical", "high", "medium", "low"}
 
 # Channel rationalization sharing constants (Phase 14.2)
 COVERAGE_ANALYSIS_BATCH_RATE_LIMIT = (2, 86400) # 2 batches per day
 MAX_COVERAGE_ENTRIES_IN_BATCH = 200             # Maximum coverage entries
+MIN_COVERAGE_OWNERSHIP_CONFIDENCE = 0.5         # Minimum confidence to share ownership
+MIN_OWNERSHIP_CONFIDENCE = MIN_COVERAGE_OWNERSHIP_CONFIDENCE  # Alias
 CLOSE_PROPOSAL_RATE_LIMIT = (5, 86400)          # 5 close proposals per day
-MIN_OWNERSHIP_CONFIDENCE = 0.5                  # Minimum confidence to share ownership
+MAX_CLOSE_PROPOSALS_PER_CYCLE = 5               # Alias for broadcast function
 
 # Route probe constants
 MAX_PATH_LENGTH = 20                        # Maximum hops in a path
