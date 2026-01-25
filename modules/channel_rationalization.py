@@ -885,3 +885,272 @@ class RationalizationManager:
                 "underperformer_marker_ratio": UNDERPERFORMER_MARKER_RATIO
             }
         }
+
+    # =========================================================================
+    # FLEET INTELLIGENCE SHARING (Phase 14.2)
+    # =========================================================================
+
+    def get_shareable_coverage_analysis(
+        self,
+        min_ownership_confidence: float = 0.5,
+        max_entries: int = 200
+    ) -> List[Dict[str, Any]]:
+        """
+        Get peer coverage analysis suitable for sharing with fleet.
+
+        Args:
+            min_ownership_confidence: Minimum confidence to share ownership
+            max_entries: Maximum number of entries
+
+        Returns:
+            List of coverage entry dicts ready for serialization
+        """
+        shareable = []
+
+        try:
+            all_coverage = self.analyzer.analyze_all_coverage()
+
+            for peer_id, coverage in all_coverage.items():
+                # Only share if we have meaningful ownership data
+                if coverage.ownership_confidence < min_ownership_confidence and not coverage.is_over_redundant:
+                    continue
+
+                shareable.append({
+                    "peer_id": peer_id,
+                    "peer_alias": coverage.peer_alias,
+                    "members_with_channels": coverage.members_with_channels,
+                    "member_marker_strength": {
+                        k: round(v, 3) for k, v in coverage.member_marker_strength.items()
+                    },
+                    "owner_member": coverage.owner_member,
+                    "ownership_confidence": round(coverage.ownership_confidence, 3),
+                    "redundancy_count": coverage.redundancy_count,
+                    "is_over_redundant": coverage.is_over_redundant
+                })
+
+        except Exception as e:
+            self._log(f"Error collecting shareable coverage: {e}", level="debug")
+
+        # Sort by redundancy (most redundant first - more important to coordinate)
+        shareable.sort(key=lambda x: (-x["redundancy_count"], -x["ownership_confidence"]))
+
+        return shareable[:max_entries]
+
+    def get_shareable_close_recommendations(
+        self,
+        max_recommendations: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        Get close recommendations suitable for sharing with fleet.
+
+        Args:
+            max_recommendations: Maximum number of recommendations
+
+        Returns:
+            List of close recommendation dicts
+        """
+        shareable = []
+
+        try:
+            recs = self.rationalizer.generate_close_recommendations()
+
+            for r in recs:
+                shareable.append({
+                    "member_id": r.member_id,
+                    "peer_id": r.peer_id,
+                    "channel_id": r.channel_id,
+                    "owner_id": r.owner_id,
+                    "reason": r.reason,
+                    "freed_capacity_sats": r.freed_capacity_sats,
+                    "member_marker_strength": round(r.member_marker_strength, 3),
+                    "owner_marker_strength": round(r.owner_marker_strength, 3)
+                })
+
+        except Exception as e:
+            self._log(f"Error collecting close recommendations: {e}", level="debug")
+
+        return shareable[:max_recommendations]
+
+    def receive_coverage_from_fleet(
+        self,
+        reporter_id: str,
+        coverage_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Receive a coverage analysis from another fleet member.
+
+        Args:
+            reporter_id: The fleet member who reported this
+            coverage_data: Dict with coverage details
+
+        Returns:
+            True if stored successfully
+        """
+        peer_id = coverage_data.get("peer_id")
+        if not peer_id:
+            return False
+
+        # Initialize remote coverage storage
+        if not hasattr(self, "_remote_coverage"):
+            self._remote_coverage: Dict[str, List[Dict[str, Any]]] = {}
+
+        entry = {
+            "reporter_id": reporter_id,
+            "members_with_channels": coverage_data.get("members_with_channels", []),
+            "owner_member": coverage_data.get("owner_member"),
+            "ownership_confidence": coverage_data.get("ownership_confidence", 0),
+            "redundancy_count": coverage_data.get("redundancy_count", 0),
+            "is_over_redundant": coverage_data.get("is_over_redundant", False),
+            "timestamp": time.time()
+        }
+
+        if peer_id not in self._remote_coverage:
+            self._remote_coverage[peer_id] = []
+
+        self._remote_coverage[peer_id].append(entry)
+
+        # Keep only last 5 reports per peer
+        if len(self._remote_coverage[peer_id]) > 5:
+            self._remote_coverage[peer_id] = self._remote_coverage[peer_id][-5:]
+
+        return True
+
+    def receive_close_proposal_from_fleet(
+        self,
+        reporter_id: str,
+        proposal_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Receive a close proposal from another fleet member.
+
+        Args:
+            reporter_id: The fleet member who proposed this
+            proposal_data: Dict with proposal details
+
+        Returns:
+            True if stored successfully
+        """
+        member_id = proposal_data.get("member_id")
+        peer_id = proposal_data.get("peer_id")
+        channel_id = proposal_data.get("channel_id")
+        if not member_id or not peer_id or not channel_id:
+            return False
+
+        # Initialize remote proposals storage
+        if not hasattr(self, "_remote_close_proposals"):
+            self._remote_close_proposals: List[Dict[str, Any]] = []
+
+        entry = {
+            "reporter_id": reporter_id,
+            "member_id": member_id,
+            "peer_id": peer_id,
+            "channel_id": channel_id,
+            "owner_id": proposal_data.get("owner_id"),
+            "reason": proposal_data.get("reason", ""),
+            "freed_capacity_sats": proposal_data.get("freed_capacity_sats", 0),
+            "timestamp": time.time()
+        }
+
+        self._remote_close_proposals.append(entry)
+
+        # Keep only last 50 proposals
+        if len(self._remote_close_proposals) > 50:
+            self._remote_close_proposals = self._remote_close_proposals[-50:]
+
+        return True
+
+    def get_fleet_coverage_consensus(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get consensus coverage analysis from fleet reports.
+
+        Args:
+            peer_id: Peer to get consensus for
+
+        Returns:
+            Consensus coverage data or None
+        """
+        if not hasattr(self, "_remote_coverage"):
+            return None
+
+        reports = self._remote_coverage.get(peer_id, [])
+        if not reports:
+            return None
+
+        now = time.time()
+        recent = [r for r in reports if now - r.get("timestamp", 0) < 7 * 86400]
+        if not recent:
+            return None
+
+        # Find consensus owner (most commonly reported)
+        owner_counts: Dict[str, int] = {}
+        for r in recent:
+            owner = r.get("owner_member")
+            if owner:
+                owner_counts[owner] = owner_counts.get(owner, 0) + 1
+
+        consensus_owner = max(owner_counts, key=owner_counts.get) if owner_counts else None
+
+        # Average confidence
+        avg_confidence = sum(r.get("ownership_confidence", 0) for r in recent) / len(recent)
+
+        # Check for over-redundancy consensus
+        over_redundant_count = sum(1 for r in recent if r.get("is_over_redundant"))
+
+        return {
+            "peer_id": peer_id,
+            "consensus_owner": consensus_owner,
+            "avg_ownership_confidence": round(avg_confidence, 3),
+            "is_over_redundant": over_redundant_count > len(recent) // 2,
+            "reporter_count": len(recent)
+        }
+
+    def get_pending_close_proposals_for_us(self) -> List[Dict[str, Any]]:
+        """
+        Get close proposals that target us (our node).
+
+        Returns:
+            List of close proposals where we are the recommended member to close
+        """
+        if not hasattr(self, "_remote_close_proposals"):
+            return []
+
+        our_proposals = []
+        now = time.time()
+
+        for p in self._remote_close_proposals:
+            # Only recent proposals
+            if now - p.get("timestamp", 0) > 7 * 86400:
+                continue
+            # Only proposals for us
+            if p.get("member_id") == self.our_pubkey:
+                our_proposals.append(p)
+
+        return our_proposals
+
+    def cleanup_old_remote_data(self, max_age_days: float = 7) -> int:
+        """Remove old remote rationalization data."""
+        cutoff = time.time() - (max_age_days * 86400)
+        cleaned = 0
+
+        # Cleanup coverage
+        if hasattr(self, "_remote_coverage"):
+            for peer_id in list(self._remote_coverage.keys()):
+                before = len(self._remote_coverage[peer_id])
+                self._remote_coverage[peer_id] = [
+                    r for r in self._remote_coverage[peer_id]
+                    if r.get("timestamp", 0) > cutoff
+                ]
+                cleaned += before - len(self._remote_coverage[peer_id])
+                if not self._remote_coverage[peer_id]:
+                    del self._remote_coverage[peer_id]
+
+        # Cleanup close proposals
+        if hasattr(self, "_remote_close_proposals"):
+            before = len(self._remote_close_proposals)
+            self._remote_close_proposals = [
+                p for p in self._remote_close_proposals
+                if p.get("timestamp", 0) > cutoff
+            ]
+            cleaned += before - len(self._remote_close_proposals)
+
+        return cleaned

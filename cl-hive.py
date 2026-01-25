@@ -1614,6 +1614,17 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_circular_flow_alert(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.TEMPORAL_PATTERN_BATCH:
             return handle_temporal_pattern_batch(peer_id, msg_payload, plugin)
+        # Phase 14.2: Strategic Positioning & Rationalization
+        elif msg_type == HiveMessageType.CORRIDOR_VALUE_BATCH:
+            return handle_corridor_value_batch(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.POSITIONING_PROPOSAL:
+            return handle_positioning_proposal(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.PHYSARUM_RECOMMENDATION:
+            return handle_physarum_recommendation(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.COVERAGE_ANALYSIS_BATCH:
+            return handle_coverage_analysis_batch(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.CLOSE_PROPOSAL:
+            return handle_close_proposal(peer_id, msg_payload, plugin)
         # Phase 9: Settlement
         elif msg_type == HiveMessageType.SETTLEMENT_OFFER:
             return handle_settlement_offer(peer_id, msg_payload, plugin)
@@ -5264,6 +5275,322 @@ def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -
     return {"result": "continue"}
 
 
+# ============================================================================
+# Phase 14.2: Strategic Positioning & Rationalization Handlers
+# ============================================================================
+
+
+def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle CORRIDOR_VALUE_BATCH message from a hive member.
+
+    This enables fleet-wide sharing of high-value routing corridor discoveries
+    for coordinated strategic positioning.
+    """
+    if not strategic_positioning_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_corridor_value_batch, get_corridor_value_batch_signing_payload
+    if not validate_corridor_value_batch(payload):
+        plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_corridor_value_batch_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Process each corridor entry
+    corridors = payload.get("corridors", [])
+    corridors_stored = 0
+
+    for corridor_data in corridors:
+        try:
+            result = strategic_positioning_mgr.receive_corridor_from_fleet(
+                reporter_id=peer_id,
+                corridor_data=corridor_data
+            )
+            if result:
+                corridors_stored += 1
+        except Exception as e:
+            plugin.log(f"cl-hive: Error processing corridor value: {e}", level='debug')
+            continue
+
+    if corridors_stored > 0:
+        plugin.log(
+            f"cl-hive: Stored {corridors_stored} corridor values from {peer_id[:16]}...",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle POSITIONING_PROPOSAL message from a hive member.
+
+    This enables fleet-wide coordination of strategic channel open recommendations.
+    """
+    if not strategic_positioning_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: POSITIONING_PROPOSAL from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_positioning_proposal, get_positioning_proposal_signing_payload
+    if not validate_positioning_proposal(payload):
+        plugin.log(f"cl-hive: POSITIONING_PROPOSAL validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: POSITIONING_PROPOSAL reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_positioning_proposal_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: POSITIONING_PROPOSAL signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: POSITIONING_PROPOSAL pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: POSITIONING_PROPOSAL signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Store the positioning proposal
+    try:
+        result = strategic_positioning_mgr.receive_positioning_proposal_from_fleet(
+            reporter_id=peer_id,
+            proposal_data=payload
+        )
+        if result:
+            target = payload.get("target_pubkey", "")[:16]
+            plugin.log(
+                f"cl-hive: Stored positioning proposal from {peer_id[:16]}... targeting {target}...",
+                level='debug'
+            )
+    except Exception as e:
+        plugin.log(f"cl-hive: Error storing positioning proposal: {e}", level='debug')
+
+    return {"result": "continue"}
+
+
+def handle_physarum_recommendation(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle PHYSARUM_RECOMMENDATION message from a hive member.
+
+    This enables fleet-wide sharing of flow-based channel lifecycle recommendations
+    (strengthen/atrophy/stimulate actions based on slime mold optimization).
+    """
+    if not strategic_positioning_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_physarum_recommendation, get_physarum_recommendation_signing_payload
+    if not validate_physarum_recommendation(payload):
+        plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_physarum_recommendation_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Store the Physarum recommendation
+    try:
+        result = strategic_positioning_mgr.receive_physarum_recommendation_from_fleet(
+            reporter_id=peer_id,
+            recommendation_data=payload
+        )
+        if result:
+            action = payload.get("action", "unknown")
+            peer_short = payload.get("peer_id", "")[:16]
+            plugin.log(
+                f"cl-hive: Stored Physarum {action} recommendation from {peer_id[:16]}... for peer {peer_short}...",
+                level='debug'
+            )
+    except Exception as e:
+        plugin.log(f"cl-hive: Error storing Physarum recommendation: {e}", level='debug')
+
+    return {"result": "continue"}
+
+
+def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle COVERAGE_ANALYSIS_BATCH message from a hive member.
+
+    This enables fleet-wide sharing of peer coverage analysis for
+    rationalization decisions (identifying redundant channels).
+    """
+    if not rationalization_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_coverage_analysis_batch, get_coverage_analysis_batch_signing_payload
+    if not validate_coverage_analysis_batch(payload):
+        plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_coverage_analysis_batch_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Process each coverage entry
+    coverage_entries = payload.get("coverage_entries", [])
+    entries_stored = 0
+
+    for coverage_data in coverage_entries:
+        try:
+            result = rationalization_mgr.receive_coverage_from_fleet(
+                reporter_id=peer_id,
+                coverage_data=coverage_data
+            )
+            if result:
+                entries_stored += 1
+        except Exception as e:
+            plugin.log(f"cl-hive: Error processing coverage entry: {e}", level='debug')
+            continue
+
+    if entries_stored > 0:
+        plugin.log(
+            f"cl-hive: Stored {entries_stored} coverage entries from {peer_id[:16]}...",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_close_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle CLOSE_PROPOSAL message from a hive member.
+
+    This enables fleet-wide coordination of channel close recommendations
+    for redundancy elimination and capital efficiency.
+    """
+    if not rationalization_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: CLOSE_PROPOSAL from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_close_proposal, get_close_proposal_signing_payload
+    if not validate_close_proposal(payload):
+        plugin.log(f"cl-hive: CLOSE_PROPOSAL validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: CLOSE_PROPOSAL reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_close_proposal_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: CLOSE_PROPOSAL signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: CLOSE_PROPOSAL pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: CLOSE_PROPOSAL signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Store the close proposal
+    try:
+        result = rationalization_mgr.receive_close_proposal_from_fleet(
+            reporter_id=peer_id,
+            proposal_data=payload
+        )
+        if result:
+            target_member = payload.get("target_member", "")[:16]
+            target_peer = payload.get("target_peer", "")[:16]
+            plugin.log(
+                f"cl-hive: Stored close proposal from {peer_id[:16]}... "
+                f"for {target_member}... channel to {target_peer}...",
+                level='debug'
+            )
+    except Exception as e:
+        plugin.log(f"cl-hive: Error storing close proposal: {e}", level='debug')
+
+    return {"result": "continue"}
+
+
 def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle SETTLEMENT_OFFER message from a hive member.
@@ -6254,6 +6581,48 @@ def fee_intelligence_loop():
             # Step 5d: Broadcast circular flow alerts (Phase 14 - Event-driven)
             _broadcast_circular_flow_alerts()
 
+            # Step 5e: Broadcast temporal patterns (Phase 14 - Weekly)
+            try:
+                from datetime import datetime
+                current_week = datetime.utcnow().strftime("%Y-W%W")
+                last_temporal_broadcast = getattr(_broadcast_our_temporal_patterns, '_last_broadcast', None)
+                if last_temporal_broadcast != current_week:
+                    _broadcast_our_temporal_patterns()
+                    _broadcast_our_temporal_patterns._last_broadcast = current_week
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Temporal patterns broadcast check error: {e}", level='debug')
+
+            # Step 5f: Broadcast corridor values (Phase 14.2 - Weekly)
+            try:
+                from datetime import datetime
+                current_week = datetime.utcnow().strftime("%Y-W%W")
+                last_corridor_broadcast = getattr(_broadcast_our_corridor_values, '_last_broadcast', None)
+                if last_corridor_broadcast != current_week:
+                    _broadcast_our_corridor_values()
+                    _broadcast_our_corridor_values._last_broadcast = current_week
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Corridor values broadcast check error: {e}", level='debug')
+
+            # Step 5g: Broadcast positioning proposals (Phase 14.2 - Event-driven)
+            _broadcast_our_positioning_proposals()
+
+            # Step 5h: Broadcast Physarum recommendations (Phase 14.2 - Event-driven)
+            _broadcast_our_physarum_recommendations()
+
+            # Step 5i: Broadcast coverage analysis (Phase 14.2 - Weekly)
+            try:
+                from datetime import datetime
+                current_week = datetime.utcnow().strftime("%Y-W%W")
+                last_coverage_broadcast = getattr(_broadcast_our_coverage_analysis, '_last_broadcast', None)
+                if last_coverage_broadcast != current_week:
+                    _broadcast_our_coverage_analysis()
+                    _broadcast_our_coverage_analysis._last_broadcast = current_week
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Coverage analysis broadcast check error: {e}", level='debug')
+
+            # Step 5j: Broadcast close proposals (Phase 14.2 - Event-driven)
+            _broadcast_our_close_proposals()
+
             # Step 6: Cleanup old liquidity needs
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
@@ -6318,6 +6687,54 @@ def fee_intelligence_loop():
                         )
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Remote pheromone cleanup error: {e}", level='warn')
+
+            # Step 11: Cleanup old remote yield metrics (Phase 14)
+            try:
+                if yield_metrics_mgr:
+                    cleaned_yields = yield_metrics_mgr.cleanup_old_remote_yield_metrics(max_age_days=30)
+                    if cleaned_yields > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_yields} old remote yield metrics",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Remote yield metrics cleanup error: {e}", level='warn')
+
+            # Step 12: Cleanup old remote temporal patterns (Phase 14)
+            try:
+                if anticipatory_liquidity_mgr:
+                    cleaned_patterns = anticipatory_liquidity_mgr.cleanup_old_remote_patterns(max_age_days=14)
+                    if cleaned_patterns > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_patterns} old remote temporal patterns",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Remote temporal patterns cleanup error: {e}", level='warn')
+
+            # Step 13: Cleanup old remote strategic positioning data (Phase 14.2)
+            try:
+                if strategic_positioning_mgr:
+                    cleaned_positioning = strategic_positioning_mgr.cleanup_old_remote_data(max_age_days=7)
+                    if cleaned_positioning > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_positioning} old remote positioning data",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Remote positioning cleanup error: {e}", level='warn')
+
+            # Step 14: Cleanup old remote rationalization data (Phase 14.2)
+            try:
+                if rationalization_mgr:
+                    cleaned_rationalization = rationalization_mgr.cleanup_old_remote_data(max_age_days=7)
+                    if cleaned_rationalization > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_rationalization} old remote rationalization data",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Remote rationalization cleanup error: {e}", level='warn')
 
         except Exception as e:
             if safe_plugin:
@@ -7254,6 +7671,418 @@ def _broadcast_circular_flow_alerts():
     except Exception as e:
         if safe_plugin:
             safe_plugin.log(f"cl-hive: Circular flow alert broadcast error: {e}", level='warn')
+
+
+def _broadcast_our_temporal_patterns():
+    """
+    Broadcast our temporal patterns to hive members for fleet-wide learning.
+
+    Temporal patterns include hour/day flow patterns that enable coordinated
+    liquidity positioning and proactive fee optimization.
+    """
+    if not anticipatory_liquidity_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import (
+            create_temporal_pattern_batch,
+            MAX_TEMPORAL_PATTERNS_IN_BATCH,
+            MIN_TEMPORAL_PATTERN_CONFIDENCE,
+            MIN_TEMPORAL_PATTERN_SAMPLES
+        )
+
+        # Get hive member IDs to exclude from sharing
+        members = database.get_all_members()
+        member_ids = {m.get("peer_id") for m in members}
+
+        # Get shareable temporal patterns (excluding hive members)
+        shareable_patterns = anticipatory_liquidity_mgr.get_shareable_patterns(
+            min_confidence=MIN_TEMPORAL_PATTERN_CONFIDENCE,
+            min_samples=MIN_TEMPORAL_PATTERN_SAMPLES,
+            exclude_peer_ids=member_ids,
+            max_patterns=MAX_TEMPORAL_PATTERNS_IN_BATCH
+        )
+
+        if not shareable_patterns:
+            return
+
+        # Create signed batch message
+        msg = create_temporal_pattern_batch(
+            patterns=shareable_patterns,
+            rpc=safe_plugin.rpc,
+            our_pubkey=our_pubkey
+        )
+
+        if not msg:
+            return
+
+        # Broadcast to all hive members
+        broadcast_count = 0
+
+        for member in members:
+            member_id = member.get("peer_id")
+            if not member_id or member_id == our_pubkey:
+                continue
+
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": member_id,
+                    "msg": msg.hex()
+                })
+                broadcast_count += 1
+            except Exception:
+                pass  # Peer might be offline
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_patterns)} temporal patterns "
+                f"to {broadcast_count} members",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Temporal patterns broadcast error: {e}", level='warn')
+
+
+# ============================================================================
+# Phase 14.2: Strategic Positioning & Rationalization Broadcasts
+# ============================================================================
+
+
+def _broadcast_our_corridor_values():
+    """
+    Broadcast our high-value corridor discoveries to hive members.
+
+    Corridors are routing paths with high volume, margin, and low competition.
+    Sharing enables coordinated strategic positioning across the fleet.
+    """
+    if not strategic_positioning_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import (
+            create_corridor_value_batch,
+            MAX_CORRIDORS_IN_BATCH,
+            MIN_CORRIDOR_VALUE_SCORE
+        )
+
+        # Get shareable corridor values
+        shareable_corridors = strategic_positioning_mgr.get_shareable_corridors(
+            min_value_score=MIN_CORRIDOR_VALUE_SCORE,
+            max_corridors=MAX_CORRIDORS_IN_BATCH
+        )
+
+        if not shareable_corridors:
+            return
+
+        # Create signed batch message
+        msg = create_corridor_value_batch(
+            corridors=shareable_corridors,
+            rpc=safe_plugin.rpc,
+            our_pubkey=our_pubkey
+        )
+
+        if not msg:
+            return
+
+        # Broadcast to all hive members
+        members = database.get_all_members()
+        broadcast_count = 0
+
+        for member in members:
+            member_id = member.get("peer_id")
+            if not member_id or member_id == our_pubkey:
+                continue
+
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": member_id,
+                    "msg": msg.hex()
+                })
+                broadcast_count += 1
+            except Exception:
+                pass
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_corridors)} corridor values "
+                f"to {broadcast_count} members",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Corridor values broadcast error: {e}", level='warn')
+
+
+def _broadcast_our_positioning_proposals():
+    """
+    Broadcast our channel open recommendations to hive members.
+
+    Positioning proposals suggest strategic channel targets for optimal
+    fleet placement based on exchange coverage and corridor value analysis.
+    """
+    if not strategic_positioning_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import create_positioning_proposal, MAX_POSITIONING_PROPOSALS_PER_CYCLE
+
+        # Get shareable positioning recommendations
+        shareable_proposals = strategic_positioning_mgr.get_shareable_positioning_recommendations(
+            max_recommendations=MAX_POSITIONING_PROPOSALS_PER_CYCLE
+        )
+
+        if not shareable_proposals:
+            return
+
+        members = database.get_all_members()
+        total_broadcast = 0
+
+        # Broadcast each proposal separately (they're targeted recommendations)
+        for proposal in shareable_proposals:
+            msg = create_positioning_proposal(
+                target_pubkey=proposal["target_pubkey"],
+                target_alias=proposal.get("target_alias", ""),
+                reason=proposal["reason"],
+                score=proposal["score"],
+                suggested_amount_sats=proposal.get("suggested_amount_sats", 0),
+                priority=proposal.get("priority", "medium"),
+                rpc=safe_plugin.rpc,
+                our_pubkey=our_pubkey
+            )
+
+            if not msg:
+                continue
+
+            for member in members:
+                member_id = member.get("peer_id")
+                if not member_id or member_id == our_pubkey:
+                    continue
+
+                try:
+                    safe_plugin.rpc.call("sendcustommsg", {
+                        "node_id": member_id,
+                        "msg": msg.hex()
+                    })
+                    total_broadcast += 1
+                except Exception:
+                    pass
+
+        if total_broadcast > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_proposals)} positioning proposals",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Positioning proposals broadcast error: {e}", level='warn')
+
+
+def _broadcast_our_physarum_recommendations():
+    """
+    Broadcast our Physarum (flow-based) channel lifecycle recommendations.
+
+    Physarum recommendations use slime mold optimization principles:
+    - strengthen: High flow channels that should be spliced larger
+    - atrophy: Low flow channels that should be closed
+    - stimulate: Young low flow channels that need fee reduction
+    """
+    if not strategic_positioning_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import create_physarum_recommendation, MAX_PHYSARUM_RECOMMENDATIONS_PER_CYCLE
+
+        # Get shareable Physarum recommendations (exclude 'hold')
+        shareable_recommendations = strategic_positioning_mgr.get_shareable_physarum_recommendations(
+            exclude_hold=True
+        )
+
+        if not shareable_recommendations:
+            return
+
+        # Limit to max per cycle
+        shareable_recommendations = shareable_recommendations[:MAX_PHYSARUM_RECOMMENDATIONS_PER_CYCLE]
+
+        members = database.get_all_members()
+        total_broadcast = 0
+
+        # Broadcast each recommendation separately
+        for rec in shareable_recommendations:
+            msg = create_physarum_recommendation(
+                peer_id=rec["peer_id"],
+                channel_scid=rec.get("channel_scid", ""),
+                action=rec["action"],
+                flow_intensity=rec["flow_intensity"],
+                channel_age_days=rec.get("channel_age_days", 0),
+                reason=rec["reason"],
+                suggested_amount_sats=rec.get("suggested_amount_sats"),
+                rpc=safe_plugin.rpc,
+                our_pubkey=our_pubkey
+            )
+
+            if not msg:
+                continue
+
+            for member in members:
+                member_id = member.get("peer_id")
+                if not member_id or member_id == our_pubkey:
+                    continue
+
+                try:
+                    safe_plugin.rpc.call("sendcustommsg", {
+                        "node_id": member_id,
+                        "msg": msg.hex()
+                    })
+                    total_broadcast += 1
+                except Exception:
+                    pass
+
+        if total_broadcast > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_recommendations)} Physarum recommendations",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Physarum recommendations broadcast error: {e}", level='warn')
+
+
+def _broadcast_our_coverage_analysis():
+    """
+    Broadcast our peer coverage analysis to hive members.
+
+    Coverage analysis shows which peers the fleet has channels to,
+    ownership determination based on routing activity (stigmergic markers),
+    and identifies redundant coverage for rationalization.
+    """
+    if not rationalization_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import (
+            create_coverage_analysis_batch,
+            MAX_COVERAGE_ENTRIES_IN_BATCH,
+            MIN_COVERAGE_OWNERSHIP_CONFIDENCE
+        )
+
+        # Get shareable coverage analysis
+        shareable_coverage = rationalization_mgr.get_shareable_coverage_analysis(
+            min_ownership_confidence=MIN_COVERAGE_OWNERSHIP_CONFIDENCE,
+            max_entries=MAX_COVERAGE_ENTRIES_IN_BATCH
+        )
+
+        if not shareable_coverage:
+            return
+
+        # Create signed batch message
+        msg = create_coverage_analysis_batch(
+            coverage_entries=shareable_coverage,
+            rpc=safe_plugin.rpc,
+            our_pubkey=our_pubkey
+        )
+
+        if not msg:
+            return
+
+        # Broadcast to all hive members
+        members = database.get_all_members()
+        broadcast_count = 0
+
+        for member in members:
+            member_id = member.get("peer_id")
+            if not member_id or member_id == our_pubkey:
+                continue
+
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": member_id,
+                    "msg": msg.hex()
+                })
+                broadcast_count += 1
+            except Exception:
+                pass
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_coverage)} coverage entries "
+                f"to {broadcast_count} members",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Coverage analysis broadcast error: {e}", level='warn')
+
+
+def _broadcast_our_close_proposals():
+    """
+    Broadcast our channel close recommendations to hive members.
+
+    Close proposals suggest redundant channels that should be closed
+    based on coverage analysis and ownership determination. The channel
+    owner with less routing activity should close to improve capital efficiency.
+    """
+    if not rationalization_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import create_close_proposal, MAX_CLOSE_PROPOSALS_PER_CYCLE
+
+        # Get shareable close recommendations
+        shareable_proposals = rationalization_mgr.get_shareable_close_recommendations(
+            max_recommendations=MAX_CLOSE_PROPOSALS_PER_CYCLE
+        )
+
+        if not shareable_proposals:
+            return
+
+        members = database.get_all_members()
+        total_broadcast = 0
+
+        # Broadcast each proposal separately (targeted to specific member)
+        for proposal in shareable_proposals:
+            msg = create_close_proposal(
+                target_member=proposal["target_member"],
+                target_peer=proposal["target_peer"],
+                reason=proposal["reason"],
+                our_routing_share=proposal["our_routing_share"],
+                their_routing_share=proposal["their_routing_share"],
+                suggested_action=proposal.get("suggested_action", "close"),
+                rpc=safe_plugin.rpc,
+                our_pubkey=our_pubkey
+            )
+
+            if not msg:
+                continue
+
+            for member in members:
+                member_id = member.get("peer_id")
+                if not member_id or member_id == our_pubkey:
+                    continue
+
+                try:
+                    safe_plugin.rpc.call("sendcustommsg", {
+                        "node_id": member_id,
+                        "msg": msg.hex()
+                    })
+                    total_broadcast += 1
+                except Exception:
+                    pass
+
+        if total_broadcast > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_proposals)} close proposals",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Close proposals broadcast error: {e}", level='warn')
 
 
 def _broadcast_health_report():

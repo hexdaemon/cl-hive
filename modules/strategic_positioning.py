@@ -1729,3 +1729,315 @@ class StrategicPositioningManager:
             },
             "priority_exchanges": list(PRIORITY_EXCHANGES.keys())
         }
+
+    # =========================================================================
+    # FLEET INTELLIGENCE SHARING (Phase 14.2)
+    # =========================================================================
+
+    def get_shareable_corridors(
+        self,
+        min_value_score: float = 0.05,
+        max_corridors: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Get valuable corridors suitable for sharing with fleet.
+
+        Args:
+            min_value_score: Minimum value score to share
+            max_corridors: Maximum number of corridors
+
+        Returns:
+            List of corridor dicts ready for serialization
+        """
+        shareable = []
+
+        try:
+            corridors = self.route_analyzer.find_valuable_corridors(min_score=min_value_score)
+
+            for c in corridors:
+                shareable.append({
+                    "source_peer_id": c.source_peer_id,
+                    "destination_peer_id": c.destination_peer_id,
+                    "source_alias": c.source_alias,
+                    "destination_alias": c.destination_alias,
+                    "daily_volume_sats": c.daily_volume_sats,
+                    "value_score": round(c.value_score, 4),
+                    "competition_level": c.competition_level,
+                    "competitor_count": c.competitor_count,
+                    "margin_estimate_ppm": c.margin_estimate_ppm,
+                    "fleet_coverage": c.fleet_coverage
+                })
+
+        except Exception as e:
+            self._log(f"Error collecting shareable corridors: {e}", level="debug")
+
+        return shareable[:max_corridors]
+
+    def get_shareable_positioning_recommendations(
+        self,
+        max_recommendations: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Get positioning recommendations suitable for sharing.
+
+        Args:
+            max_recommendations: Maximum number of recommendations
+
+        Returns:
+            List of positioning proposal dicts
+        """
+        shareable = []
+
+        try:
+            recs = self.positioning_strategy.get_positioning_recommendations(count=max_recommendations)
+
+            for r in recs:
+                shareable.append({
+                    "target_peer_id": r.target_peer_id,
+                    "recommended_member": r.recommended_member or "",
+                    "priority_tier": r.priority_tier,
+                    "target_capacity_sats": r.target_capacity_sats,
+                    "reason": r.reason,
+                    "value_score": round(r.value_score, 4),
+                    "is_exchange": r.is_exchange,
+                    "is_underserved": r.is_underserved
+                })
+
+        except Exception as e:
+            self._log(f"Error collecting positioning recommendations: {e}", level="debug")
+
+        return shareable
+
+    def get_shareable_physarum_recommendations(
+        self,
+        exclude_hold: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Get Physarum flow recommendations suitable for sharing.
+
+        Args:
+            exclude_hold: Whether to exclude "hold" recommendations
+
+        Returns:
+            List of Physarum recommendation dicts
+        """
+        shareable = []
+
+        try:
+            recs = self.physarum_mgr.get_all_recommendations()
+
+            for r in recs:
+                if exclude_hold and r.action == "hold":
+                    continue
+
+                shareable.append({
+                    "channel_id": r.channel_id,
+                    "peer_id": r.peer_id,
+                    "action": r.action,
+                    "flow_intensity": round(r.flow_intensity, 4),
+                    "reason": r.reason,
+                    "expected_yield_change_pct": round(r.expected_yield_change_pct, 2),
+                    "splice_amount_sats": r.splice_amount_sats,
+                    "capital_to_redeploy_sats": r.capital_to_redeploy_sats
+                })
+
+        except Exception as e:
+            self._log(f"Error collecting Physarum recommendations: {e}", level="debug")
+
+        return shareable
+
+    def receive_corridor_from_fleet(
+        self,
+        reporter_id: str,
+        corridor_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Receive a corridor value report from another fleet member.
+
+        Args:
+            reporter_id: The fleet member who reported this
+            corridor_data: Dict with corridor details
+
+        Returns:
+            True if stored successfully
+        """
+        source = corridor_data.get("source_peer_id")
+        dest = corridor_data.get("destination_peer_id")
+        if not source or not dest:
+            return False
+
+        # Initialize remote corridors storage
+        if not hasattr(self, "_remote_corridors"):
+            self._remote_corridors: Dict[str, List[Dict[str, Any]]] = {}
+
+        key = f"{source}:{dest}"
+        entry = {
+            "reporter_id": reporter_id,
+            "daily_volume_sats": corridor_data.get("daily_volume_sats", 0),
+            "value_score": corridor_data.get("value_score", 0),
+            "competition_level": corridor_data.get("competition_level", "unknown"),
+            "timestamp": time.time()
+        }
+
+        if key not in self._remote_corridors:
+            self._remote_corridors[key] = []
+
+        self._remote_corridors[key].append(entry)
+
+        # Keep only last 5 reports per corridor
+        if len(self._remote_corridors[key]) > 5:
+            self._remote_corridors[key] = self._remote_corridors[key][-5:]
+
+        return True
+
+    def receive_positioning_proposal_from_fleet(
+        self,
+        reporter_id: str,
+        proposal_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Receive a positioning proposal from another fleet member.
+
+        Args:
+            reporter_id: The fleet member who proposed this
+            proposal_data: Dict with proposal details
+
+        Returns:
+            True if stored successfully
+        """
+        target = proposal_data.get("target_peer_id")
+        if not target:
+            return False
+
+        # Initialize remote proposals storage
+        if not hasattr(self, "_remote_proposals"):
+            self._remote_proposals: List[Dict[str, Any]] = []
+
+        entry = {
+            "reporter_id": reporter_id,
+            "target_peer_id": target,
+            "recommended_member": proposal_data.get("recommended_member", ""),
+            "priority_tier": proposal_data.get("priority_tier", "low"),
+            "target_capacity_sats": proposal_data.get("target_capacity_sats", 0),
+            "reason": proposal_data.get("reason", ""),
+            "value_score": proposal_data.get("value_score", 0),
+            "timestamp": time.time()
+        }
+
+        self._remote_proposals.append(entry)
+
+        # Keep only last 50 proposals
+        if len(self._remote_proposals) > 50:
+            self._remote_proposals = self._remote_proposals[-50:]
+
+        return True
+
+    def receive_physarum_recommendation_from_fleet(
+        self,
+        reporter_id: str,
+        recommendation_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Receive a Physarum recommendation from another fleet member.
+
+        Args:
+            reporter_id: The fleet member who recommended this
+            recommendation_data: Dict with recommendation details
+
+        Returns:
+            True if stored successfully
+        """
+        channel_id = recommendation_data.get("channel_id")
+        peer_id = recommendation_data.get("peer_id")
+        if not channel_id or not peer_id:
+            return False
+
+        # Initialize remote recommendations storage
+        if not hasattr(self, "_remote_physarum"):
+            self._remote_physarum: Dict[str, List[Dict[str, Any]]] = {}
+
+        entry = {
+            "reporter_id": reporter_id,
+            "action": recommendation_data.get("action", "hold"),
+            "flow_intensity": recommendation_data.get("flow_intensity", 0),
+            "reason": recommendation_data.get("reason", ""),
+            "expected_yield_change_pct": recommendation_data.get("expected_yield_change_pct", 0),
+            "timestamp": time.time()
+        }
+
+        if peer_id not in self._remote_physarum:
+            self._remote_physarum[peer_id] = []
+
+        self._remote_physarum[peer_id].append(entry)
+
+        # Keep only last 10 recommendations per peer
+        if len(self._remote_physarum[peer_id]) > 10:
+            self._remote_physarum[peer_id] = self._remote_physarum[peer_id][-10:]
+
+        return True
+
+    def get_fleet_corridor_consensus(self, source: str, dest: str) -> Optional[Dict[str, Any]]:
+        """Get consensus corridor value from fleet reports."""
+        if not hasattr(self, "_remote_corridors"):
+            return None
+
+        key = f"{source}:{dest}"
+        reports = self._remote_corridors.get(key, [])
+        if not reports:
+            return None
+
+        now = time.time()
+        recent = [r for r in reports if now - r.get("timestamp", 0) < 7 * 86400]
+        if not recent:
+            return None
+
+        avg_volume = sum(r.get("daily_volume_sats", 0) for r in recent) / len(recent)
+        avg_score = sum(r.get("value_score", 0) for r in recent) / len(recent)
+
+        return {
+            "source": source,
+            "destination": dest,
+            "avg_daily_volume_sats": int(avg_volume),
+            "avg_value_score": round(avg_score, 4),
+            "reporter_count": len(recent)
+        }
+
+    def cleanup_old_remote_data(self, max_age_days: float = 7) -> int:
+        """Remove old remote positioning data."""
+        cutoff = time.time() - (max_age_days * 86400)
+        cleaned = 0
+
+        # Cleanup corridors
+        if hasattr(self, "_remote_corridors"):
+            for key in list(self._remote_corridors.keys()):
+                before = len(self._remote_corridors[key])
+                self._remote_corridors[key] = [
+                    r for r in self._remote_corridors[key]
+                    if r.get("timestamp", 0) > cutoff
+                ]
+                cleaned += before - len(self._remote_corridors[key])
+                if not self._remote_corridors[key]:
+                    del self._remote_corridors[key]
+
+        # Cleanup proposals
+        if hasattr(self, "_remote_proposals"):
+            before = len(self._remote_proposals)
+            self._remote_proposals = [
+                p for p in self._remote_proposals
+                if p.get("timestamp", 0) > cutoff
+            ]
+            cleaned += before - len(self._remote_proposals)
+
+        # Cleanup physarum
+        if hasattr(self, "_remote_physarum"):
+            for peer_id in list(self._remote_physarum.keys()):
+                before = len(self._remote_physarum[peer_id])
+                self._remote_physarum[peer_id] = [
+                    r for r in self._remote_physarum[peer_id]
+                    if r.get("timestamp", 0) > cutoff
+                ]
+                cleaned += before - len(self._remote_physarum[peer_id])
+                if not self._remote_physarum[peer_id]:
+                    del self._remote_physarum[peer_id]
+
+        return cleaned

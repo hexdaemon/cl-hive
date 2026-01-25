@@ -132,6 +132,13 @@ class HiveMessageType(IntEnum):
     CIRCULAR_FLOW_ALERT = 32859    # Detected wasteful circular rebalancing patterns
     TEMPORAL_PATTERN_BATCH = 32861 # Hour/day flow patterns and predictions
 
+    # Phase 14.2: Strategic Positioning & Rationalization
+    CORRIDOR_VALUE_BATCH = 32863   # High-value routing corridors discovered
+    POSITIONING_PROPOSAL = 32865   # Channel open recommendation for fleet coordination
+    PHYSARUM_RECOMMENDATION = 32867 # Flow-based channel lifecycle (strengthen/atrophy/stimulate)
+    COVERAGE_ANALYSIS_BATCH = 32869 # Peer coverage and ownership analysis
+    CLOSE_PROPOSAL = 32871         # Channel close recommendation for redundancy
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -377,6 +384,21 @@ TEMPORAL_PATTERN_BATCH_RATE_LIMIT = (4, 86400)  # 4 batches per day (every 6 hou
 MAX_PATTERNS_IN_BATCH = 500                     # Maximum patterns in one batch
 MIN_PATTERN_CONFIDENCE = 0.6                    # Minimum confidence to share
 MIN_PATTERN_SAMPLES = 10                        # Minimum samples for pattern validity
+
+# Strategic positioning sharing constants (Phase 14.2)
+CORRIDOR_VALUE_BATCH_RATE_LIMIT = (2, 86400)    # 2 batches per day (every 12 hours)
+MAX_CORRIDORS_IN_BATCH = 100                    # Maximum corridors in one batch
+MIN_CORRIDOR_VALUE_SCORE = 0.05                 # Minimum value score to share
+POSITIONING_PROPOSAL_RATE_LIMIT = (5, 86400)    # 5 proposals per day
+PHYSARUM_RECOMMENDATION_RATE_LIMIT = (10, 86400) # 10 recommendations per day
+VALID_PHYSARUM_ACTIONS = {"strengthen", "atrophy", "stimulate", "hold"}
+VALID_PRIORITY_TIERS = {"critical", "high", "medium", "low"}
+
+# Channel rationalization sharing constants (Phase 14.2)
+COVERAGE_ANALYSIS_BATCH_RATE_LIMIT = (2, 86400) # 2 batches per day
+MAX_COVERAGE_ENTRIES_IN_BATCH = 200             # Maximum coverage entries
+CLOSE_PROPOSAL_RATE_LIMIT = (5, 86400)          # 5 close proposals per day
+MIN_OWNERSHIP_CONFIDENCE = 0.5                  # Minimum confidence to share ownership
 
 # Route probe constants
 MAX_PATH_LENGTH = 20                        # Maximum hops in a path
@@ -4870,3 +4892,459 @@ def create_temporal_pattern_batch(
         return None
 
     return serialize(HiveMessageType.TEMPORAL_PATTERN_BATCH, payload)
+
+
+# =============================================================================
+# CORRIDOR VALUE BATCH FUNCTIONS (Phase 14.2)
+# =============================================================================
+
+def get_corridor_value_batch_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get the canonical string to sign for CORRIDOR_VALUE_BATCH messages."""
+    corridors = payload.get("corridors", [])
+    sorted_corridors = sorted(corridors, key=lambda c: (c.get("source_peer_id", ""), c.get("destination_peer_id", "")))
+    corridors_str = json.dumps(sorted_corridors, sort_keys=True, separators=(',', ':'))
+    corridors_hash = hashlib.sha256(corridors_str.encode()).hexdigest()[:16]
+
+    return (
+        f"CORRIDOR_VALUE_BATCH:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{len(corridors)}:"
+        f"{corridors_hash}"
+    )
+
+
+def validate_corridor_value_batch(payload: Dict[str, Any]) -> bool:
+    """Validate a CORRIDOR_VALUE_BATCH payload."""
+    reporter_id = payload.get("reporter_id")
+    if not reporter_id or not isinstance(reporter_id, str) or len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return False
+    now = time.time()
+    if timestamp > now + 300 or timestamp < now - (48 * 3600):
+        return False
+
+    signature = payload.get("signature")
+    if not signature or not isinstance(signature, str):
+        return False
+
+    corridors = payload.get("corridors")
+    if not isinstance(corridors, list) or len(corridors) > MAX_CORRIDORS_IN_BATCH:
+        return False
+
+    for c in corridors:
+        if not isinstance(c, dict):
+            return False
+        for field in ["source_peer_id", "destination_peer_id"]:
+            val = c.get(field)
+            if not val or not isinstance(val, str) or len(val) > MAX_PEER_ID_LEN:
+                return False
+        value_score = c.get("value_score")
+        if not isinstance(value_score, (int, float)) or value_score < 0 or value_score > 100:
+            return False
+        daily_volume = c.get("daily_volume_sats")
+        if not isinstance(daily_volume, int) or daily_volume < 0:
+            return False
+
+    return True
+
+
+def create_corridor_value_batch(
+    corridors: List[Dict[str, Any]],
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create a CORRIDOR_VALUE_BATCH message.
+
+    Shares discovered high-value routing corridors with the fleet.
+    """
+    timestamp = int(time.time())
+    payload = {
+        "reporter_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "corridors": corridors,
+    }
+
+    try:
+        signing_payload = get_corridor_value_batch_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.CORRIDOR_VALUE_BATCH, payload)
+
+
+# =============================================================================
+# POSITIONING PROPOSAL FUNCTIONS (Phase 14.2)
+# =============================================================================
+
+def get_positioning_proposal_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get the canonical string to sign for POSITIONING_PROPOSAL messages."""
+    return (
+        f"POSITIONING_PROPOSAL:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('target_peer_id', '')}:"
+        f"{payload.get('recommended_member', '')}:"
+        f"{payload.get('target_capacity_sats', 0)}"
+    )
+
+
+def validate_positioning_proposal(payload: Dict[str, Any]) -> bool:
+    """Validate a POSITIONING_PROPOSAL payload."""
+    reporter_id = payload.get("reporter_id")
+    if not reporter_id or not isinstance(reporter_id, str) or len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return False
+    now = time.time()
+    if timestamp > now + 300 or timestamp < now - (48 * 3600):
+        return False
+
+    signature = payload.get("signature")
+    if not signature or not isinstance(signature, str):
+        return False
+
+    target_peer_id = payload.get("target_peer_id")
+    if not target_peer_id or not isinstance(target_peer_id, str) or len(target_peer_id) > MAX_PEER_ID_LEN:
+        return False
+
+    recommended_member = payload.get("recommended_member")
+    if not recommended_member or not isinstance(recommended_member, str) or len(recommended_member) > MAX_PEER_ID_LEN:
+        return False
+
+    priority_tier = payload.get("priority_tier")
+    if priority_tier not in VALID_PRIORITY_TIERS:
+        return False
+
+    target_capacity = payload.get("target_capacity_sats")
+    if not isinstance(target_capacity, int) or target_capacity < 0 or target_capacity > 100_000_000_000:
+        return False
+
+    return True
+
+
+def create_positioning_proposal(
+    target_peer_id: str,
+    recommended_member: str,
+    priority_tier: str,
+    target_capacity_sats: int,
+    reason: str,
+    value_score: float,
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create a POSITIONING_PROPOSAL message.
+
+    Proposes which fleet member should open a channel to a target peer.
+    """
+    timestamp = int(time.time())
+    payload = {
+        "reporter_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "target_peer_id": target_peer_id,
+        "recommended_member": recommended_member,
+        "priority_tier": priority_tier,
+        "target_capacity_sats": target_capacity_sats,
+        "reason": reason[:500],
+        "value_score": round(value_score, 4),
+    }
+
+    try:
+        signing_payload = get_positioning_proposal_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.POSITIONING_PROPOSAL, payload)
+
+
+# =============================================================================
+# PHYSARUM RECOMMENDATION FUNCTIONS (Phase 14.2)
+# =============================================================================
+
+def get_physarum_recommendation_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get the canonical string to sign for PHYSARUM_RECOMMENDATION messages."""
+    return (
+        f"PHYSARUM_RECOMMENDATION:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('channel_id', '')}:"
+        f"{payload.get('action', '')}:"
+        f"{payload.get('flow_intensity', 0)}"
+    )
+
+
+def validate_physarum_recommendation(payload: Dict[str, Any]) -> bool:
+    """Validate a PHYSARUM_RECOMMENDATION payload."""
+    reporter_id = payload.get("reporter_id")
+    if not reporter_id or not isinstance(reporter_id, str) or len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return False
+    now = time.time()
+    if timestamp > now + 300 or timestamp < now - (48 * 3600):
+        return False
+
+    signature = payload.get("signature")
+    if not signature or not isinstance(signature, str):
+        return False
+
+    channel_id = payload.get("channel_id")
+    if not channel_id or not isinstance(channel_id, str) or len(channel_id) > 50:
+        return False
+
+    peer_id = payload.get("peer_id")
+    if not peer_id or not isinstance(peer_id, str) or len(peer_id) > MAX_PEER_ID_LEN:
+        return False
+
+    action = payload.get("action")
+    if action not in VALID_PHYSARUM_ACTIONS:
+        return False
+
+    flow_intensity = payload.get("flow_intensity")
+    if not isinstance(flow_intensity, (int, float)) or flow_intensity < 0 or flow_intensity > 1:
+        return False
+
+    return True
+
+
+def create_physarum_recommendation(
+    channel_id: str,
+    peer_id: str,
+    action: str,
+    flow_intensity: float,
+    reason: str,
+    expected_yield_change_pct: float,
+    rpc: Any,
+    our_pubkey: str,
+    splice_amount_sats: int = 0
+) -> Optional[bytes]:
+    """
+    Create a PHYSARUM_RECOMMENDATION message.
+
+    Shares flow-based channel lifecycle recommendations (strengthen/atrophy/stimulate).
+    """
+    timestamp = int(time.time())
+    payload = {
+        "reporter_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "channel_id": channel_id,
+        "peer_id": peer_id,
+        "action": action,
+        "flow_intensity": round(flow_intensity, 4),
+        "reason": reason[:500],
+        "expected_yield_change_pct": round(expected_yield_change_pct, 2),
+        "splice_amount_sats": splice_amount_sats,
+    }
+
+    try:
+        signing_payload = get_physarum_recommendation_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.PHYSARUM_RECOMMENDATION, payload)
+
+
+# =============================================================================
+# COVERAGE ANALYSIS BATCH FUNCTIONS (Phase 14.2)
+# =============================================================================
+
+def get_coverage_analysis_batch_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get the canonical string to sign for COVERAGE_ANALYSIS_BATCH messages."""
+    entries = payload.get("coverage_entries", [])
+    sorted_entries = sorted(entries, key=lambda e: e.get("peer_id", ""))
+    entries_str = json.dumps(sorted_entries, sort_keys=True, separators=(',', ':'))
+    entries_hash = hashlib.sha256(entries_str.encode()).hexdigest()[:16]
+
+    return (
+        f"COVERAGE_ANALYSIS_BATCH:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{len(entries)}:"
+        f"{entries_hash}"
+    )
+
+
+def validate_coverage_analysis_batch(payload: Dict[str, Any]) -> bool:
+    """Validate a COVERAGE_ANALYSIS_BATCH payload."""
+    reporter_id = payload.get("reporter_id")
+    if not reporter_id or not isinstance(reporter_id, str) or len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return False
+    now = time.time()
+    if timestamp > now + 300 or timestamp < now - (48 * 3600):
+        return False
+
+    signature = payload.get("signature")
+    if not signature or not isinstance(signature, str):
+        return False
+
+    entries = payload.get("coverage_entries")
+    if not isinstance(entries, list) or len(entries) > MAX_COVERAGE_ENTRIES_IN_BATCH:
+        return False
+
+    for e in entries:
+        if not isinstance(e, dict):
+            return False
+        peer_id = e.get("peer_id")
+        if not peer_id or not isinstance(peer_id, str) or len(peer_id) > MAX_PEER_ID_LEN:
+            return False
+        members = e.get("members_with_channels")
+        if not isinstance(members, list):
+            return False
+        owner_confidence = e.get("ownership_confidence")
+        if not isinstance(owner_confidence, (int, float)) or owner_confidence < 0 or owner_confidence > 1:
+            return False
+
+    return True
+
+
+def create_coverage_analysis_batch(
+    coverage_entries: List[Dict[str, Any]],
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create a COVERAGE_ANALYSIS_BATCH message.
+
+    Shares peer coverage analysis showing which members have channels to each peer.
+    """
+    timestamp = int(time.time())
+    payload = {
+        "reporter_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "coverage_entries": coverage_entries,
+    }
+
+    try:
+        signing_payload = get_coverage_analysis_batch_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.COVERAGE_ANALYSIS_BATCH, payload)
+
+
+# =============================================================================
+# CLOSE PROPOSAL FUNCTIONS (Phase 14.2)
+# =============================================================================
+
+def get_close_proposal_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get the canonical string to sign for CLOSE_PROPOSAL messages."""
+    return (
+        f"CLOSE_PROPOSAL:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('member_id', '')}:"
+        f"{payload.get('peer_id', '')}:"
+        f"{payload.get('channel_id', '')}"
+    )
+
+
+def validate_close_proposal(payload: Dict[str, Any]) -> bool:
+    """Validate a CLOSE_PROPOSAL payload."""
+    reporter_id = payload.get("reporter_id")
+    if not reporter_id or not isinstance(reporter_id, str) or len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return False
+    now = time.time()
+    if timestamp > now + 300 or timestamp < now - (48 * 3600):
+        return False
+
+    signature = payload.get("signature")
+    if not signature or not isinstance(signature, str):
+        return False
+
+    member_id = payload.get("member_id")
+    if not member_id or not isinstance(member_id, str) or len(member_id) > MAX_PEER_ID_LEN:
+        return False
+
+    peer_id = payload.get("peer_id")
+    if not peer_id or not isinstance(peer_id, str) or len(peer_id) > MAX_PEER_ID_LEN:
+        return False
+
+    channel_id = payload.get("channel_id")
+    if not channel_id or not isinstance(channel_id, str) or len(channel_id) > 50:
+        return False
+
+    owner_id = payload.get("owner_id")
+    if owner_id and (not isinstance(owner_id, str) or len(owner_id) > MAX_PEER_ID_LEN):
+        return False
+
+    freed_capacity = payload.get("freed_capacity_sats")
+    if not isinstance(freed_capacity, int) or freed_capacity < 0:
+        return False
+
+    return True
+
+
+def create_close_proposal(
+    member_id: str,
+    peer_id: str,
+    channel_id: str,
+    owner_id: str,
+    reason: str,
+    freed_capacity_sats: int,
+    member_marker_strength: float,
+    owner_marker_strength: float,
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create a CLOSE_PROPOSAL message.
+
+    Proposes that a fleet member close a redundant/underperforming channel.
+    """
+    timestamp = int(time.time())
+    payload = {
+        "reporter_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "member_id": member_id,
+        "peer_id": peer_id,
+        "channel_id": channel_id,
+        "owner_id": owner_id,
+        "reason": reason[:500],
+        "freed_capacity_sats": freed_capacity_sats,
+        "member_marker_strength": round(member_marker_strength, 3),
+        "owner_marker_strength": round(owner_marker_strength, 3),
+    }
+
+    try:
+        signing_payload = get_close_proposal_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.CLOSE_PROPOSAL, payload)
