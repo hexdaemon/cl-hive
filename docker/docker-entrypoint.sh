@@ -451,6 +451,14 @@ fi
 
 echo "Configuring cl-hive..."
 
+# Create advisor database directory
+ADVISOR_DATA_DIR="$LIGHTNING_DIR/advisor"
+mkdir -p "$ADVISOR_DATA_DIR"
+
+# Export ADVISOR_DB_PATH for MCP server and tools
+export ADVISOR_DB_PATH="$ADVISOR_DATA_DIR/advisor.db"
+echo "Advisor database: $ADVISOR_DB_PATH"
+
 cat >> "$CONFIG_FILE" << EOF
 
 # =============================================================================
@@ -479,6 +487,9 @@ fi
 
 # Export for cl-revenue-ops if needed
 export LIGHTNING_DIR="$LIGHTNING_DIR"
+
+# Export advisor database path for MCP server tools
+export ADVISOR_DB_PATH="$ADVISOR_DATA_DIR/advisor.db"
 
 # -----------------------------------------------------------------------------
 # Wait for Bitcoin RPC (with exponential backoff)
@@ -545,6 +556,7 @@ echo "Network Mode:   $NETWORK_MODE"
 echo "WireGuard:      $WIREGUARD_ENABLED"
 echo "Hive Mode:      $HIVE_GOVERNANCE_MODE"
 echo "Lightning Dir:  $LIGHTNING_DIR"
+echo "Advisor DB:     $ADVISOR_DB_PATH"
 if [ -n "$ANNOUNCE_ADDR" ]; then
     echo "Announce Addr:  $ANNOUNCE_ADDR"
 fi
