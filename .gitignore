@@ -53,7 +53,8 @@ logs/
 data/
 modules/__pycache__
 
-# Note: vendor/ is tracked (contains cl-revenue-ops for Docker builds)
+# Vendor directory (bundled dependencies for Docker build)
+vendor/
 
 # MCP Server and monitoring config files (user-specific, use config/*.example.json as templates)
 .mcp.json
