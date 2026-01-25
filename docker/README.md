@@ -509,13 +509,7 @@ docker/
 
 ### Prerequisites
 
-The Docker build requires cl-revenue-ops to be placed in the `vendor` directory:
-
-```bash
-# From cl-hive root directory
-mkdir -p vendor
-cp -r /path/to/cl-revenue-ops vendor/cl-revenue-ops
-```
+No special prerequisites - cl-revenue-ops is automatically cloned from GitHub during the build.
 
 ### Build
 
@@ -536,7 +530,7 @@ docker-compose build
 | CLBOSS | latest (ksedgwic fork) | Yes |
 | Sling | v4.1.3 | Yes |
 | c-lightning-REST | v0.10.7 | Yes |
-| cl-revenue-ops | bundled | Yes |
+| cl-revenue-ops | latest (from GitHub) | Yes |
 | cl-hive | bundled | Yes |
 | Tor | 0.4.8.x | Yes |
 | WireGuard | 1.0.x | Optional |

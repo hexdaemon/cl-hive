@@ -7,7 +7,7 @@
 FROM ubuntu:24.04
 
 LABEL maintainer="Lightning Goats Team"
-LABEL version="1.9.0"
+LABEL version="2.0.0"
 LABEL description="Production Lightning node with cl-hive coordination"
 
 # Prevent interactive prompts during install
@@ -159,9 +159,9 @@ RUN git clone --depth 1 --branch ${CLN_REST_VERSION} https://github.com/Ride-The
 # CL-REVENUE-OPS PLUGIN
 # =============================================================================
 
-# Copy from vendor directory (bundled with cl-hive)
-COPY vendor/cl-revenue-ops /opt/cl-revenue-ops
-RUN chmod +x /opt/cl-revenue-ops/cl-revenue-ops.py
+# Clone from GitHub (previously bundled in vendor/)
+RUN git clone --depth 1 https://github.com/lightning-goats/cl_revenue_ops.git /opt/cl-revenue-ops \
+    && chmod +x /opt/cl-revenue-ops/cl-revenue-ops.py
 
 # =============================================================================
 # CL-HIVE PLUGIN
