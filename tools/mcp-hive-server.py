@@ -5489,34 +5489,122 @@ async def handle_advisor_resolve_alert(args: Dict) -> Dict:
 
 
 async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
-    """Get peer intelligence/reputation data."""
+    """
+    Get peer intelligence/reputation data with network graph analysis.
+
+    When a specific peer_id is provided, queries both:
+    1. Local experience data (from advisor_db)
+    2. Network graph data (from CLN listnodes/listchannels)
+
+    This provides comprehensive peer evaluation for channel open decisions.
+    """
     db = ensure_advisor_db()
 
     peer_id = args.get("peer_id")
 
     if peer_id:
+        # Get local experience data
         intel = db.get_peer_intelligence(peer_id)
-        if not intel:
-            return {"error": f"No data for peer: {peer_id}"}
+
+        local_data = {}
+        if intel:
+            local_data = {
+                "alias": intel.alias,
+                "first_seen": intel.first_seen.isoformat() if intel.first_seen else None,
+                "last_seen": intel.last_seen.isoformat() if intel.last_seen else None,
+                "channels_opened": intel.channels_opened,
+                "channels_closed": intel.channels_closed,
+                "force_closes": intel.force_closes,
+                "avg_channel_lifetime_days": intel.avg_channel_lifetime_days,
+                "total_forwards": intel.total_forwards,
+                "total_revenue_sats": intel.total_revenue_sats,
+                "total_costs_sats": intel.total_costs_sats,
+                "profitability_score": intel.profitability_score,
+                "reliability_score": intel.reliability_score,
+                "recommendation": intel.recommendation
+            }
+
+        # Get network graph data from first available node
+        graph_data = {}
+        is_existing_peer = False
+        node = next(iter(fleet.nodes.values()), None)
+
+        if node:
+            try:
+                # Query listnodes for peer info
+                nodes_result = await node.call("listnodes", id=peer_id)
+                if nodes_result and nodes_result.get("nodes"):
+                    node_info = nodes_result["nodes"][0]
+                    graph_data["alias"] = node_info.get("alias", "")
+                    graph_data["last_timestamp"] = node_info.get("last_timestamp", 0)
+
+                # Query listchannels for peer's channels
+                channels_result = await node.call("listchannels", source=peer_id)
+                channels = channels_result.get("channels", [])
+
+                graph_data["channel_count"] = len(channels)
+
+                if channels:
+                    capacities = []
+                    fees = []
+
+                    for ch in channels:
+                        cap = ch.get("amount_msat", 0)
+                        if isinstance(cap, str):
+                            cap = int(cap.replace("msat", ""))
+                        capacities.append(cap // 1000)
+
+                        fee_ppm = ch.get("fee_per_millionth", 0)
+                        fees.append(fee_ppm)
+
+                    graph_data["total_capacity_sats"] = sum(capacities)
+                    graph_data["avg_channel_size_sats"] = graph_data["total_capacity_sats"] // len(capacities) if capacities else 0
+
+                    if fees:
+                        sorted_fees = sorted(fees)
+                        graph_data["median_fee_ppm"] = sorted_fees[len(sorted_fees) // 2]
+                        graph_data["min_fee_ppm"] = sorted_fees[0]
+                        graph_data["max_fee_ppm"] = sorted_fees[-1]
+
+                    graph_data["is_well_connected"] = len(channels) >= 15
+
+                # Check if we already have a channel with this peer
+                peers_result = await node.call("listpeers", id=peer_id)
+                if peers_result and peers_result.get("peers"):
+                    peer_info = peers_result["peers"][0]
+                    if peer_info.get("channels"):
+                        is_existing_peer = True
+
+            except Exception as e:
+                graph_data["error"] = str(e)
+
+        # Calculate channel open criteria
+        channel_open_criteria = {
+            "meets_min_channels": graph_data.get("channel_count", 0) >= 15,
+            "meets_fee_criteria": graph_data.get("median_fee_ppm", 9999) <= 500,
+            "has_force_close_history": (local_data.get("force_closes", 0) or 0) > 0,
+            "is_existing_peer": is_existing_peer,
+        }
+
+        # Calculate approval
+        channel_open_criteria["approved"] = (
+            channel_open_criteria["meets_min_channels"] and
+            not channel_open_criteria["has_force_close_history"] and
+            not channel_open_criteria["is_existing_peer"] and
+            local_data.get("recommendation", "neutral") not in ("avoid", "caution")
+        )
 
         return {
-            "peer_id": intel.peer_id,
-            "alias": intel.alias,
-            "first_seen": intel.first_seen.isoformat() if intel.first_seen else None,
-            "last_seen": intel.last_seen.isoformat() if intel.last_seen else None,
-            "channels_opened": intel.channels_opened,
-            "channels_closed": intel.channels_closed,
-            "force_closes": intel.force_closes,
-            "avg_channel_lifetime_days": intel.avg_channel_lifetime_days,
-            "total_forwards": intel.total_forwards,
-            "total_revenue_sats": intel.total_revenue_sats,
-            "total_costs_sats": intel.total_costs_sats,
-            "profitability_score": intel.profitability_score,
-            "reliability_score": intel.reliability_score,
-            "recommendation": intel.recommendation
+            "peer_id": peer_id,
+            "local_experience": local_data if local_data else None,
+            "network_graph": graph_data if graph_data else None,
+            "channel_open_criteria": channel_open_criteria,
+            "recommendation": local_data.get("recommendation", "unknown") if local_data else (
+                "good" if channel_open_criteria["approved"] else "neutral"
+            )
         }
     else:
-        # Return all peers
+        # Return all peers (local data only)
         all_intel = db.get_all_peer_intelligence()
         return {
             "count": len(all_intel),
