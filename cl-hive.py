@@ -1604,6 +1604,9 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
         # Phase 13: Stigmergic Marker Sharing
         elif msg_type == HiveMessageType.STIGMERGIC_MARKER_BATCH:
             return handle_stigmergic_marker_batch(peer_id, msg_payload, plugin)
+        # Phase 13: Pheromone Sharing
+        elif msg_type == HiveMessageType.PHEROMONE_BATCH:
+            return handle_pheromone_batch(peer_id, msg_payload, plugin)
         # Phase 9: Settlement
         elif msg_type == HiveMessageType.SETTLEMENT_OFFER:
             return handle_settlement_offer(peer_id, msg_payload, plugin)
@@ -4989,6 +4992,77 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     return {"result": "continue"}
 
 
+def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle PHEROMONE_BATCH message from a hive member.
+
+    This enables fleet-wide learning from fee outcomes. When a member
+    has successful routing at certain fees, they share their pheromone
+    levels so other members can adjust their fees accordingly.
+    """
+    if not fee_coordination_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: PHEROMONE_BATCH from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_pheromone_batch, get_pheromone_batch_signing_payload
+    if not validate_pheromone_batch(payload):
+        plugin.log(f"cl-hive: PHEROMONE_BATCH validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: PHEROMONE_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_pheromone_batch_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: PHEROMONE_BATCH signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: PHEROMONE_BATCH pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: PHEROMONE_BATCH signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Process each pheromone entry
+    pheromones = payload.get("pheromones", [])
+    pheromones_stored = 0
+
+    from modules.protocol import PHEROMONE_WEIGHTING_FACTOR
+
+    for pheromone_data in pheromones:
+        try:
+            # Use the receive_pheromone_from_gossip method
+            result = fee_coordination_mgr.adaptive_controller.receive_pheromone_from_gossip(
+                reporter_id=peer_id,
+                pheromone_data=pheromone_data,
+                weighting_factor=PHEROMONE_WEIGHTING_FACTOR
+            )
+            if result:
+                pheromones_stored += 1
+        except Exception as e:
+            plugin.log(f"cl-hive: Error processing pheromone: {e}", level='debug')
+            continue
+
+    if pheromones_stored > 0:
+        plugin.log(
+            f"cl-hive: Stored {pheromones_stored} pheromones from {peer_id[:16]}...",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
 def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle SETTLEMENT_OFFER message from a hive member.
@@ -5961,6 +6035,9 @@ def fee_intelligence_loop():
             # Step 5a: Broadcast stigmergic markers (Phase 13 - Fleet Learning)
             _broadcast_our_stigmergic_markers()
 
+            # Step 5b: Broadcast pheromones (Phase 13 - Fleet Learning)
+            _broadcast_our_pheromones()
+
             # Step 6: Cleanup old liquidity needs
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
@@ -6011,6 +6088,20 @@ def fee_intelligence_loop():
                         )
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Peer reputation cleanup error: {e}", level='warn')
+
+            # Step 10: Cleanup old remote pheromones (Phase 13 - Fleet Learning)
+            try:
+                if fee_coordination_mgr:
+                    cleaned_pheromones = fee_coordination_mgr.adaptive_controller.cleanup_old_remote_pheromones(
+                        max_age_hours=48
+                    )
+                    if cleaned_pheromones > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_pheromones} old remote pheromones",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Remote pheromone cleanup error: {e}", level='warn')
 
         except Exception as e:
             if safe_plugin:
@@ -6723,6 +6814,91 @@ def _broadcast_our_stigmergic_markers():
     except Exception as e:
         if safe_plugin:
             safe_plugin.log(f"cl-hive: Stigmergic marker broadcast error: {e}", level='warn')
+
+
+def _broadcast_our_pheromones():
+    """
+    Broadcast our pheromone levels to hive members for fleet-wide learning.
+
+    Pheromones are the "memory" of successful fee levels for specific channels/peers.
+    Sharing these enables the fleet to learn from each other's fee experiments
+    without direct coordination.
+    """
+    if not fee_coordination_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import (
+            create_pheromone_batch,
+            MIN_PHEROMONE_LEVEL,
+            MAX_PHEROMONES_IN_BATCH
+        )
+
+        # Get our channels and update the channel-to-peer mapping
+        funds = safe_plugin.rpc.listfunds()
+        channels = funds.get("channels", [])
+
+        # Update channel-to-peer mappings in the adaptive controller
+        channel_infos = []
+        for ch in channels:
+            if ch.get("state") == "CHANNELD_NORMAL":
+                channel_infos.append({
+                    "short_channel_id": ch.get("short_channel_id"),
+                    "peer_id": ch.get("peer_id")
+                })
+        fee_coordination_mgr.adaptive_controller.update_channel_peer_mappings(channel_infos)
+
+        # Get hive member IDs to exclude from sharing
+        members = database.get_all_members()
+        member_ids = {m.get("peer_id") for m in members}
+
+        # Get shareable pheromones (excluding hive members)
+        shareable_pheromones = fee_coordination_mgr.adaptive_controller.get_shareable_pheromones(
+            min_level=MIN_PHEROMONE_LEVEL,
+            max_pheromones=MAX_PHEROMONES_IN_BATCH,
+            exclude_peer_ids=member_ids
+        )
+
+        if not shareable_pheromones:
+            return
+
+        # Create signed batch message
+        msg = create_pheromone_batch(
+            pheromones=shareable_pheromones,
+            rpc=safe_plugin.rpc,
+            our_pubkey=our_pubkey
+        )
+
+        if not msg:
+            return
+
+        # Broadcast to all hive members
+        broadcast_count = 0
+
+        for member in members:
+            member_id = member.get("peer_id")
+            if not member_id or member_id == our_pubkey:
+                continue
+
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": member_id,
+                    "msg": msg.hex()
+                })
+                broadcast_count += 1
+            except Exception:
+                pass  # Peer might be offline
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_pheromones)} pheromones "
+                f"to {broadcast_count} members",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Pheromone broadcast error: {e}", level='warn')
 
 
 def _broadcast_health_report():

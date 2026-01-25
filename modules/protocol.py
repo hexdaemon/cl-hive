@@ -124,6 +124,9 @@ class HiveMessageType(IntEnum):
     # Phase 13: Stigmergic Marker Sharing
     STIGMERGIC_MARKER_BATCH = 32853  # Batch of route markers for fleet learning
 
+    # Phase 13: Pheromone Sharing
+    PHEROMONE_BATCH = 32855  # Batch of fee pheromone levels for fleet learning
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -345,6 +348,12 @@ STIGMERGIC_MARKER_BATCH_RATE_LIMIT = (1, 3600)  # 1 batch per hour per sender
 MAX_MARKERS_IN_BATCH = 50                   # Maximum markers in one batch message
 MIN_MARKER_STRENGTH = 0.1                   # Minimum strength to share (after decay)
 MAX_MARKER_AGE_HOURS = 24                   # Don't share markers older than this
+
+# Pheromone sharing constants
+PHEROMONE_BATCH_RATE_LIMIT = (1, 3600)      # 1 batch per hour per sender
+MAX_PHEROMONES_IN_BATCH = 100               # Maximum pheromone entries in one batch
+MIN_PHEROMONE_LEVEL = 0.5                   # Minimum level to share (meaningful signal)
+PHEROMONE_WEIGHTING_FACTOR = 0.3            # How much to weight remote pheromones vs local
 
 # Route probe constants
 MAX_PATH_LENGTH = 20                        # Maximum hops in a path
@@ -4282,3 +4291,157 @@ def create_stigmergic_marker_batch(
     }
 
     return serialize(HiveMessageType.STIGMERGIC_MARKER_BATCH, payload)
+
+
+# =============================================================================
+# PHEROMONE BATCH FUNCTIONS
+# =============================================================================
+
+def get_pheromone_batch_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for PHEROMONE_BATCH messages.
+
+    Signs over: reporter_id, timestamp, and a hash of the sorted pheromone data.
+    This ensures the entire batch is authenticated without making the
+    signing string excessively long.
+
+    Args:
+        payload: PHEROMONE_BATCH message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    pheromones = payload.get("pheromones", [])
+
+    # Sort pheromones by peer_id for deterministic ordering
+    sorted_pheromones = sorted(pheromones, key=lambda p: p.get("peer_id", ""))
+
+    # Create a condensed hash of the pheromone data
+    pheromones_str = json.dumps(sorted_pheromones, sort_keys=True, separators=(',', ':'))
+    pheromones_hash = hashlib.sha256(pheromones_str.encode()).hexdigest()[:16]
+
+    return (
+        f"PHEROMONE_BATCH:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{len(pheromones)}:"
+        f"{pheromones_hash}"
+    )
+
+
+def validate_pheromone_batch(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a PHEROMONE_BATCH payload.
+
+    SECURITY: Bounds all values to prevent manipulation and overflow.
+
+    Args:
+        payload: PHEROMONE_BATCH message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    # Required fields
+    reporter_id = payload.get("reporter_id")
+    if not reporter_id or not isinstance(reporter_id, str):
+        return False
+    if len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return False
+    # Timestamp should be within reasonable range (not in future, not too old)
+    now = time.time()
+    if timestamp > now + 300:  # 5 min future tolerance
+        return False
+    if timestamp < now - (48 * 3600):  # 48 hour max age
+        return False
+
+    signature = payload.get("signature")
+    if not signature or not isinstance(signature, str):
+        return False
+
+    pheromones = payload.get("pheromones")
+    if not isinstance(pheromones, list):
+        return False
+    if len(pheromones) > MAX_PHEROMONES_IN_BATCH:
+        return False
+
+    # Validate each pheromone entry
+    for p in pheromones:
+        if not isinstance(p, dict):
+            return False
+
+        peer_id = p.get("peer_id")
+        if not peer_id or not isinstance(peer_id, str):
+            return False
+        if len(peer_id) > MAX_PEER_ID_LEN:
+            return False
+
+        level = p.get("level")
+        if not isinstance(level, (int, float)):
+            return False
+        if level < 0 or level > 10000:  # Reasonable bounds
+            return False
+
+        fee_ppm = p.get("fee_ppm")
+        if not isinstance(fee_ppm, int):
+            return False
+        if fee_ppm < 0 or fee_ppm > 100000:  # Reasonable fee bounds
+            return False
+
+        # Optional fields
+        if "channel_id" in p:
+            channel_id = p.get("channel_id")
+            if not isinstance(channel_id, str) or len(channel_id) > 50:
+                return False
+
+    return True
+
+
+def create_pheromone_batch(
+    pheromones: List[Dict[str, Any]],
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create a PHEROMONE_BATCH message.
+
+    This message shares pheromone levels (fee memory from successful routing)
+    with the fleet, enabling collective learning about what fees work for
+    specific external peers.
+
+    Args:
+        pheromones: List of pheromone entries, each containing:
+            - peer_id: External peer pubkey
+            - level: Pheromone level (strength of fee memory)
+            - fee_ppm: Fee that earned this pheromone
+            - channel_id: Optional - channel ID
+        rpc: CLN RPC interface for signing
+        our_pubkey: Our node's public key
+
+    Returns:
+        Serialized PHEROMONE_BATCH message, or None on error
+    """
+    timestamp = int(time.time())
+    reporter_id = our_pubkey
+
+    # Create payload for signing
+    payload = {
+        "reporter_id": reporter_id,
+        "timestamp": timestamp,
+        "signature": "",  # Placeholder
+        "pheromones": pheromones,
+    }
+
+    # Sign the payload
+    try:
+        signing_payload = get_pheromone_batch_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.PHEROMONE_BATCH, payload)

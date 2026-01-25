@@ -621,6 +621,15 @@ class AdaptiveFeeController:
         # Pheromone levels per channel (fee memory)
         self._pheromone: Dict[str, float] = defaultdict(float)
 
+        # Track the fee that earned each pheromone level
+        self._pheromone_fee: Dict[str, int] = {}
+
+        # Map channel_id to peer_id for sharing
+        self._channel_peer_map: Dict[str, str] = {}
+
+        # Remote pheromones received from fleet (keyed by peer_id)
+        self._remote_pheromones: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
         # Velocity cache for evaporation rate calculation
         self._velocity_cache: Dict[str, float] = {}
         self._velocity_cache_time: Dict[str, float] = {}
@@ -717,6 +726,9 @@ class AdaptiveFeeController:
             deposit = revenue_sats * PHEROMONE_DEPOSIT_SCALE
             self._pheromone[channel_id] += deposit
 
+            # Track the fee that earned this pheromone
+            self._pheromone_fee[channel_id] = current_fee
+
             self._log(
                 f"Channel {channel_id[:8]}: pheromone deposit {deposit:.2f}, "
                 f"total now {self._pheromone[channel_id]:.2f}",
@@ -760,6 +772,204 @@ class AdaptiveFeeController:
     def get_all_pheromone_levels(self) -> Dict[str, float]:
         """Get all pheromone levels."""
         return dict(self._pheromone)
+
+    def set_channel_peer_mapping(self, channel_id: str, peer_id: str) -> None:
+        """
+        Set the mapping from channel_id to peer_id.
+
+        This is needed for sharing pheromones - we share by peer_id
+        so other members with channels to the same peer can learn.
+        """
+        self._channel_peer_map[channel_id] = peer_id
+
+    def update_channel_peer_mappings(self, channels: List[Dict[str, Any]]) -> None:
+        """
+        Update channel-to-peer mappings from a list of channel info.
+
+        Args:
+            channels: List of channel dicts with 'short_channel_id' and 'peer_id'
+        """
+        for ch in channels:
+            channel_id = ch.get("short_channel_id")
+            peer_id = ch.get("peer_id")
+            if channel_id and peer_id:
+                self._channel_peer_map[channel_id] = peer_id
+
+    def get_shareable_pheromones(
+        self,
+        min_level: float = 0.5,
+        max_pheromones: int = 100,
+        exclude_peer_ids: Optional[set] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get pheromones suitable for sharing with fleet.
+
+        Only shares pheromones that:
+        - Have sufficient level (meaningful signal)
+        - Have a known fee associated
+        - Have a known peer mapping
+        - Are not for hive members (exclude_peer_ids)
+
+        Args:
+            min_level: Minimum pheromone level to share
+            max_pheromones: Maximum number of entries to return
+            exclude_peer_ids: Set of peer IDs to exclude (e.g., hive members)
+
+        Returns:
+            List of pheromone dicts ready for serialization
+        """
+        exclude_peer_ids = exclude_peer_ids or set()
+        shareable = []
+
+        for channel_id, level in self._pheromone.items():
+            # Check level threshold
+            if level < min_level:
+                continue
+
+            # Get the fee that earned this pheromone
+            fee_ppm = self._pheromone_fee.get(channel_id)
+            if fee_ppm is None:
+                continue
+
+            # Get peer_id for this channel
+            peer_id = self._channel_peer_map.get(channel_id)
+            if not peer_id:
+                continue
+
+            # Skip hive members
+            if peer_id in exclude_peer_ids:
+                continue
+
+            shareable.append({
+                "peer_id": peer_id,
+                "level": round(level, 3),
+                "fee_ppm": fee_ppm,
+                "channel_id": channel_id
+            })
+
+        # Sort by level descending (strongest signals first)
+        shareable.sort(key=lambda x: -x["level"])
+
+        return shareable[:max_pheromones]
+
+    def receive_pheromone_from_gossip(
+        self,
+        reporter_id: str,
+        pheromone_data: Dict[str, Any],
+        weighting_factor: float = 0.3
+    ) -> bool:
+        """
+        Receive a pheromone report from another fleet member.
+
+        Remote pheromones are stored separately and can be used to
+        influence local fee decisions. We don't directly modify our
+        local pheromone levels, but blend them when making decisions.
+
+        Args:
+            reporter_id: The fleet member who reported this
+            pheromone_data: Dict with peer_id, level, fee_ppm
+            weighting_factor: How much weight to give remote data (0-1)
+
+        Returns:
+            True if stored successfully
+        """
+        peer_id = pheromone_data.get("peer_id")
+        if not peer_id:
+            return False
+
+        level = pheromone_data.get("level", 0)
+        fee_ppm = pheromone_data.get("fee_ppm", 0)
+
+        if level <= 0 or fee_ppm <= 0:
+            return False
+
+        # Store remote pheromone, keyed by the external peer
+        entry = {
+            "reporter_id": reporter_id,
+            "level": level,
+            "fee_ppm": fee_ppm,
+            "timestamp": time.time(),
+            "weight": weighting_factor
+        }
+
+        # Keep only recent reports per peer (last 10)
+        self._remote_pheromones[peer_id].append(entry)
+        if len(self._remote_pheromones[peer_id]) > 10:
+            self._remote_pheromones[peer_id] = self._remote_pheromones[peer_id][-10:]
+
+        return True
+
+    def get_fleet_fee_hint(self, peer_id: str) -> Optional[Tuple[int, float]]:
+        """
+        Get fee hint from fleet pheromones for a specific peer.
+
+        Aggregates remote pheromone reports to suggest a fee.
+
+        Args:
+            peer_id: The external peer to get hints for
+
+        Returns:
+            Tuple of (suggested_fee_ppm, confidence) or None if no data
+        """
+        reports = self._remote_pheromones.get(peer_id, [])
+        if not reports:
+            return None
+
+        # Filter to recent reports (last 24 hours)
+        now = time.time()
+        recent = [r for r in reports if now - r.get("timestamp", 0) < 86400]
+
+        if not recent:
+            return None
+
+        # Weight by level and recency
+        total_weight = 0
+        weighted_fee = 0
+
+        for r in recent:
+            age_hours = (now - r.get("timestamp", now)) / 3600
+            recency_weight = max(0.1, 1.0 - (age_hours / 24))
+            level_weight = r.get("level", 0) / 10  # Normalize level
+            weight = recency_weight * level_weight * r.get("weight", 0.3)
+
+            weighted_fee += r.get("fee_ppm", 0) * weight
+            total_weight += weight
+
+        if total_weight < 0.1:
+            return None
+
+        suggested_fee = int(weighted_fee / total_weight)
+        confidence = min(1.0, total_weight)
+
+        return (suggested_fee, confidence)
+
+    def get_all_fleet_hints(self) -> Dict[str, Tuple[int, float]]:
+        """Get fee hints for all peers with remote pheromone data."""
+        hints = {}
+        for peer_id in self._remote_pheromones:
+            hint = self.get_fleet_fee_hint(peer_id)
+            if hint:
+                hints[peer_id] = hint
+        return hints
+
+    def cleanup_old_remote_pheromones(self, max_age_hours: float = 48) -> int:
+        """Remove old remote pheromone data."""
+        cutoff = time.time() - (max_age_hours * 3600)
+        cleaned = 0
+
+        for peer_id in list(self._remote_pheromones.keys()):
+            before = len(self._remote_pheromones[peer_id])
+            self._remote_pheromones[peer_id] = [
+                r for r in self._remote_pheromones[peer_id]
+                if r.get("timestamp", 0) > cutoff
+            ]
+            cleaned += before - len(self._remote_pheromones[peer_id])
+
+            # Remove empty entries
+            if not self._remote_pheromones[peer_id]:
+                del self._remote_pheromones[peer_id]
+
+        return cleaned
 
 
 # =============================================================================
