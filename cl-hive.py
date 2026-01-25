@@ -6582,8 +6582,8 @@ def fee_intelligence_loop():
             # Step 5c: Broadcast yield metrics (Phase 14 - Daily, only once per day)
             # Check if we've already broadcast today
             try:
-                from datetime import datetime
-                today = datetime.utcnow().strftime("%Y-%m-%d")
+                from datetime import datetime, timezone
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 last_yield_broadcast = getattr(_broadcast_our_yield_metrics, '_last_broadcast', None)
                 if last_yield_broadcast != today:
                     _broadcast_our_yield_metrics()
@@ -6596,8 +6596,8 @@ def fee_intelligence_loop():
 
             # Step 5e: Broadcast temporal patterns (Phase 14 - Weekly)
             try:
-                from datetime import datetime
-                current_week = datetime.utcnow().strftime("%Y-W%W")
+                from datetime import datetime, timezone
+                current_week = datetime.now(timezone.utc).strftime("%Y-W%W")
                 last_temporal_broadcast = getattr(_broadcast_our_temporal_patterns, '_last_broadcast', None)
                 if last_temporal_broadcast != current_week:
                     _broadcast_our_temporal_patterns()
@@ -6607,8 +6607,8 @@ def fee_intelligence_loop():
 
             # Step 5f: Broadcast corridor values (Phase 14.2 - Weekly)
             try:
-                from datetime import datetime
-                current_week = datetime.utcnow().strftime("%Y-W%W")
+                from datetime import datetime, timezone
+                current_week = datetime.now(timezone.utc).strftime("%Y-W%W")
                 last_corridor_broadcast = getattr(_broadcast_our_corridor_values, '_last_broadcast', None)
                 if last_corridor_broadcast != current_week:
                     _broadcast_our_corridor_values()
@@ -6624,8 +6624,8 @@ def fee_intelligence_loop():
 
             # Step 5i: Broadcast coverage analysis (Phase 14.2 - Weekly)
             try:
-                from datetime import datetime
-                current_week = datetime.utcnow().strftime("%Y-W%W")
+                from datetime import datetime, timezone
+                current_week = datetime.now(timezone.utc).strftime("%Y-W%W")
                 last_coverage_broadcast = getattr(_broadcast_our_coverage_analysis, '_last_broadcast', None)
                 if last_coverage_broadcast != current_week:
                     _broadcast_our_coverage_analysis()
@@ -7926,15 +7926,15 @@ def _broadcast_our_physarum_recommendations():
         # Broadcast each recommendation separately
         for rec in shareable_recommendations:
             msg = create_physarum_recommendation(
+                channel_id=rec.get("channel_id", ""),
                 peer_id=rec["peer_id"],
-                channel_scid=rec.get("channel_scid", ""),
                 action=rec["action"],
                 flow_intensity=rec["flow_intensity"],
-                channel_age_days=rec.get("channel_age_days", 0),
                 reason=rec["reason"],
-                suggested_amount_sats=rec.get("suggested_amount_sats"),
+                expected_yield_change_pct=rec.get("expected_yield_change_pct", 0.0),
                 rpc=safe_plugin.rpc,
-                our_pubkey=our_pubkey
+                our_pubkey=our_pubkey,
+                splice_amount_sats=rec.get("splice_amount_sats", 0)
             )
 
             if not msg:

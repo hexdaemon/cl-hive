@@ -125,6 +125,59 @@ upgrade_cl_revenue_ops() {
     return 1
 }
 
+restart_plugin() {
+    local plugin_path="$1"
+    local plugin_name="$2"
+
+    log_step "Restarting $plugin_name plugin..."
+
+    # Try to stop the plugin gracefully
+    if docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" plugin stop "$plugin_path" 2>/dev/null; then
+        log_info "Stopped $plugin_name"
+        sleep 1
+    else
+        log_warn "Failed to stop $plugin_name (may not be running)"
+    fi
+
+    # Start the plugin
+    if docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" plugin start "$plugin_path" 2>/dev/null; then
+        log_info "Started $plugin_name"
+        return 0
+    else
+        log_error "Failed to start $plugin_name"
+        return 1
+    fi
+}
+
+restart_plugins() {
+    local hive_upgraded="$1"
+    local revenue_upgraded="$2"
+
+    log_step "Restarting upgraded plugins..."
+
+    local restart_failed=false
+
+    # Restart plugins individually (faster, no channel downtime)
+    if [ "$hive_upgraded" == "true" ]; then
+        if ! restart_plugin "/opt/cl-hive/cl-hive.py" "cl-hive"; then
+            restart_failed=true
+        fi
+    fi
+
+    if [ "$revenue_upgraded" == "true" ]; then
+        if ! restart_plugin "/opt/cl-revenue-ops/cl-revenue-ops.py" "cl-revenue-ops"; then
+            restart_failed=true
+        fi
+    fi
+
+    if [ "$restart_failed" == "true" ]; then
+        log_warn "Plugin restart failed, falling back to lightningd restart..."
+        restart_lightningd
+    else
+        log_info "Plugin restart complete"
+    fi
+}
+
 restart_lightningd() {
     log_step "Restarting lightningd to load updated plugins..."
 
@@ -132,7 +185,7 @@ restart_lightningd() {
     docker exec "$CONTAINER_NAME" supervisorctl restart lightningd
 
     log_info "Waiting for node to become healthy..."
-    
+
     local retries=30
     while [ $retries -gt 0 ]; do
         if docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" getinfo >/dev/null 2>&1; then
@@ -234,17 +287,18 @@ main() {
     check_container
     show_versions
 
-    local needs_restart=false
+    local hive_upgraded=false
+    local revenue_upgraded=false
 
     if [ "$upgrade_hive" == "true" ]; then
         if ! upgrade_cl_hive; then
-            needs_restart=true
+            hive_upgraded=true
         fi
     fi
 
     if [ "$upgrade_revenue" == "true" ]; then
         if ! upgrade_cl_revenue_ops; then
-            needs_restart=true
+            revenue_upgraded=true
         fi
     fi
 
@@ -254,8 +308,9 @@ main() {
         exit 0
     fi
 
-    if [ "$needs_restart" == "true" ]; then
-        restart_lightningd
+    if [ "$hive_upgraded" == "true" ] || [ "$revenue_upgraded" == "true" ]; then
+        # Prefer plugin restart over lightningd restart (faster, no channel downtime)
+        restart_plugins "$hive_upgraded" "$revenue_upgraded"
         echo ""
         show_versions
         echo ""
