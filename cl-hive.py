@@ -3223,6 +3223,19 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if local_tier not in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value):
         return {"result": "continue"}
 
+    # Ensure the promotion request exists in our database (fixes gossip sync issue)
+    # When we receive a VOUCH, we may not have received the original PROMOTION_REQUEST
+    # This can happen if messages arrive out of order or if we joined after the request
+    existing_request = database.get_promotion_requests(payload["target_pubkey"])
+    request_exists = any(r.get("request_id") == payload["request_id"] for r in existing_request)
+    if not request_exists:
+        database.add_promotion_request(
+            payload["target_pubkey"],
+            payload["request_id"],
+            status="pending"
+        )
+        plugin.log(f"cl-hive: Created missing promotion request for {payload['target_pubkey'][:16]}... from VOUCH", level='debug')
+
     stored = database.add_promotion_vouch(
         payload["target_pubkey"],
         payload["request_id"],
