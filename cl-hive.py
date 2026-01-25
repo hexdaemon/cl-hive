@@ -1601,6 +1601,9 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_route_probe_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.PEER_REPUTATION_SNAPSHOT:
             return handle_peer_reputation_snapshot(peer_id, msg_payload, plugin)
+        # Phase 13: Stigmergic Marker Sharing
+        elif msg_type == HiveMessageType.STIGMERGIC_MARKER_BATCH:
+            return handle_stigmergic_marker_batch(peer_id, msg_payload, plugin)
         # Phase 9: Settlement
         elif msg_type == HiveMessageType.SETTLEMENT_OFFER:
             return handle_settlement_offer(peer_id, msg_payload, plugin)
@@ -4918,6 +4921,74 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
     return {"result": "continue"}
 
 
+def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle STIGMERGIC_MARKER_BATCH message from a hive member.
+
+    This enables fleet-wide learning from routing outcomes. When a member
+    successfully routes traffic, they share their markers so other members
+    can adjust their fees accordingly (stigmergic coordination).
+    """
+    if not fee_coordination_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_stigmergic_marker_batch, get_stigmergic_marker_batch_signing_payload
+    if not validate_stigmergic_marker_batch(payload):
+        plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_stigmergic_marker_batch_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Process each marker
+    markers = payload.get("markers", [])
+    markers_stored = 0
+
+    for marker_data in markers:
+        try:
+            # Add depositor field (the sender of the batch)
+            marker_data["depositor"] = peer_id
+
+            # Use the existing receive_marker_from_gossip method
+            result = fee_coordination_mgr.stigmergic_coord.receive_marker_from_gossip(marker_data)
+            if result:
+                markers_stored += 1
+        except Exception as e:
+            plugin.log(f"cl-hive: Error processing marker: {e}", level='debug')
+            continue
+
+    if markers_stored > 0:
+        plugin.log(
+            f"cl-hive: Stored {markers_stored} stigmergic markers from {peer_id[:16]}...",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
 def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle SETTLEMENT_OFFER message from a hive member.
@@ -5887,6 +5958,9 @@ def fee_intelligence_loop():
             # Step 5: Broadcast liquidity needs
             _broadcast_liquidity_needs()
 
+            # Step 5a: Broadcast stigmergic markers (Phase 13 - Fleet Learning)
+            _broadcast_our_stigmergic_markers()
+
             # Step 6: Cleanup old liquidity needs
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
@@ -6579,6 +6653,76 @@ def _broadcast_our_fee_intelligence():
     except Exception as e:
         if safe_plugin:
             safe_plugin.log(f"cl-hive: Fee intelligence broadcast error: {e}", level='warn')
+
+
+def _broadcast_our_stigmergic_markers():
+    """
+    Broadcast our stigmergic markers to hive members for fleet-wide learning.
+
+    Stigmergic markers are signals left after routing attempts that encode
+    success/failure, fee levels, and volume. Sharing these enables the fleet
+    to learn from each other's routing outcomes without direct coordination.
+    """
+    if not fee_coordination_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import (
+            create_stigmergic_marker_batch,
+            MIN_MARKER_STRENGTH,
+            MAX_MARKER_AGE_HOURS,
+            MAX_MARKERS_IN_BATCH
+        )
+
+        # Get shareable markers from our stigmergic coordinator
+        shareable_markers = fee_coordination_mgr.stigmergic_coord.get_shareable_markers(
+            our_pubkey=our_pubkey,
+            min_strength=MIN_MARKER_STRENGTH,
+            max_age_hours=MAX_MARKER_AGE_HOURS,
+            max_markers=MAX_MARKERS_IN_BATCH
+        )
+
+        if not shareable_markers:
+            return
+
+        # Create signed batch message
+        msg = create_stigmergic_marker_batch(
+            markers=shareable_markers,
+            rpc=safe_plugin.rpc,
+            our_pubkey=our_pubkey
+        )
+
+        if not msg:
+            return
+
+        # Get hive members to broadcast to
+        members = database.get_all_members()
+        broadcast_count = 0
+
+        for member in members:
+            member_id = member.get("peer_id")
+            if not member_id or member_id == our_pubkey:
+                continue
+
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": member_id,
+                    "msg": msg.hex()
+                })
+                broadcast_count += 1
+            except Exception:
+                pass  # Peer might be offline
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_markers)} stigmergic markers "
+                f"to {broadcast_count} members",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Stigmergic marker broadcast error: {e}", level='warn')
 
 
 def _broadcast_health_report():

@@ -121,6 +121,9 @@ class HiveMessageType(IntEnum):
     SETTLEMENT_READY = 32849      # Vote that data hash matches (quorum)
     SETTLEMENT_EXECUTED = 32851   # Confirm payment execution
 
+    # Phase 13: Stigmergic Marker Sharing
+    STIGMERGIC_MARKER_BATCH = 32853  # Batch of route markers for fleet learning
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -336,6 +339,12 @@ ROUTE_PROBE_BATCH_RATE_LIMIT = (2, 3600)   # 2 batches per hour per sender
 MAX_PROBES_IN_BATCH = 100                  # Maximum route probes in one batch message
 PEER_REPUTATION_SNAPSHOT_RATE_LIMIT = (2, 86400)  # 2 snapshots per day per sender
 MAX_PEERS_IN_REPUTATION_SNAPSHOT = 200      # Maximum peers in one reputation snapshot
+
+# Stigmergic marker sharing constants
+STIGMERGIC_MARKER_BATCH_RATE_LIMIT = (1, 3600)  # 1 batch per hour per sender
+MAX_MARKERS_IN_BATCH = 50                   # Maximum markers in one batch message
+MIN_MARKER_STRENGTH = 0.1                   # Minimum strength to share (after decay)
+MAX_MARKER_AGE_HOURS = 24                   # Don't share markers older than this
 
 # Route probe constants
 MAX_PATH_LENGTH = 20                        # Maximum hops in a path
@@ -4093,3 +4102,183 @@ def create_settlement_executed(
         payload["amount_paid_sats"] = amount_paid_sats
 
     return serialize(HiveMessageType.SETTLEMENT_EXECUTED, payload)
+
+
+# =============================================================================
+# PHASE 13: STIGMERGIC MARKER SHARING
+# =============================================================================
+
+def get_stigmergic_marker_batch_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for STIGMERGIC_MARKER_BATCH messages.
+
+    Signs over: reporter_id, timestamp, and a hash of the sorted marker data.
+    This ensures the entire batch is authenticated without making the
+    signing string excessively long.
+
+    Args:
+        payload: STIGMERGIC_MARKER_BATCH message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    import hashlib
+
+    markers = payload.get("markers", [])
+
+    # Create deterministic hash of markers
+    # Sort by (source, destination, timestamp) for consistency
+    sorted_markers = sorted(
+        markers,
+        key=lambda m: (
+            m.get("source_peer_id", ""),
+            m.get("destination_peer_id", ""),
+            m.get("timestamp", 0)
+        )
+    )
+
+    # Hash the sorted marker data
+    markers_str = json.dumps(sorted_markers, sort_keys=True, separators=(',', ':'))
+    markers_hash = hashlib.sha256(markers_str.encode()).hexdigest()[:16]
+
+    return (
+        f"STIGMERGIC_MARKER_BATCH:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{len(markers)}:"
+        f"{markers_hash}"
+    )
+
+
+def validate_stigmergic_marker_batch(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a STIGMERGIC_MARKER_BATCH payload.
+
+    SECURITY: Bounds all values to prevent manipulation and overflow.
+
+    Args:
+        payload: STIGMERGIC_MARKER_BATCH message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    import time as time_module
+
+    # Required fields
+    if not payload.get("reporter_id"):
+        return False
+    if not payload.get("timestamp"):
+        return False
+    if not payload.get("signature"):
+        return False
+    if "markers" not in payload:
+        return False
+
+    # Reporter ID must be valid pubkey format
+    reporter_id = payload.get("reporter_id", "")
+    if not (len(reporter_id) == 66 and reporter_id[:2] in ("02", "03")):
+        return False
+
+    # Timestamp must be recent (within 1 hour) and not in future
+    now = int(time_module.time())
+    timestamp = payload.get("timestamp", 0)
+    if not isinstance(timestamp, int):
+        return False
+    if timestamp > now + 60:  # Allow 60s clock skew
+        return False
+    if timestamp < now - 3600:  # Not older than 1 hour
+        return False
+
+    # Markers list bounds
+    markers = payload.get("markers", [])
+    if not isinstance(markers, list):
+        return False
+    if len(markers) > MAX_MARKERS_IN_BATCH:
+        return False
+
+    # Validate each marker
+    for marker in markers:
+        if not isinstance(marker, dict):
+            return False
+
+        # Required marker fields
+        if not marker.get("source_peer_id"):
+            return False
+        if not marker.get("destination_peer_id"):
+            return False
+
+        # Validate peer ID formats
+        src = marker.get("source_peer_id", "")
+        dst = marker.get("destination_peer_id", "")
+        if not (len(src) == 66 and src[:2] in ("02", "03")):
+            return False
+        if not (len(dst) == 66 and dst[:2] in ("02", "03")):
+            return False
+
+        # Validate fee_ppm bounds
+        fee_ppm = marker.get("fee_ppm", 0)
+        if not isinstance(fee_ppm, int) or fee_ppm < 0 or fee_ppm > 100000:
+            return False
+
+        # Validate volume bounds
+        volume_sats = marker.get("volume_sats", 0)
+        if not isinstance(volume_sats, int) or volume_sats < 0 or volume_sats > 1_000_000_000:
+            return False
+
+        # Validate strength bounds
+        strength = marker.get("strength", 0)
+        if not isinstance(strength, (int, float)) or strength < 0 or strength > 10:
+            return False
+
+        # Validate timestamp
+        marker_ts = marker.get("timestamp", 0)
+        if not isinstance(marker_ts, (int, float)):
+            return False
+        # Marker shouldn't be older than 24 hours
+        if marker_ts < now - (MAX_MARKER_AGE_HOURS * 3600):
+            return False
+
+    return True
+
+
+def create_stigmergic_marker_batch(
+    reporter_id: str,
+    timestamp: int,
+    signature: str,
+    markers: List[Dict[str, Any]]
+) -> bytes:
+    """
+    Create a STIGMERGIC_MARKER_BATCH message.
+
+    This message shares successful/failed routing markers with the fleet,
+    enabling indirect coordination on fee levels. Other members read these
+    markers and adjust their fees accordingly (stigmergic coordination).
+
+    SECURITY: The signature must be created using signmessage() over the
+    canonical payload returned by get_stigmergic_marker_batch_signing_payload().
+
+    Args:
+        reporter_id: Hive member sharing markers
+        timestamp: Unix timestamp
+        signature: zbase-encoded signature from signmessage()
+        markers: List of route marker dicts, each containing:
+            - source_peer_id: Source of the route
+            - destination_peer_id: Destination of the route
+            - fee_ppm: Fee charged for this route
+            - success: Whether routing succeeded
+            - volume_sats: Volume routed
+            - timestamp: When the routing occurred
+            - strength: Current marker strength (after decay)
+            - channel_id: Optional - channel used for routing
+
+    Returns:
+        Serialized STIGMERGIC_MARKER_BATCH message
+    """
+    payload = {
+        "reporter_id": reporter_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "markers": markers,
+    }
+
+    return serialize(HiveMessageType.STIGMERGIC_MARKER_BATCH, payload)

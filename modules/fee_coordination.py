@@ -939,6 +939,69 @@ class StigmergicCoordinator:
 
         return result
 
+    def get_shareable_markers(
+        self,
+        our_pubkey: str,
+        min_strength: float = 0.1,
+        max_age_hours: float = 24.0,
+        max_markers: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Get markers suitable for sharing with fleet.
+
+        Only shares markers that:
+        - Were deposited by us (our_pubkey)
+        - Have sufficient strength after decay
+        - Are not too old
+        - Are successful routes (prioritized) or recent failures
+
+        Args:
+            our_pubkey: Our node's public key
+            min_strength: Minimum marker strength to share
+            max_age_hours: Maximum age in hours
+            max_markers: Maximum number of markers to return
+
+        Returns:
+            List of marker dicts ready for serialization
+        """
+        now = time.time()
+        max_age_secs = max_age_hours * 3600
+        shareable = []
+
+        for markers in self._markers.values():
+            for m in markers:
+                # Only share our own markers
+                if m.depositor != our_pubkey:
+                    continue
+
+                # Check age
+                age = now - m.timestamp
+                if age > max_age_secs:
+                    continue
+
+                # Check strength
+                current_strength = self._calculate_marker_strength(m, now)
+                if current_strength < min_strength:
+                    continue
+
+                shareable.append({
+                    "source_peer_id": m.source_peer_id,
+                    "destination_peer_id": m.destination_peer_id,
+                    "fee_ppm": m.fee_ppm,
+                    "success": m.success,
+                    "volume_sats": m.volume_sats,
+                    "timestamp": m.timestamp,
+                    "strength": round(current_strength, 3)
+                })
+
+        # Sort by: success first, then by strength (descending), then by timestamp (newest)
+        shareable.sort(
+            key=lambda x: (not x["success"], -x["strength"], -x["timestamp"])
+        )
+
+        # Limit to max_markers
+        return shareable[:max_markers]
+
 
 # =============================================================================
 # MYCELIUM DEFENSE SYSTEM
