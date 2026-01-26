@@ -1823,14 +1823,34 @@ class CostReductionManager:
                 )
                 result["sendpay_result"] = sendpay_result
 
-                # 3. Wait for completion
-                waitsendpay_result = rpc.waitsendpay(
-                    payment_hash=payment_hash,
-                    timeout=60
-                )
-                result["status"] = "success"
-                result["waitsendpay_result"] = waitsendpay_result
-                result["message"] = f"Successfully rebalanced {amount_sats} sats through hive at zero fees!"
+                # 3. Wait for completion using short polling to avoid RPC lock starvation
+                # Use short timeouts (2s) with retries to allow other RPC calls
+                max_attempts = 30  # 30 * 2s = 60s total
+                waitsendpay_result = None
+                for attempt in range(max_attempts):
+                    try:
+                        waitsendpay_result = rpc.waitsendpay(
+                            payment_hash=payment_hash,
+                            timeout=2  # Short timeout to release RPC lock frequently
+                        )
+                        # Success - payment completed
+                        break
+                    except Exception as wait_err:
+                        err_str = str(wait_err)
+                        # Check if it's just a timeout (payment still in progress)
+                        if "Timed out" in err_str or "timeout" in err_str.lower():
+                            # Payment still in progress, continue polling
+                            continue
+                        # Real error - payment failed
+                        raise
+
+                if waitsendpay_result:
+                    result["status"] = "success"
+                    result["waitsendpay_result"] = waitsendpay_result
+                    result["message"] = f"Successfully rebalanced {amount_sats} sats through hive at zero fees!"
+                else:
+                    result["status"] = "timeout"
+                    result["error"] = "Payment timed out after 60 seconds"
 
             except Exception as e:
                 error_str = str(e)
