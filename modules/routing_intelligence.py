@@ -29,6 +29,7 @@ from .protocol import (
     MAX_PATH_LENGTH,
     MAX_PROBES_IN_BATCH,
 )
+from . import network_metrics
 
 
 # Route quality thresholds
@@ -36,6 +37,11 @@ HIGH_SUCCESS_RATE = 0.9     # 90% success rate considered high
 LOW_SUCCESS_RATE = 0.5      # Below 50% considered unreliable
 MAX_PROBES_PER_PATH = 100   # Max probes to track per path
 PROBE_STALENESS_HOURS = 24  # Probes older than this are stale
+
+# Centrality-aware routing (Use Case 7)
+CENTRALITY_WEIGHT_IN_ROUTING = 0.15  # 15% weight for centrality in route score
+HIGH_CENTRALITY_ROUTING_BONUS = 1.2  # 20% bonus for paths with high-centrality members
+MIN_CENTRALITY_FOR_FALLBACK = 0.4    # Minimum centrality to consider for fallback paths
 
 
 @dataclass
@@ -49,6 +55,9 @@ class RouteSuggestion:
     confidence: float
     last_successful_probe: int
     hive_hop_count: int  # Number of hive members in path
+    # Centrality-aware routing (Use Case 7)
+    path_centrality_score: float = 0.0  # Average centrality of hive members in path
+    is_high_centrality_path: bool = False  # True if path includes high-centrality members
 
 
 @dataclass
@@ -569,19 +578,54 @@ class HiveRoutingMap:
 
         return 0.0  # No data
 
+    def _get_path_centrality_score(
+        self,
+        path: List[str],
+        hive_members: set
+    ) -> Tuple[float, bool]:
+        """
+        Calculate centrality score for a routing path.
+
+        Returns:
+            Tuple of (average_centrality, is_high_centrality)
+        """
+        calculator = network_metrics.get_calculator()
+        if not calculator:
+            return 0.0, False
+
+        centrality_scores = []
+        for hop in path:
+            if hop in hive_members:
+                metrics = calculator.get_member_metrics(hop)
+                if metrics:
+                    centrality_scores.append(metrics.hive_centrality)
+
+        if not centrality_scores:
+            return 0.0, False
+
+        avg_centrality = sum(centrality_scores) / len(centrality_scores)
+        is_high = max(centrality_scores) >= 0.6  # High if any hop has centrality >= 0.6
+
+        return avg_centrality, is_high
+
     def get_best_route_to(
         self,
         destination: str,
         amount_sats: int,
-        hive_members: set = None
+        hive_members: set = None,
+        use_centrality_scoring: bool = True
     ) -> Optional[RouteSuggestion]:
         """
         Get best known route to destination based on collective probes.
+
+        Now includes centrality-aware scoring (Use Case 7) to prefer
+        paths through well-connected hive members.
 
         Args:
             destination: Target node pubkey
             amount_sats: Amount to route
             hive_members: Set of hive member pubkeys (for bonus calculation)
+            use_centrality_scoring: If True, include centrality in scoring
 
         Returns:
             RouteSuggestion if found, None otherwise
@@ -624,6 +668,11 @@ class HiveRoutingMap:
             # Calculate confidence
             confidence = self.get_path_confidence(list(path))
 
+            # Calculate path centrality (Use Case 7)
+            path_centrality, is_high_centrality = self._get_path_centrality_score(
+                list(path), hive_members
+            )
+
             candidates.append(RouteSuggestion(
                 destination=destination,
                 path=list(path),
@@ -632,7 +681,9 @@ class HiveRoutingMap:
                 success_rate=success_rate,
                 confidence=confidence,
                 last_successful_probe=stats.last_success_time,
-                hive_hop_count=hive_hop_count
+                hive_hop_count=hive_hop_count,
+                path_centrality_score=path_centrality,
+                is_high_centrality_path=is_high_centrality
             ))
 
         if not candidates:
@@ -649,12 +700,131 @@ class HiveRoutingMap:
             # Prefer paths through hive members (0 fee hops)
             hive_bonus = 0.1 * route.hive_hop_count
 
+            # Centrality bonus (Use Case 7)
+            centrality_bonus = 0.0
+            if use_centrality_scoring and route.path_centrality_score > 0:
+                centrality_bonus = route.path_centrality_score * CENTRALITY_WEIGHT_IN_ROUTING
+                if route.is_high_centrality_path:
+                    centrality_bonus *= HIGH_CENTRALITY_ROUTING_BONUS
+
             # Confidence multiplier
             confidence_mult = 0.5 + (route.confidence * 0.5)
 
-            return (success_score * 0.4 + fee_score * 0.4 + hive_bonus * 0.2) * confidence_mult
+            # Adjust weights to include centrality
+            if use_centrality_scoring:
+                return (
+                    success_score * 0.35 +
+                    fee_score * 0.35 +
+                    hive_bonus * 0.15 +
+                    centrality_bonus
+                ) * confidence_mult
+            else:
+                return (
+                    success_score * 0.4 +
+                    fee_score * 0.4 +
+                    hive_bonus * 0.2
+                ) * confidence_mult
 
         return max(candidates, key=score_route)
+
+    def get_fallback_routes(
+        self,
+        destination: str,
+        failed_path: List[str],
+        amount_sats: int,
+        hive_members: set = None,
+        limit: int = 3
+    ) -> List[RouteSuggestion]:
+        """
+        Get fallback routes when a primary path fails.
+
+        Prioritizes paths through high-centrality hive members that
+        don't include the failed path's hops.
+
+        Args:
+            destination: Target node pubkey
+            failed_path: The path that failed
+            amount_sats: Amount to route
+            hive_members: Set of hive member pubkeys
+            limit: Maximum number of fallback routes to return
+
+        Returns:
+            List of alternative RouteSuggestion sorted by quality
+        """
+        if hive_members is None:
+            hive_members = set()
+
+        failed_set = set(failed_path)
+        candidates = []
+
+        for (dest, path), stats in self._path_stats.items():
+            if dest != destination:
+                continue
+
+            if stats.probe_count == 0:
+                continue
+
+            # Skip paths that overlap with failed path (except destination)
+            path_set = set(path)
+            if path_set & failed_set:  # Any overlap
+                continue
+
+            success_rate = stats.success_count / stats.probe_count
+
+            # For fallbacks, we might accept slightly lower success rates
+            if success_rate < LOW_SUCCESS_RATE * 0.8:  # 40% threshold for fallbacks
+                continue
+
+            if stats.avg_capacity_sats > 0 and stats.avg_capacity_sats < amount_sats:
+                continue
+
+            if stats.success_count > 0:
+                avg_latency = stats.total_latency_ms // stats.success_count
+                avg_fee = stats.total_fee_ppm // stats.success_count
+            else:
+                avg_latency = 0
+                avg_fee = 0
+
+            hive_hop_count = sum(1 for hop in path if hop in hive_members)
+            path_centrality, is_high_centrality = self._get_path_centrality_score(
+                list(path), hive_members
+            )
+
+            # For fallbacks, strongly prefer high-centrality paths
+            if path_centrality < MIN_CENTRALITY_FOR_FALLBACK and hive_hop_count > 0:
+                continue
+
+            candidates.append(RouteSuggestion(
+                destination=destination,
+                path=list(path),
+                expected_fee_ppm=avg_fee,
+                expected_latency_ms=avg_latency,
+                success_rate=success_rate,
+                confidence=self.get_path_confidence(list(path)),
+                last_successful_probe=stats.last_success_time,
+                hive_hop_count=hive_hop_count,
+                path_centrality_score=path_centrality,
+                is_high_centrality_path=is_high_centrality
+            ))
+
+        # Score with heavy emphasis on centrality for fallbacks
+        def score_fallback(route: RouteSuggestion) -> float:
+            success_score = route.success_rate
+            fee_score = 1.0 / (1 + route.expected_fee_ppm / 1000)
+
+            # Heavily weight centrality for fallback routes
+            centrality_score = route.path_centrality_score
+            if route.is_high_centrality_path:
+                centrality_score *= 1.5
+
+            return (
+                success_score * 0.3 +
+                fee_score * 0.2 +
+                centrality_score * 0.5  # 50% weight for centrality in fallbacks
+            )
+
+        candidates.sort(key=score_fallback, reverse=True)
+        return candidates[:limit]
 
     def get_routes_to(
         self,
