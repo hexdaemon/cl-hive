@@ -468,12 +468,17 @@ class ProactiveAdvisor:
             try:
                 history = await self.mcp.call(
                     "settlement_history",
-                    {"node": node_name, "limit": 5}
+                    {"node": node_name, "limit": 10}
                 )
-                settled_periods = [
-                    p.get("period") for p in history.get("settlement_periods", [])
-                    if p.get("status") == "completed"
-                ]
+                # Convert settlement timestamps to ISO week periods
+                # settlement_history returns period_id (int), not period (YYYY-WW)
+                # so we calculate the period from end_time
+                settled_periods = []
+                for p in history.get("settlement_periods", []):
+                    if p.get("status") == "completed" and p.get("end_time"):
+                        end_dt = datetime.fromtimestamp(p["end_time"])
+                        week_period = f"{end_dt.year}-{end_dt.isocalendar()[1]:02d}"
+                        settled_periods.append(week_period)
             except Exception:
                 settled_periods = []
 

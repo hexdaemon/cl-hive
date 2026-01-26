@@ -11973,6 +11973,25 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
         response["message"] = f"Dry run - {len(payments)} payments would be executed"
         return response
 
+    # CRITICAL: Check if this ISO week was already settled to prevent duplicates
+    # This is a safety check - the advisor should also prevent duplicates
+    from datetime import datetime
+    now = datetime.now()
+    current_week = f"{now.year}-{now.isocalendar()[1]:02d}"
+
+    existing_periods = settlement_mgr.get_settlement_history(limit=10)
+    for p in existing_periods:
+        if p.get("status") == "completed" and p.get("end_time"):
+            end_dt = datetime.fromtimestamp(p["end_time"])
+            settled_week = f"{end_dt.year}-{end_dt.isocalendar()[1]:02d}"
+            if settled_week == current_week:
+                return {
+                    "error": "duplicate_settlement",
+                    "message": f"Week {current_week} was already settled (period_id={p['period_id']})",
+                    "existing_period_id": p["period_id"],
+                    "settled_at": p.get("settled_at")
+                }
+
     # Check if we have any payments to execute
     if not payments:
         response["execution_status"] = "no_payments"
