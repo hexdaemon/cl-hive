@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
+from . import network_metrics
+
 
 # =============================================================================
 # CONSTANTS
@@ -46,6 +48,11 @@ CIRCULAR_FLOW_RATIO_THRESHOLD = 0.8  # 80% flow ratio indicates circular
 
 # Rebalance outcome tracking
 REBALANCE_HISTORY_HOURS = 72        # Track rebalances for 72 hours
+
+# Rebalance hub scoring (Use Case 5)
+HIGH_HUB_SCORE_THRESHOLD = 0.6      # Score above this is "high" hub potential
+PREFER_HUB_SCORE_BONUS = 1.2        # 20% preference bonus for high-hub peers
+HUB_SCORE_WEIGHT_IN_PATH = 0.3      # 30% weight for hub score in path selection
 
 
 # =============================================================================
@@ -80,8 +87,14 @@ class RebalanceRecommendation:
     estimated_fleet_cost_sats: int = 0
     estimated_external_cost_sats: int = 0
 
+    # Rebalance hub info (Use Case 5)
+    peer_hub_score: float = 0.0
+    is_high_hub: bool = False
+    preferred_hub_member: Optional[str] = None
+    hub_member_score: float = 0.0
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "channel_id": self.channel_id,
             "peer_id": self.peer_id,
             "direction": self.direction,
@@ -97,6 +110,14 @@ class RebalanceRecommendation:
             "estimated_fleet_cost_sats": self.estimated_fleet_cost_sats,
             "estimated_external_cost_sats": self.estimated_external_cost_sats
         }
+        # Include hub info if relevant
+        if self.is_high_hub or self.preferred_hub_member:
+            result["peer_hub_score"] = round(self.peer_hub_score, 3)
+            result["is_high_hub"] = self.is_high_hub
+            if self.preferred_hub_member:
+                result["preferred_hub_member"] = self.preferred_hub_member
+                result["hub_member_score"] = round(self.hub_member_score, 3)
+        return result
 
 
 @dataclass
@@ -637,6 +658,283 @@ class FleetRebalanceRouter:
             return None
         except Exception:
             return None
+
+    # =========================================================================
+    # REBALANCE HUB SCORING (Use Case 5)
+    # =========================================================================
+
+    def get_member_hub_scores(self) -> Dict[str, float]:
+        """
+        Get rebalance hub scores for all fleet members.
+
+        High hub scores indicate members that are well-connected
+        within the hive and optimal for routing liquidity.
+
+        Returns:
+            Dict mapping member_id to hub_score (0.0-1.0)
+        """
+        calculator = network_metrics.get_calculator()
+        if not calculator:
+            return {}
+
+        hub_scores = {}
+        members = self._get_fleet_members()
+
+        for member_id in members:
+            metrics = calculator.get_member_metrics(member_id)
+            if metrics:
+                hub_scores[member_id] = metrics.rebalance_hub_score
+            else:
+                hub_scores[member_id] = 0.0
+
+        return hub_scores
+
+    def get_optimal_rebalance_hubs(self, min_score: float = HIGH_HUB_SCORE_THRESHOLD) -> List[Dict[str, Any]]:
+        """
+        Find members with high rebalance hub scores.
+
+        These members are optimal intermediaries for fleet-internal
+        rebalancing due to their central position in the hive topology.
+
+        Args:
+            min_score: Minimum hub score to include (default: 0.6)
+
+        Returns:
+            List of hub members with scores, sorted by score descending
+        """
+        hub_scores = self.get_member_hub_scores()
+
+        hubs = []
+        for member_id, score in hub_scores.items():
+            if score >= min_score:
+                hubs.append({
+                    "member_id": member_id,
+                    "hub_score": round(score, 3),
+                    "is_high_hub": score >= HIGH_HUB_SCORE_THRESHOLD
+                })
+
+        # Sort by score descending
+        hubs.sort(key=lambda h: h["hub_score"], reverse=True)
+        return hubs
+
+    def _score_path_with_hub_bonus(self, path: List[str], amount_sats: int) -> float:
+        """
+        Score a fleet path considering hub scores of members.
+
+        Higher hub scores along the path indicate better routing efficiency.
+
+        Args:
+            path: List of member pubkeys in the path
+            amount_sats: Amount being routed
+
+        Returns:
+            Combined score (lower is better for routing)
+        """
+        if not path:
+            return float('inf')
+
+        hub_scores = self.get_member_hub_scores()
+
+        # Base cost component
+        cost = self._estimate_fleet_cost(amount_sats, len(path))
+        cost_score = cost / max(1, amount_sats)  # Normalize to 0-1ish
+
+        # Hub score component (average hub score along path)
+        path_hub_scores = [hub_scores.get(m, 0.0) for m in path]
+        avg_hub_score = sum(path_hub_scores) / len(path_hub_scores) if path_hub_scores else 0.0
+
+        # Higher hub score = better, so invert for "lower is better" scoring
+        hub_penalty = 1.0 - avg_hub_score
+
+        # Combined score: weighted average
+        combined = (1 - HUB_SCORE_WEIGHT_IN_PATH) * cost_score + HUB_SCORE_WEIGHT_IN_PATH * hub_penalty
+
+        return combined
+
+    def find_hub_aware_fleet_path(
+        self,
+        from_peer: str,
+        to_peer: str,
+        amount_sats: int
+    ) -> Optional[FleetPath]:
+        """
+        Find a fleet path that prefers high-hub-score members.
+
+        This is an enhanced version of find_fleet_path that considers
+        rebalance hub scores when selecting the path.
+
+        Args:
+            from_peer: Source peer
+            to_peer: Destination peer
+            amount_sats: Amount to rebalance
+
+        Returns:
+            FleetPath optimized for hub routing, or None
+        """
+        topology = self._get_fleet_topology()
+        members = set(topology.keys())
+
+        if not members:
+            return None
+
+        # Find all candidate paths (limit search to reasonable depth)
+        all_paths = self._find_all_fleet_paths(from_peer, to_peer, max_depth=4)
+
+        if not all_paths:
+            # Fall back to regular path finding
+            return self.find_fleet_path(from_peer, to_peer, amount_sats)
+
+        # Score each path with hub bonus
+        scored_paths = []
+        for path in all_paths:
+            score = self._score_path_with_hub_bonus(path, amount_sats)
+            scored_paths.append((path, score))
+
+        # Sort by score (lower is better)
+        scored_paths.sort(key=lambda x: x[1])
+
+        # Return best path
+        best_path = scored_paths[0][0]
+        hub_scores = self.get_member_hub_scores()
+        avg_hub = sum(hub_scores.get(m, 0.0) for m in best_path) / len(best_path)
+
+        return FleetPath(
+            path=best_path,
+            hops=len(best_path),
+            estimated_cost_sats=self._estimate_fleet_cost(amount_sats, len(best_path)),
+            estimated_time_seconds=30 * len(best_path),
+            reliability_score=max(0.5, min(0.95, 0.8 + avg_hub * 0.2))  # Hub score boosts reliability
+        )
+
+    def _find_all_fleet_paths(
+        self,
+        from_peer: str,
+        to_peer: str,
+        max_depth: int = 4
+    ) -> List[List[str]]:
+        """
+        Find all fleet paths between peers up to max_depth.
+
+        Returns multiple paths for hub-aware selection.
+        """
+        topology = self._get_fleet_topology()
+        all_paths = []
+
+        # Find members connected to from_peer
+        start_members = []
+        for member, peers in topology.items():
+            if from_peer in peers:
+                start_members.append(member)
+
+        if not start_members:
+            return []
+
+        # Find members connected to to_peer
+        end_members = set()
+        for member, peers in topology.items():
+            if to_peer in peers:
+                end_members.add(member)
+
+        if not end_members:
+            return []
+
+        # DFS to find all paths
+        def dfs(current: str, path: List[str], visited: Set[str]):
+            if len(path) > max_depth:
+                return
+
+            if current in end_members:
+                all_paths.append(list(path))
+                return
+
+            current_peers = topology.get(current, set())
+            for member, member_peers in topology.items():
+                if member not in visited and member != current:
+                    # Check if connected
+                    if current_peers & member_peers:
+                        visited.add(member)
+                        path.append(member)
+                        dfs(member, path, visited)
+                        path.pop()
+                        visited.discard(member)
+
+        # Search from each start member
+        for start in start_members:
+            dfs(start, [start], {start})
+
+        return all_paths
+
+    def get_hub_enhanced_rebalance_path(
+        self,
+        from_channel: str,
+        to_channel: str,
+        amount_sats: int
+    ) -> Dict[str, Any]:
+        """
+        Get rebalance path recommendation with hub optimization.
+
+        Enhanced version of get_best_rebalance_path that considers
+        rebalance hub scores for optimal liquidity routing.
+
+        Args:
+            from_channel: Source channel SCID
+            to_channel: Destination channel SCID
+            amount_sats: Amount to rebalance
+
+        Returns:
+            Dict with path recommendation including hub info
+        """
+        result = {
+            "fleet_path_available": False,
+            "fleet_path": [],
+            "estimated_fleet_cost_sats": 0,
+            "estimated_external_cost_sats": self._estimate_external_cost(amount_sats),
+            "savings_pct": 0,
+            "recommendation": "use_external_path",
+            # Hub info (Use Case 5)
+            "hub_optimized": False,
+            "path_avg_hub_score": 0.0,
+            "preferred_hub_member": None
+        }
+
+        from_peer = self._get_peer_for_channel(from_channel)
+        to_peer = self._get_peer_for_channel(to_channel)
+
+        if not from_peer or not to_peer:
+            return result
+
+        # Try hub-aware path finding
+        fleet_path = self.find_hub_aware_fleet_path(from_peer, to_peer, amount_sats)
+
+        if fleet_path:
+            result["fleet_path_available"] = True
+            result["fleet_path"] = fleet_path.path
+            result["estimated_fleet_cost_sats"] = fleet_path.estimated_cost_sats
+            result["hub_optimized"] = True
+
+            # Calculate path hub score
+            hub_scores = self.get_member_hub_scores()
+            path_hub_scores = [hub_scores.get(m, 0.0) for m in fleet_path.path]
+            avg_hub = sum(path_hub_scores) / len(path_hub_scores) if path_hub_scores else 0.0
+            result["path_avg_hub_score"] = round(avg_hub, 3)
+
+            # Identify best hub in path
+            if path_hub_scores:
+                best_hub_idx = path_hub_scores.index(max(path_hub_scores))
+                result["preferred_hub_member"] = fleet_path.path[best_hub_idx]
+
+            # Calculate savings
+            external_cost = result["estimated_external_cost_sats"]
+            fleet_cost = fleet_path.estimated_cost_sats
+
+            if external_cost > 0:
+                savings = (external_cost - fleet_cost) / external_cost
+                result["savings_pct"] = round(savings * 100, 1)
+
+                if savings >= FLEET_PATH_SAVINGS_THRESHOLD:
+                    result["recommendation"] = "use_fleet_path"
+
+        return result
 
 
 # =============================================================================
