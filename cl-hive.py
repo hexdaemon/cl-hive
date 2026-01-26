@@ -37,7 +37,7 @@ import signal
 import threading
 import time
 import secrets
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
 from pyln.client import Plugin, RpcError
 
