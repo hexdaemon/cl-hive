@@ -99,10 +99,18 @@ class HiveDatabase:
                 uptime_pct REAL DEFAULT 0.0,
                 vouch_count INTEGER DEFAULT 0,
                 last_seen INTEGER,
-                metadata TEXT
+                metadata TEXT,
+                addresses TEXT
             )
         """)
-        
+        # Add addresses column if upgrading from older schema
+        try:
+            conn.execute(
+                "ALTER TABLE hive_members ADD COLUMN addresses TEXT"
+            )
+        except Exception:
+            pass  # Column already exists
+
         # =====================================================================
         # INTENT LOCKS TABLE
         # =====================================================================
@@ -1071,12 +1079,12 @@ class HiveDatabase:
     def update_member(self, peer_id: str, **kwargs) -> bool:
         """
         Update member fields.
-        
-        Allowed fields: tier, contribution_ratio, uptime_pct, vouch_count, 
-                       last_seen, promoted_at, metadata
+
+        Allowed fields: tier, contribution_ratio, uptime_pct, vouch_count,
+                       last_seen, promoted_at, metadata, addresses
         """
         allowed = {'tier', 'contribution_ratio', 'uptime_pct', 'vouch_count',
-                   'last_seen', 'promoted_at', 'metadata'}
+                   'last_seen', 'promoted_at', 'metadata', 'addresses'}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         
         if not updates:

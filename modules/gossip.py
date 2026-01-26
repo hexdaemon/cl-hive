@@ -211,7 +211,8 @@ class GossipManager:
                                available_sats: int, fee_policy: Dict[str, Any],
                                topology: List[str],
                                budget_available_sats: int = 0,
-                               budget_reserved_until: int = 0) -> Dict[str, Any]:
+                               budget_reserved_until: int = 0,
+                               addresses: List[str] = None) -> Dict[str, Any]:
         """
         Create a gossip payload for broadcast.
 
@@ -225,6 +226,7 @@ class GossipManager:
             topology: List of external peer connections
             budget_available_sats: Budget-constrained spendable liquidity
             budget_reserved_until: Timestamp when budget hold expires (0 if none)
+            addresses: List of our node's connection addresses (e.g., ["1.2.3.4:9735", "xyz.onion:9735"])
 
         Returns:
             Dict payload ready for GOSSIP message serialization
@@ -268,6 +270,8 @@ class GossipManager:
             "budget_available_sats": budget_available_sats,
             "budget_reserved_until": budget_reserved_until,
             "budget_last_update": now,
+            # Connection addresses for auto-connect (Issue #38)
+            "addresses": addresses or [],
         }
     
     # =========================================================================

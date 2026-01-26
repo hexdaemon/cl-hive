@@ -2102,6 +2102,16 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: GOSSIP accepted from {sender_id[:16]}...{relay_info} "
                    f"(v{payload.get('version', '?')})", level='debug')
 
+        # Store addresses for auto-connect (Issue #38)
+        addresses = payload.get("addresses", [])
+        if addresses and database:
+            # Store as JSON string
+            import json
+            database.update_member(sender_id, addresses=json.dumps(addresses))
+
+        # Auto-connect to member if not already connected (Issue #38)
+        _try_auto_connect(sender_id, addresses)
+
     # RELAY: Forward to other members if TTL allows
     relay_count = _relay_message(HiveMessageType.GOSSIP, payload, peer_id)
     if relay_count > 0:
@@ -2289,6 +2299,7 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
 
         tier = member_info.get("tier", "neophyte")
         joined_at = member_info.get("joined_at", int(time.time()))
+        addresses = member_info.get("addresses", [])
 
         # Validate tier value (2-tier system: member or neophyte)
         if tier not in ("member", "neophyte"):
@@ -2300,8 +2311,17 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
                 tier=tier,
                 joined_at=joined_at
             )
+            # Store addresses if provided (Issue #38)
+            if addresses:
+                import json
+                database.update_member(member_peer_id, addresses=json.dumps(addresses))
+
             added += 1
             plugin.log(f"cl-hive: Added member {member_peer_id[:16]}... ({tier}) from sync")
+
+            # Auto-connect to new member (Issue #38)
+            _try_auto_connect(member_peer_id, addresses)
+
         except Exception as e:
             plugin.log(f"cl-hive: Failed to add synced member: {e}", level='warn')
 
@@ -2313,20 +2333,32 @@ def _create_membership_payload() -> list:
     Create membership list for inclusion in FULL_SYNC.
 
     Returns:
-        List of member dicts with peer_id, tier, joined_at
+        List of member dicts with peer_id, tier, joined_at, addresses
     """
     if not database:
         return []
 
     members = database.get_all_members()
-    return [
-        {
+    result = []
+    for m in members:
+        member_dict = {
             "peer_id": m["peer_id"],
             "tier": m.get("tier", "neophyte"),
             "joined_at": m.get("joined_at", 0)
         }
-        for m in members
-    ]
+        # Include addresses if available (Issue #38)
+        addresses_json = m.get("addresses")
+        if addresses_json:
+            try:
+                import json
+                member_dict["addresses"] = json.loads(addresses_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # For our own entry, use current addresses
+        if m["peer_id"] == our_pubkey:
+            member_dict["addresses"] = _get_our_addresses()
+        result.append(member_dict)
+    return result
 
 
 def _create_signed_full_sync_msg() -> Optional[bytes]:
@@ -2394,8 +2426,84 @@ def _create_signed_state_hash_msg() -> Optional[bytes]:
     return serialize(HiveMessageType.STATE_HASH, state_hash_payload)
 
 
+def _get_our_addresses() -> List[str]:
+    """
+    Get our node's connection addresses from getinfo.
+
+    Returns:
+        List of connection strings like ["1.2.3.4:9735", "xyz.onion:9735"]
+    """
+    if not safe_plugin:
+        return []
+
+    try:
+        info = safe_plugin.rpc.getinfo()
+        addresses = []
+        for addr in info.get("address", []):
+            addr_type = addr.get("type", "")
+            addr_str = addr.get("address", "")
+            port = addr.get("port", 9735)
+            if addr_str and addr_type in ("ipv4", "ipv6", "torv3"):
+                addresses.append(f"{addr_str}:{port}")
+        return addresses
+    except Exception:
+        return []
+
+
+def _is_peer_connected(peer_id: str) -> bool:
+    """Check if we're already connected to a peer."""
+    if not safe_plugin:
+        return False
+    try:
+        peers = safe_plugin.rpc.listpeers(peer_id).get("peers", [])
+        return len(peers) > 0 and peers[0].get("connected", False)
+    except Exception:
+        return False
+
+
+def _try_auto_connect(peer_id: str, addresses: List[str]) -> bool:
+    """
+    Attempt to auto-connect to a hive member if not already connected.
+
+    This enables automatic mesh formation when new members join via gossip.
+    (Issue #38: Auto-connect hive members on join)
+
+    Args:
+        peer_id: The member's public key
+        addresses: List of connection strings like ["1.2.3.4:9735", "xyz.onion:9735"]
+
+    Returns:
+        True if connection was established or already exists, False otherwise
+    """
+    if not safe_plugin or not peer_id or peer_id == our_pubkey:
+        return False
+
+    # Skip if no addresses provided
+    if not addresses:
+        return False
+
+    # Check if already connected
+    if _is_peer_connected(peer_id):
+        return True
+
+    # Try each address until one succeeds
+    for addr in addresses:
+        try:
+            connect_str = f"{peer_id}@{addr}"
+            safe_plugin.rpc.connect(connect_str)
+            plugin.log(f"cl-hive: Auto-connected to hive member {peer_id[:16]}... via {addr}", level='info')
+            return True
+        except Exception as e:
+            # Log at debug level - connection failures are common (firewalls, NAT, etc.)
+            plugin.log(f"cl-hive: Auto-connect to {peer_id[:16]}... via {addr} failed: {e}", level='debug')
+            continue
+
+    return False
+
+
 def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
-                               fee_policy: Dict, topology: list) -> Optional[bytes]:
+                               fee_policy: Dict, topology: list,
+                               addresses: List[str] = None) -> Optional[bytes]:
     """
     Create a signed GOSSIP message for broadcast.
 
@@ -2408,6 +2516,7 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
         available_sats: Available outbound liquidity
         fee_policy: Current fee policy dict
         topology: List of external peer connections
+        addresses: List of our connection addresses for auto-connect
 
     Returns:
         Serialized and signed GOSSIP message, or None if signing fails
@@ -2421,7 +2530,8 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
         capacity_sats=capacity_sats,
         available_sats=available_sats,
         fee_policy=fee_policy,
-        topology=topology
+        topology=topology,
+        addresses=addresses or []
     )
 
     # Add sender identification for signature verification
@@ -6787,6 +6897,50 @@ def process_ready_intents():
 # PHASE 5: MEMBERSHIP MAINTENANCE LOOP
 # =============================================================================
 
+def _auto_connect_to_all_members() -> int:
+    """
+    Ensure we're connected to all hive members (Issue #38).
+
+    Called periodically to maintain full mesh connectivity.
+
+    Returns:
+        Number of new connections established
+    """
+    if not database or not safe_plugin:
+        return 0
+
+    members = database.get_all_members()
+    connected = 0
+
+    for member in members:
+        member_peer_id = member.get("peer_id")
+        if not member_peer_id or member_peer_id == our_pubkey:
+            continue
+
+        # Skip if already connected
+        if _is_peer_connected(member_peer_id):
+            continue
+
+        # Get addresses from database
+        addresses = []
+        addresses_json = member.get("addresses")
+        if addresses_json:
+            try:
+                import json
+                addresses = json.loads(addresses_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if not addresses:
+            continue
+
+        # Try to connect
+        if _try_auto_connect(member_peer_id, addresses):
+            connected += 1
+
+    return connected
+
+
 def membership_maintenance_loop():
     """
     Periodic pruning of membership-related data.
@@ -6797,6 +6951,7 @@ def membership_maintenance_loop():
     - Stale presence data
     - Old planner logs (> 30 days)
     - Expired/completed pending actions (> 7 days)
+    - Auto-connect to disconnected hive members (Issue #38)
     """
     MAINTENANCE_INTERVAL = 3600  # seconds
     PRESENCE_WINDOW_SECONDS = 30 * 86400
@@ -6818,6 +6973,12 @@ def membership_maintenance_loop():
                 database.cleanup_expired_actions()  # Mark expired as 'expired'
                 database.prune_planner_logs(older_than_days=30)
                 database.prune_old_actions(older_than_days=7)
+
+                # Issue #38: Auto-connect to hive members we're not connected to
+                reconnected = _auto_connect_to_all_members()
+                if reconnected > 0 and safe_plugin:
+                    safe_plugin.log(f"Auto-connected to {reconnected} hive member(s)", level='info')
+
         except Exception as e:
             if safe_plugin:
                 safe_plugin.log(f"Membership maintenance error: {e}", level='warn')
@@ -7598,12 +7759,14 @@ def gossip_loop():
             )
 
             if should_broadcast:
-                # Step 5: Create signed GOSSIP message
+                # Step 5: Create signed GOSSIP message (with addresses for auto-connect)
+                our_addresses = _get_our_addresses()
                 gossip_msg = _create_signed_gossip_msg(
                     capacity_sats=hive_capacity_sats,
                     available_sats=hive_available_sats,
                     fee_policy=fee_policy,
-                    topology=external_peers
+                    topology=external_peers,
+                    addresses=our_addresses
                 )
 
                 if gossip_msg:
