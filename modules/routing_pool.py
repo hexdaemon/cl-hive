@@ -638,20 +638,75 @@ class RoutingPool:
         """
         Get position metrics for a member.
 
+        Calculates:
+        - centrality: Approximated betweenness centrality based on topology size
+                     and connectivity relative to fleet average
+        - unique_peers: Number of external peers only this member connects to
+        - bridge_score: Ratio of unique peers to total peers (bridge function)
+
         Returns:
             (centrality, unique_peers, bridge_score)
         """
-        # TODO: Implement actual calculation using network graph
-        # For now, return defaults
         centrality = 0.01  # Default low centrality
         unique_peers = 0
         bridge_score = 0.0
 
-        if self.state_manager:
-            state = self.state_manager.get_peer_state(member_id)
-            if state:
-                topology = getattr(state, 'topology', []) or []
-                unique_peers = len(topology)
+        if not self.state_manager:
+            return (centrality, unique_peers, bridge_score)
+
+        # Get this member's topology
+        state = self.state_manager.get_peer_state(member_id)
+        if not state:
+            return (centrality, unique_peers, bridge_score)
+
+        member_topology = set(getattr(state, 'topology', []) or [])
+        if not member_topology:
+            return (centrality, unique_peers, bridge_score)
+
+        # Collect all other members' topologies to find unique peers
+        all_members = self.db.get_all_members() if self.db else []
+        other_members_peers = set()
+        total_fleet_peers = set()
+        topology_sizes = []
+
+        for member in all_members:
+            other_id = member.get('peer_id')
+            if not other_id:
+                continue
+
+            other_state = self.state_manager.get_peer_state(other_id)
+            if not other_state:
+                continue
+
+            other_topology = set(getattr(other_state, 'topology', []) or [])
+            total_fleet_peers.update(other_topology)
+            topology_sizes.append(len(other_topology))
+
+            if other_id != member_id:
+                other_members_peers.update(other_topology)
+
+        # Calculate unique peers (peers only this member connects to)
+        unique_peer_set = member_topology - other_members_peers
+        unique_peers = len(unique_peer_set)
+
+        # Calculate bridge score (ratio of unique to total connections)
+        # Higher = more "bridge-like" - connecting otherwise disconnected parts
+        if len(member_topology) > 0:
+            bridge_score = min(1.0, unique_peers / len(member_topology))
+
+        # Approximate betweenness centrality:
+        # - Based on topology size relative to fleet average
+        # - Members with more connections are likely more central
+        # - Weighted by unique peer contribution (bridges have higher centrality)
+        if topology_sizes:
+            avg_topology_size = sum(topology_sizes) / len(topology_sizes)
+            if avg_topology_size > 0:
+                # Base centrality from relative connectivity
+                relative_connectivity = len(member_topology) / avg_topology_size
+                # Boost for unique peer connections (bridge function)
+                bridge_boost = 1.0 + (bridge_score * 0.5)
+                # Normalize to typical centrality range (0.001 - 0.1)
+                centrality = min(MAX_CENTRALITY, 0.01 * relative_connectivity * bridge_boost)
 
         return (centrality, unique_peers, bridge_score)
 
@@ -659,20 +714,91 @@ class RoutingPool:
         """
         Get operations metrics for a member.
 
+        Calculates:
+        - success_rate: Estimated from contribution ratio and uptime
+                       (nodes that forward more with high uptime are reliable)
+        - response_time_ms: Estimated from uptime (high uptime = likely responsive)
+
+        Note: Without explicit HTLC success/failure tracking, we approximate
+        using available proxy metrics. Future enhancement could add actual
+        timing data from forward events.
+
         Returns:
             (success_rate, response_time_ms)
         """
-        # TODO: Implement actual calculation from forwarding stats
-        # For now, return good defaults
+        # Default values (good baseline)
         success_rate = 0.95
         response_time_ms = 50.0
 
+        # Get member data for uptime
+        member = self.db.get_member(member_id) if self.db else None
+        uptime_pct = 1.0
+        if member:
+            uptime_pct = member.get('uptime_pct', 1.0)
+            # Handle percentage stored as 0-100 vs 0-1
+            if uptime_pct > 1.0:
+                uptime_pct = uptime_pct / 100.0
+
+        # Get contribution stats as proxy for routing reliability
+        contribution_ratio = 1.0
+        total_forwarded = 0
+        if self.db:
+            try:
+                stats = self.db.get_contribution_stats(member_id, window_days=30)
+                forwarded = stats.get('forwarded', 0)
+                received = stats.get('received', 0)
+                total_forwarded = forwarded
+                if received > 0:
+                    contribution_ratio = forwarded / received
+            except Exception:
+                pass
+
+        # Estimate success rate:
+        # - Base rate from uptime (offline nodes can't succeed)
+        # - Boost for good contribution ratio (active routing = working node)
+        # - Cap at TARGET_SUCCESS_RATE (0.95)
+        base_success = uptime_pct * 0.9  # Uptime contributes 90% of base
+
+        # Contribution bonus: nodes that forward a lot are likely reliable
+        # Scale: ratio of 1.0+ is good, higher is better, cap bonus at 10%
+        contrib_bonus = min(0.10, (min(contribution_ratio, 2.0) - 0.5) * 0.1)
+
+        success_rate = min(TARGET_SUCCESS_RATE, base_success + contrib_bonus)
+        success_rate = max(0.5, success_rate)  # Floor at 50%
+
+        # Estimate response time:
+        # - High uptime suggests well-maintained, fast node
+        # - Active routing (high forwarded volume) suggests responsive
+        # - Scale from 20ms (best) to 200ms (worst) based on metrics
+        if uptime_pct >= 0.99:
+            # Excellent uptime = likely fast
+            response_time_ms = 30.0
+        elif uptime_pct >= 0.95:
+            # Good uptime
+            response_time_ms = 50.0
+        elif uptime_pct >= 0.90:
+            # Acceptable uptime
+            response_time_ms = 80.0
+        else:
+            # Lower uptime = assume slower
+            response_time_ms = 120.0
+
+        # Adjust for routing activity (active nodes are tuned)
+        if total_forwarded > 1000000:  # >1M sats forwarded
+            response_time_ms = max(20.0, response_time_ms - 20.0)
+        elif total_forwarded > 100000:  # >100k sats
+            response_time_ms = max(20.0, response_time_ms - 10.0)
+
+        # Check health aggregator for additional signals
         if self.health_aggregator:
             try:
                 health = self.health_aggregator.get_member_health(member_id)
                 if health:
-                    # Extract from health data if available
-                    pass
+                    # If health data includes success metrics, use them
+                    if 'success_rate' in health:
+                        success_rate = health['success_rate']
+                    if 'avg_response_ms' in health:
+                        response_time_ms = health['avg_response_ms']
             except Exception:
                 pass
 
