@@ -33,7 +33,7 @@ if [[ -f "$DOCKER_DIR/.env" ]]; then
 fi
 
 # Configuration
-BACKUP_LOCATION="${BACKUP_LOCATION:-/backups}"
+BACKUP_LOCATION="${BACKUP_LOCATION:-./backups}"
 BACKUP_RETENTION="${BACKUP_RETENTION:-30}"
 BACKUP_ENCRYPTION="${BACKUP_ENCRYPTION:-true}"
 GPG_KEY_ID="${GPG_KEY_ID:-}"
@@ -137,7 +137,12 @@ backup_hsm_secret() {
     mkdir -p "$hsm_dir"
 
     # Copy hsm_secret from container
-    docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/hsm_secret" "$hsm_dir/hsm_secret"
+    # CLN creates network subdir inside LIGHTNING_DIR, so path is $NETWORK/$NETWORK
+    docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/$NETWORK/hsm_secret" "$hsm_dir/hsm_secret"
+
+    # Fix ownership (docker cp creates files as root)
+    sudo chown "$USER:$USER" "$hsm_dir/hsm_secret"
+    chmod 600 "$hsm_dir/hsm_secret"
 
     # Create checksum
     sha256sum "$hsm_dir/hsm_secret" > "$hsm_dir/hsm_secret.sha256"
@@ -174,6 +179,9 @@ backup_database() {
     # Copy database backups if they exist
     docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/lightningd.sqlite3-wal" "$db_dir/" 2>/dev/null || true
     docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/lightningd.sqlite3-shm" "$db_dir/" 2>/dev/null || true
+
+    # Fix ownership (docker cp creates files as root)
+    sudo chown -R "$USER:$USER" "$db_dir/"
 
     # Copy plugin databases (cl-hive and cl-revenue-ops)
     log "Backing up plugin databases..."
@@ -220,6 +228,9 @@ backup_config() {
     # Copy hive database
     docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/cl-hive.db" "$config_dir/" 2>/dev/null || true
 
+    # Fix ownership (docker cp creates files as root)
+    sudo chown -R "$USER:$USER" "$config_dir/" 2>/dev/null || true
+
     # Compress
     tar -czf "$BACKUP_DIR/config.tar.gz" -C "$BACKUP_DIR" config
     rm -rf "$config_dir"
@@ -239,6 +250,9 @@ backup_channel_state() {
 
     # Copy gossip store
     docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/gossip_store" "$channels_dir/" 2>/dev/null || true
+
+    # Fix ownership (docker cp creates files as root)
+    sudo chown -R "$USER:$USER" "$channels_dir/" 2>/dev/null || true
 
     # Compress
     tar -czf "$BACKUP_DIR/channels.tar.gz" -C "$BACKUP_DIR" channels
