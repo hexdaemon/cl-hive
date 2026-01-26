@@ -15,7 +15,7 @@ Author: Lightning Goats Team
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 # =============================================================================
 # CONSTANTS
@@ -78,18 +78,21 @@ class GossipManager:
     """
     
     def __init__(self, state_manager, plugin=None,
-                 heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL):
+                 heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL,
+                 get_membership_hash: Optional[Callable[[], str]] = None):
         """
         Initialize the GossipManager.
-        
+
         Args:
             state_manager: StateManager instance for state updates
             plugin: Optional plugin reference for logging
             heartbeat_interval: Seconds between forced heartbeat broadcasts
+            get_membership_hash: Optional callback to get membership hash for sync
         """
         self.state_manager = state_manager
         self.plugin = plugin
         self.heartbeat_interval = heartbeat_interval
+        self.get_membership_hash = get_membership_hash
 
         # Track our last broadcast state
         self._last_broadcast_state = GossipState()
@@ -326,49 +329,82 @@ class GossipManager:
     def create_state_hash_payload(self) -> Dict[str, Any]:
         """
         Create a STATE_HASH message payload for anti-entropy check.
-        
+
         Sent on peer connection to detect state divergence.
-        
+        Includes both fleet hash (gossip state) and membership hash (tiers).
+
         Returns:
-            Dict with fleet_hash and metadata
+            Dict with fleet_hash, membership_hash and metadata
         """
         fleet_hash = self.state_manager.calculate_fleet_hash()
         stats = self.state_manager.get_fleet_stats()
-        
-        return {
+
+        payload = {
             "fleet_hash": fleet_hash,
             "peer_count": stats['peer_count'],
             "timestamp": int(time.time())
         }
+
+        # Include membership hash if available
+        if self.get_membership_hash:
+            try:
+                payload["membership_hash"] = self.get_membership_hash()
+            except Exception as e:
+                self._log(f"Failed to get membership hash: {e}", "warn")
+
+        return payload
     
     def process_state_hash(self, sender_id: str, payload: Dict[str, Any]) -> bool:
         """
         Process an incoming STATE_HASH message.
-        
-        Compares remote hash against local and determines if
-        FULL_SYNC is needed.
-        
+
+        Compares remote hashes against local and determines if
+        FULL_SYNC is needed. Checks both fleet hash (gossip state)
+        and membership hash (tiers).
+
         Args:
             sender_id: Public key of the sending node
             payload: STATE_HASH payload
-            
+
         Returns:
-            True if hashes match (no sync needed), False if diverged
+            True if all hashes match (no sync needed), False if any diverged
         """
-        remote_hash = payload.get('fleet_hash', '')
+        remote_fleet_hash = payload.get('fleet_hash', '')
+        remote_membership_hash = payload.get('membership_hash', '')
         remote_count = payload.get('peer_count', 0)
-        
-        local_hash = self.state_manager.calculate_fleet_hash()
+
+        local_fleet_hash = self.state_manager.calculate_fleet_hash()
         local_stats = self.state_manager.get_fleet_stats()
-        
-        if local_hash == remote_hash:
+
+        # Get local membership hash if available
+        local_membership_hash = ''
+        if self.get_membership_hash:
+            try:
+                local_membership_hash = self.get_membership_hash()
+            except Exception as e:
+                self._log(f"Failed to get membership hash: {e}", "warn")
+
+        # Check fleet hash
+        fleet_match = (local_fleet_hash == remote_fleet_hash)
+
+        # Check membership hash (only if both sides have it)
+        membership_match = True
+        if local_membership_hash and remote_membership_hash:
+            membership_match = (local_membership_hash == remote_membership_hash)
+
+        if fleet_match and membership_match:
             self._log(f"State hash match with {sender_id[:16]}... "
                      f"({local_stats['peer_count']} peers)")
             return True
         else:
-            self._log(f"State hash MISMATCH with {sender_id[:16]}...: "
-                     f"local={local_hash[:16]}... ({local_stats['peer_count']} peers), "
-                     f"remote={remote_hash[:16]}... ({remote_count} peers)")
+            mismatch_type = []
+            if not fleet_match:
+                mismatch_type.append("fleet")
+            if not membership_match:
+                mismatch_type.append("membership")
+            self._log(f"State hash MISMATCH ({', '.join(mismatch_type)}) with {sender_id[:16]}...: "
+                     f"local_fleet={local_fleet_hash[:16]}..., "
+                     f"remote_fleet={remote_fleet_hash[:16]}... ({remote_count} peers)")
             return False
     
     # =========================================================================

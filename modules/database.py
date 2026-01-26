@@ -18,6 +18,7 @@ import os
 import time
 import json
 import threading
+import hashlib
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
@@ -1075,7 +1076,34 @@ class HiveDatabase:
             "SELECT * FROM hive_members ORDER BY tier, joined_at"
         ).fetchall()
         return [dict(row) for row in rows]
-    
+
+    def get_membership_hash(self) -> str:
+        """
+        Calculate deterministic hash of membership state.
+
+        Includes peer_id and tier for each member, sorted by peer_id.
+        Used to detect membership divergence between nodes and trigger
+        FULL_SYNC when tiers differ.
+
+        Returns:
+            Hex-encoded SHA256 hash of membership state
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT peer_id, tier FROM hive_members ORDER BY peer_id"
+        ).fetchall()
+
+        # Build list of (peer_id, tier) tuples
+        member_tuples = [(row['peer_id'], row['tier']) for row in rows]
+
+        # Serialize to canonical JSON
+        json_str = json.dumps(member_tuples, sort_keys=True, separators=(',', ':'))
+
+        # Calculate SHA256
+        hash_hex = hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
+        return hash_hex
+
     def update_member(self, peer_id: str, **kwargs) -> bool:
         """
         Update member fields.

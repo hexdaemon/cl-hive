@@ -1032,9 +1032,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize gossip manager (Phase 2)
     gossip_mgr = GossipManager(
-        state_manager, 
-        safe_plugin, 
-        heartbeat_interval=config.heartbeat_interval
+        state_manager,
+        safe_plugin,
+        heartbeat_interval=config.heartbeat_interval,
+        get_membership_hash=database.get_membership_hash
     )
     plugin.log("cl-hive: Gossip manager initialized")
     
