@@ -40,6 +40,10 @@ MAX_FEE_POLICY_KEYS = 20
 # DATA CLASSES
 # =============================================================================
 
+# Capability constants for version-aware feature negotiation
+CAPABILITY_MCF = "mcf"  # Min-Cost Max-Flow optimization support
+
+
 @dataclass
 class GossipState:
     """
@@ -56,6 +60,7 @@ class GossipState:
     version: int = 0
     budget_available_sats: int = 0
     budget_reserved_until: int = 0
+    capabilities: List[str] = field(default_factory=list)
 
 
 # =============================================================================
@@ -215,7 +220,8 @@ class GossipManager:
                                topology: List[str],
                                budget_available_sats: int = 0,
                                budget_reserved_until: int = 0,
-                               addresses: List[str] = None) -> Dict[str, Any]:
+                               addresses: List[str] = None,
+                               capabilities: List[str] = None) -> Dict[str, Any]:
         """
         Create a gossip payload for broadcast.
 
@@ -230,12 +236,17 @@ class GossipManager:
             budget_available_sats: Budget-constrained spendable liquidity
             budget_reserved_until: Timestamp when budget hold expires (0 if none)
             addresses: List of our node's connection addresses (e.g., ["1.2.3.4:9735", "xyz.onion:9735"])
+            capabilities: List of supported capabilities (e.g., ["mcf"] for MCF optimization)
 
         Returns:
             Dict payload ready for GOSSIP message serialization
         """
         now = int(time.time())
         new_version = self._last_broadcast_state.version + 1
+
+        # Default capabilities include MCF support (this node has it)
+        if capabilities is None:
+            capabilities = [CAPABILITY_MCF]
 
         # Update our tracking state
         self._last_broadcast_state = GossipState(
@@ -247,6 +258,7 @@ class GossipManager:
             version=new_version,
             budget_available_sats=budget_available_sats,
             budget_reserved_until=budget_reserved_until,
+            capabilities=capabilities.copy(),
         )
 
         # Also update the state manager with our local state
@@ -275,6 +287,8 @@ class GossipManager:
             "budget_last_update": now,
             # Connection addresses for auto-connect (Issue #38)
             "addresses": addresses or [],
+            # Capabilities for version-aware feature negotiation (Phase 15)
+            "capabilities": capabilities,
         }
     
     # =========================================================================

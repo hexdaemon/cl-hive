@@ -64,6 +64,7 @@ class HivePeerState:
         fees_forward_count: Number of forwards in current period
         fees_period_start: Start of current fee reporting period
         fees_last_report: Timestamp of last fee report received
+        capabilities: List of supported capabilities (e.g., ["mcf"] for MCF optimization)
     """
     peer_id: str
     capacity_sats: int
@@ -81,6 +82,8 @@ class HivePeerState:
     fees_forward_count: int = 0
     fees_period_start: int = 0
     fees_last_report: int = 0
+    # Capabilities for version-aware feature negotiation (e.g., ["mcf"])
+    capabilities: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -114,6 +117,9 @@ class HivePeerState:
         fees_period_start = data.get("fees_period_start", 0)
         fees_last_report = data.get("fees_last_report", 0)
 
+        # Capabilities (optional, backward compatible - old nodes have no capabilities)
+        capabilities = data.get("capabilities", [])
+
         return cls(
             peer_id=peer_id,
             capacity_sats=capacity_sats,
@@ -130,6 +136,7 @@ class HivePeerState:
             fees_forward_count=fees_forward_count,
             fees_period_start=fees_period_start,
             fees_last_report=fees_last_report,
+            capabilities=capabilities,
         )
     
     def to_hash_tuple(self) -> Dict[str, Any]:

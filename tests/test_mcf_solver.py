@@ -90,12 +90,20 @@ class MockStateManager:
     def get_all_peer_states(self):
         return list(self.peer_states.values())
 
-    def set_peer_state(self, peer_id, capacity=0, topology=None):
+    def set_peer_state(self, peer_id, capacity=0, topology=None, capabilities=None):
         state = MagicMock()
         state.peer_id = peer_id
         state.capacity_sats = capacity
         state.topology = topology or []
+        state.capabilities = capabilities if capabilities is not None else ["mcf"]
         self.peer_states[peer_id] = state
+
+    def set_mcf_capable(self, peer_id, capable=True):
+        """Set MCF capability for a peer (for testing version-aware election)."""
+        if peer_id in self.peer_states:
+            self.peer_states[peer_id].capabilities = ["mcf"] if capable else []
+        else:
+            self.set_peer_state(peer_id, capabilities=["mcf"] if capable else [])
 
 
 class MockLiquidityCoordinator:
@@ -580,7 +588,7 @@ class TestMCFCoordinator:
     """Test MCFCoordinator class."""
 
     def test_elect_coordinator(self):
-        """Test coordinator election (lexicographic lowest)."""
+        """Test coordinator election (lexicographic lowest among MCF-capable)."""
         plugin = MockPlugin()
         database = MockDatabase()
         state_manager = MockStateManager()
@@ -593,6 +601,11 @@ class TestMCFCoordinator:
             {"peer_id": "02" + "c" * 64},
         ]
 
+        # Set MCF capability for all members (version-aware election)
+        state_manager.set_mcf_capable("02" + "a" * 64, True)
+        state_manager.set_mcf_capable("02" + "b" * 64, True)
+        state_manager.set_mcf_capable("02" + "c" * 64, True)
+
         coordinator = MCFCoordinator(
             plugin=plugin,
             database=database,
@@ -603,8 +616,40 @@ class TestMCFCoordinator:
 
         elected = coordinator.elect_coordinator()
 
-        # Should be lexicographically lowest
+        # Should be lexicographically lowest among MCF-capable
         assert elected == "02" + "a" * 64
+
+    def test_elect_coordinator_skips_non_mcf_capable(self):
+        """Test that election skips members without MCF capability."""
+        plugin = MockPlugin()
+        database = MockDatabase()
+        state_manager = MockStateManager()
+        liquidity_coordinator = MockLiquidityCoordinator()
+
+        # Add members
+        database.members = [
+            {"peer_id": "02" + "a" * 64},  # Lowest but NOT MCF-capable
+            {"peer_id": "02" + "b" * 64},  # MCF-capable
+            {"peer_id": "02" + "c" * 64},  # MCF-capable
+        ]
+
+        # Only b and c are MCF-capable
+        state_manager.set_mcf_capable("02" + "a" * 64, False)
+        state_manager.set_mcf_capable("02" + "b" * 64, True)
+        state_manager.set_mcf_capable("02" + "c" * 64, True)
+
+        coordinator = MCFCoordinator(
+            plugin=plugin,
+            database=database,
+            state_manager=state_manager,
+            liquidity_coordinator=liquidity_coordinator,
+            our_pubkey="02" + "d" * 64
+        )
+
+        elected = coordinator.elect_coordinator()
+
+        # Should skip "a" (not MCF-capable) and elect "b"
+        assert elected == "02" + "b" * 64
 
     def test_is_coordinator(self):
         """Test is_coordinator check."""
@@ -617,6 +662,10 @@ class TestMCFCoordinator:
             {"peer_id": "02" + "b" * 64},
             {"peer_id": "02" + "c" * 64},
         ]
+
+        # Set MCF capability for members
+        state_manager.set_mcf_capable("02" + "b" * 64, True)
+        state_manager.set_mcf_capable("02" + "c" * 64, True)
 
         # Our pubkey is lexicographically lowest
         coordinator = MCFCoordinator(
@@ -727,6 +776,9 @@ class TestMCFCoordinator:
         liquidity_coordinator = MockLiquidityCoordinator()
 
         database.members = [{"peer_id": "02" + "a" * 64}]
+
+        # Set MCF capability for the member
+        state_manager.set_mcf_capable("02" + "a" * 64, True)
 
         coordinator = MCFCoordinator(
             plugin=plugin,
@@ -1688,12 +1740,17 @@ class TestMCFCoordinationProtocol:
         state_manager = MockStateManager()
         liquidity_coordinator = MockLiquidityCoordinator()
 
-        # Setup fleet members (B < A < C lexicographically)
+        # Setup fleet members (A < B < C lexicographically)
         database.members = [
-            {"peer_id": "02" + "b" * 64},  # Lowest
-            {"peer_id": "02" + "a" * 64},
+            {"peer_id": "02" + "b" * 64},
+            {"peer_id": "02" + "a" * 64},  # Lowest
             {"peer_id": "02" + "c" * 64},
         ]
+
+        # Set MCF capability for all members (version-aware election)
+        state_manager.set_mcf_capable("02" + "a" * 64, True)
+        state_manager.set_mcf_capable("02" + "b" * 64, True)
+        state_manager.set_mcf_capable("02" + "c" * 64, True)
 
         # Create coordinator from different perspectives
         coord_a = MCFCoordinator(
@@ -1720,13 +1777,13 @@ class TestMCFCoordinationProtocol:
             our_pubkey="02" + "c" * 64
         )
 
-        # All should elect same coordinator (lexicographically lowest)
+        # All should elect same coordinator (lexicographically lowest among MCF-capable)
         elected_by_a = coord_a.elect_coordinator()
         elected_by_b = coord_b.elect_coordinator()
         elected_by_c = coord_c.elect_coordinator()
 
         assert elected_by_a == elected_by_b == elected_by_c
-        # 02aaa... < 02bbb... lexicographically
+        # 02aaa... < 02bbb... < 02ccc... lexicographically
         assert elected_by_a == "02" + "a" * 64
 
     def test_full_coordination_cycle(self):

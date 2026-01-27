@@ -1051,12 +1051,13 @@ class MCFCoordinator:
 
     def elect_coordinator(self) -> str:
         """
-        Elect coordinator using lexicographic lowest pubkey.
+        Elect coordinator using lexicographic lowest pubkey among MCF-capable members.
 
-        Simple deterministic election - all nodes agree without communication.
+        Only considers members that have advertised MCF capability via gossip.
+        Falls back to our own node if no MCF-capable members found.
 
         Returns:
-            Pubkey of elected coordinator
+            Pubkey of elected coordinator (MCF-capable member with lowest pubkey)
         """
         members = self.database.get_all_members() if self.database else []
         member_ids = [m.get("peer_id") for m in members if m.get("peer_id")]
@@ -1064,12 +1065,42 @@ class MCFCoordinator:
         if not member_ids:
             return self.our_pubkey
 
-        # Include ourselves
+        # Include ourselves (we always have MCF capability since we're running this code)
         if self.our_pubkey not in member_ids:
             member_ids.append(self.our_pubkey)
 
-        # Lexicographic lowest wins
-        return min(member_ids)
+        # Filter to only MCF-capable members
+        mcf_capable_ids = []
+        for member_id in member_ids:
+            if member_id == self.our_pubkey:
+                # We have MCF capability (running this code proves it)
+                mcf_capable_ids.append(member_id)
+            elif self.state_manager:
+                # Check peer's advertised capabilities from gossip
+                peer_state = self.state_manager.get_peer_state(member_id)
+                if peer_state:
+                    capabilities = getattr(peer_state, 'capabilities', [])
+                    if 'mcf' in capabilities:
+                        mcf_capable_ids.append(member_id)
+                # If no peer state, member hasn't gossiped recently - exclude from election
+            # If no state_manager, can't check capabilities - exclude
+
+        if not mcf_capable_ids:
+            # No MCF-capable members found, fall back to ourselves
+            self._log("No MCF-capable members found, using self as coordinator", level="debug")
+            return self.our_pubkey
+
+        # Lexicographic lowest among MCF-capable members wins
+        elected = min(mcf_capable_ids)
+
+        if len(mcf_capable_ids) < len(member_ids):
+            self._log(
+                f"MCF coordinator election: {len(mcf_capable_ids)}/{len(member_ids)} "
+                f"members are MCF-capable, elected {elected[:16]}...",
+                level="debug"
+            )
+
+        return elected
 
     def is_coordinator(self) -> bool:
         """Check if we are the elected coordinator."""
