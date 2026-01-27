@@ -133,19 +133,26 @@ restart_plugin() {
     log_step "Restarting $plugin_name plugin..."
 
     # Try to stop the plugin gracefully
-    if docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" plugin stop "$plugin_path" 2>/dev/null; then
+    local stop_output
+    stop_output=$(docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" plugin stop "$plugin_path" 2>&1)
+    if [ $? -eq 0 ]; then
         log_info "Stopped $plugin_name"
         sleep 1
     else
         log_warn "Failed to stop $plugin_name (may not be running)"
     fi
 
-    # Start the plugin
-    if docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" plugin start "$plugin_path" 2>/dev/null; then
+    # Start the plugin (show errors for debugging)
+    local start_output
+    start_output=$(docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" plugin start "$plugin_path" 2>&1)
+    local start_result=$?
+
+    if [ $start_result -eq 0 ]; then
         log_info "Started $plugin_name"
         return 0
     else
         log_error "Failed to start $plugin_name"
+        echo "$start_output" | head -20
         return 1
     fi
 }
