@@ -160,7 +160,7 @@ RUN git clone --depth 1 --branch ${CLN_REST_VERSION} https://github.com/Ride-The
 # =============================================================================
 
 # Clone from GitHub (previously bundled in vendor/)
-ARG CL_REVENUE_OPS_VERSION=v2.1.1
+ARG CL_REVENUE_OPS_VERSION=v2.2.0
 RUN git clone --depth 1 --branch ${CL_REVENUE_OPS_VERSION} https://github.com/lightning-goats/cl_revenue_ops.git /opt/cl-revenue-ops \
     && chmod +x /opt/cl-revenue-ops/cl-revenue-ops.py
 
