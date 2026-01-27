@@ -65,6 +65,31 @@ This surfaces insights like:
 - Where you have concentration risk (highly correlated channels)
 - How to allocate liquidity for maximum risk-adjusted return
 
+### The Routing Pool: Collective Revenue Sharing
+
+This is a new concept for Lightning: **pooled routing revenue with weighted distribution**.
+
+Here's the problem with traditional routing: one node might have perfectly positioned liquidity that enables a route, but a different node in the path actually earns the fee. The node providing the strategic position gets nothing. Over time, this creates misaligned incentives—why maintain expensive liquidity positions if someone else captures the value?
+
+The hive solves this with a **Routing Pool**. Members contribute to a collective revenue pool, and distributions are calculated based on weighted contributions:
+
+| Factor | Weight | What It Measures |
+|--------|--------|------------------|
+| **Capital** | 70% | Liquidity committed to fleet channels |
+| **Operations** | 10% | Uptime, reliability, responsiveness |
+| **Position** | 20% | Strategic value of your network position |
+
+At the end of each period, pool revenue is distributed proportionally. A node with great positioning but modest capital still earns from routes it helped enable. A node with large capital but poor positioning earns less than raw capacity would suggest.
+
+**Why this matters:**
+
+- **Aligned incentives**: Everyone benefits when the fleet succeeds
+- **Fair compensation**: Strategic positioning is rewarded, not just raw capital
+- **Reduced competition**: Members cooperate to maximize pool revenue rather than competing for individual fees
+- **Smoothed returns**: High-variance routing income becomes more predictable
+
+The pool is transparent—every member can see contributions, revenue, and distributions. Settlement happens on a configurable schedule (weekly by default). No trust required: it's math, not promises.
+
 ---
 
 ## The Technical Stack
@@ -180,14 +205,50 @@ Open channels to one or more of our fleet members:
 
 ### Step 2: Install the Plugins
 
-Clone the repositories:
+#### Option A: Docker (Easiest)
+
+Spin up a complete node with all plugins pre-configured in minutes:
 
 ```bash
 git clone https://github.com/lightning-goats/cl-hive
-git clone https://github.com/lightning-goats/cl_revenue_ops
+cd cl-hive/docker
+cp .env.example .env        # Edit with your settings
+docker-compose up -d
 ```
 
-Follow the setup guides in each repo. The plugins work with Core Lightning v23.05+.
+That's it. You get Core Lightning, cl-hive, cl-revenue-ops, and all dependencies in a single container. Hot upgrades are simple:
+
+```bash
+./scripts/hot-upgrade.sh
+```
+
+#### Option B: Manual Installation
+
+For existing Core Lightning nodes (v23.05+):
+
+```bash
+# Clone the plugins
+git clone https://github.com/lightning-goats/cl-hive
+git clone https://github.com/lightning-goats/cl_revenue_ops
+
+# Install dependencies
+pip install pyln-client>=24.0
+
+# Copy plugins to your CLN plugin directory
+cp cl-hive/cl-hive.py ~/.lightning/plugins/
+cp -r cl-hive/modules ~/.lightning/plugins/cl-hive-modules
+cp cl_revenue_ops/cl-revenue-ops.py ~/.lightning/plugins/
+cp -r cl_revenue_ops/modules ~/.lightning/plugins/cl-revenue-ops-modules
+
+# Enable in your config (~/.lightning/config)
+echo "plugin=/home/YOUR_USER/.lightning/plugins/cl-hive.py" >> ~/.lightning/config
+echo "plugin=/home/YOUR_USER/.lightning/plugins/cl-revenue-ops.py" >> ~/.lightning/config
+
+# Restart lightningd
+lightning-cli stop && lightningd
+```
+
+**Note:** cl-revenue-ops requires the [sling](https://github.com/daywalker90/sling) plugin for rebalancing.
 
 ### Step 3: Request an Invite
 
