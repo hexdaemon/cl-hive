@@ -100,7 +100,7 @@ Both plugins are written in Python for Core Lightning:
 - PKI authentication using CLN's HSM (no external crypto libraries)
 - Gossip protocol with anti-entropy (consistent fleet state)
 - Intent Lock protocol (prevents "thundering herd" race conditions)
-- Membership tiers (Admin → Member → Neophyte)
+- Membership tiers (Member → Neophyte with algorithmic promotion)
 - Topology planning and expansion coordination
 - Splice coordination between members
 
@@ -141,11 +141,7 @@ The hive uses a three-tier membership system:
 - Full participation in fee coordination
 - Push and pull rebalancing privileges
 - Voting rights on governance decisions
-
-**Admin** (Fleet Operators)
 - Can invite new members
-- Manages fleet topology decisions
-- Sets governance parameters
 
 Promotion from Neophyte to Member is algorithmic—based on uptime, contribution ratio, and topological value. No politics, no favoritism. Prove your value and you're promoted automatically.
 
