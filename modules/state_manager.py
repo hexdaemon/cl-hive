@@ -16,7 +16,7 @@ Author: Lightning Goats Team
 import hashlib
 import json
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional, Tuple
 
 # =============================================================================
