@@ -1,24 +1,31 @@
 # cl-hive Production Node - Docker Compose
 #
-# Usage:
-#   1. Run ./setup.sh for interactive configuration, OR
-#   2. Copy .env.example to .env and configure manually
-#   3. docker-compose up -d
-#   4. docker-compose logs -f
+# Quick Start:
+#   1. Clone both repos side by side:
+#        git clone https://github.com/lightning-goats/cl-hive.git
+#        git clone https://github.com/lightning-goats/cl_revenue_ops.git
+#   2. cd cl-hive/docker
+#   3. cp .env.example .env && nano .env  # Configure Bitcoin RPC, etc.
+#   4. docker-compose up -d
 #
-# Production deployment:
-#   ./setup.sh                     # Interactive wizard
-#   docker-compose up -d           # Start with production settings
+# Hot Upgrades (no rebuild needed):
+#   ./scripts/hot-upgrade.sh       # Pull latest code and restart plugins
 #
 # Access lightning-cli:
 #   docker-compose exec cln lightning-cli getinfo
+#
+# IMPORTANT: Both cl-hive and cl_revenue_ops are mounted from the host.
+# This enables hot upgrades. The directory structure should be:
+#   parent/
+#     cl-hive/          <- this repo
+#     cl_revenue_ops/   <- clone from GitHub
 
 services:
   cln:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: cl-hive-node:2.0.0
+    image: cl-hive-node:2.2.1
     container_name: cl-hive-node
     restart: unless-stopped
 
@@ -110,15 +117,21 @@ services:
       # Custom configs (optional)
       - ${CUSTOM_CONFIG_PATH:-./config}:/etc/lightning/custom:ro
 
-      # Development mounts (optional - allows fixes without rebuilding)
-      # Comment these out for production to use baked-in versions
+      # Infrastructure scripts (optional overrides)
       - ./docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
       - ./supervisord.conf:/etc/supervisor/conf.d/supervisord.conf:ro
 
-      # cl-hive plugin mount (for development - updates without rebuild)
-      - ../cl-hive.py:/opt/cl-hive/cl-hive.py:ro
-      - ../modules:/opt/cl-hive/modules:ro
-      - ../cl-hive.conf.sample:/etc/lightning/cl-hive.conf:ro
+      # =================================================================
+      # PLUGIN MOUNTS - Required for hot upgrades via ./scripts/hot-upgrade.sh
+      # These mount the git repos so updates can be pulled without rebuilding.
+      # =================================================================
+
+      # cl-hive (coordination layer)
+      - ..:/opt/cl-hive:ro
+
+      # cl-revenue-ops (execution layer) - clone it next to cl-hive:
+      #   git clone https://github.com/lightning-goats/cl_revenue_ops.git ../cl_revenue_ops
+      - ../../cl_revenue_ops:/opt/cl-revenue-ops:ro
 
       # bitcoin-cli mount (needed when build fails to download from bitcoincore.org)
       # Copy your host's bitcoin-cli first: cp /usr/local/bin/bitcoin-cli ./bitcoin-cli

@@ -158,8 +158,10 @@ RUN git clone --depth 1 --branch ${CLN_REST_VERSION} https://github.com/Ride-The
 # =============================================================================
 # CL-REVENUE-OPS PLUGIN
 # =============================================================================
+# Fallback: Clone from GitHub if not mounted from host.
+# For hot upgrades, mount from host in docker-compose.yml:
+#   - /path/to/cl_revenue_ops:/opt/cl-revenue-ops:ro
 
-# Clone from GitHub (previously bundled in vendor/)
 ARG CL_REVENUE_OPS_VERSION=v2.2.1
 RUN git clone --depth 1 --branch ${CL_REVENUE_OPS_VERSION} https://github.com/lightning-goats/cl_revenue_ops.git /opt/cl-revenue-ops \
     && chmod +x /opt/cl-revenue-ops/cl-revenue-ops.py
@@ -167,6 +169,10 @@ RUN git clone --depth 1 --branch ${CL_REVENUE_OPS_VERSION} https://github.com/li
 # =============================================================================
 # CL-HIVE PLUGIN
 # =============================================================================
+# Fallback: Copy files if not mounted from host.
+# For hot upgrades, mount from host in docker-compose.yml:
+#   - /path/to/cl-hive:/opt/cl-hive:ro
+# When mounted, the host's git repo enables ./scripts/hot-upgrade.sh
 
 COPY . /opt/cl-hive
 RUN chmod +x /opt/cl-hive/cl-hive.py
