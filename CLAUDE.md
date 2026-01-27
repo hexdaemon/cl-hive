@@ -57,6 +57,7 @@ Core Lightning
 | `mcf_solver.py` | Min-Cost Max-Flow solver for global fleet rebalance optimization |
 | `liquidity_coordinator.py` | Liquidity needs aggregation and rebalance assignment distribution |
 | `cost_reduction.py` | Fleet rebalance routing with MCF/BFS fallback |
+| `anticipatory_manager.py` | Kalman-filtered flow prediction, intra-day pattern detection |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
 | `database.py` | SQLite with WAL mode, thread-local connections |
 

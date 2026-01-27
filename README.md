@@ -45,7 +45,10 @@ Health monitoring and liquidity needs detection across the fleet.
 Automated splice operations between hive members with full PSBT exchange workflow. Resize channels without closing them - splice-in to add capacity, splice-out to remove.
 
 ### Min-Cost Max-Flow Optimization (MCF)
-Global fleet-wide rebalancing optimization using Successive Shortest Paths algorithm. Automatically prefers zero-fee hive internal channels, prevents circular flows, and coordinates simultaneous rebalances across the fleet with version-aware coordinator election.
+Global fleet-wide rebalancing optimization using Successive Shortest Paths algorithm. Automatically prefers zero-fee hive internal channels, prevents circular flows, and coordinates simultaneous rebalances across the fleet with version-aware coordinator election and staleness-based failover.
+
+### Anticipatory Liquidity Management
+Predictive liquidity positioning using Kalman-filtered flow velocity estimation and intra-day pattern detection. Detects temporal patterns (surge, drain, quiet periods) and recommends proactive rebalancing before demand spikes.
 
 ### VPN Transport Support
 Optional WireGuard VPN integration for secure fleet communication.
