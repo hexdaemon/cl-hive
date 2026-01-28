@@ -1018,6 +1018,7 @@ class HiveDatabase:
                 period_start INTEGER NOT NULL,
                 period_end INTEGER NOT NULL,
                 received_at INTEGER NOT NULL,
+                rebalance_costs_sats INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (peer_id, period)
             )
         """)
@@ -1025,6 +1026,13 @@ class HiveDatabase:
             CREATE INDEX IF NOT EXISTS idx_fee_reports_period
             ON fee_reports(period)
         """)
+        # Add rebalance_costs_sats column if upgrading from older schema
+        try:
+            conn.execute(
+                "ALTER TABLE fee_reports ADD COLUMN rebalance_costs_sats INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass  # Column already exists
 
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
@@ -5303,7 +5311,8 @@ class HiveDatabase:
         fees_earned_sats: int,
         forward_count: int,
         period_start: int,
-        period_end: int
+        period_end: int,
+        rebalance_costs_sats: int = 0
     ) -> bool:
         """
         Save or update a fee report from a hive member.
@@ -5318,6 +5327,7 @@ class HiveDatabase:
             forward_count: Number of forwards in the period
             period_start: Period start timestamp
             period_end: Period end timestamp (report time)
+            rebalance_costs_sats: Rebalancing costs in the period
 
         Returns:
             True if saved successfully
@@ -5329,15 +5339,16 @@ class HiveDatabase:
             conn.execute("""
                 INSERT INTO fee_reports
                 (peer_id, period, fees_earned_sats, forward_count,
-                 period_start, period_end, received_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                 period_start, period_end, received_at, rebalance_costs_sats)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(peer_id, period) DO UPDATE SET
                     fees_earned_sats = excluded.fees_earned_sats,
                     forward_count = excluded.forward_count,
                     period_end = excluded.period_end,
-                    received_at = excluded.received_at
+                    received_at = excluded.received_at,
+                    rebalance_costs_sats = excluded.rebalance_costs_sats
             """, (peer_id, period, fees_earned_sats, forward_count,
-                  period_start, period_end, now))
+                  period_start, period_end, now, rebalance_costs_sats))
             return True
         except Exception as e:
             self.plugin.log(f"HiveDatabase: Failed to save fee report: {e}", level='warn')
@@ -5351,12 +5362,12 @@ class HiveDatabase:
             period: Settlement period (YYYY-WW format)
 
         Returns:
-            List of fee report dicts with peer_id, fees_earned_sats, etc.
+            List of fee report dicts with peer_id, fees_earned_sats, rebalance_costs_sats, etc.
         """
         conn = self._get_connection()
         rows = conn.execute("""
             SELECT peer_id, fees_earned_sats, forward_count,
-                   period_start, period_end, received_at
+                   period_start, period_end, received_at, rebalance_costs_sats
             FROM fee_reports
             WHERE period = ?
             ORDER BY peer_id
@@ -5373,7 +5384,7 @@ class HiveDatabase:
         conn = self._get_connection()
         rows = conn.execute("""
             SELECT f1.peer_id, f1.period, f1.fees_earned_sats, f1.forward_count,
-                   f1.period_start, f1.period_end, f1.received_at
+                   f1.period_start, f1.period_end, f1.received_at, f1.rebalance_costs_sats
             FROM fee_reports f1
             INNER JOIN (
                 SELECT peer_id, MAX(received_at) as max_received

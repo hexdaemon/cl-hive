@@ -2820,7 +2820,8 @@ def create_fee_report(
     period_start: int,
     period_end: int,
     forward_count: int,
-    signature: str
+    signature: str,
+    rebalance_costs_sats: int = 0
 ) -> bytes:
     """
     Create a FEE_REPORT message to broadcast fee earnings.
@@ -2835,6 +2836,7 @@ def create_fee_report(
         period_end: Unix timestamp of period end (current time)
         forward_count: Number of forwards completed
         signature: zbase-encoded signature of the fee report payload
+        rebalance_costs_sats: Rebalancing costs in the period (for net profit settlement)
 
     Returns:
         Serialized FEE_REPORT message
@@ -2842,6 +2844,7 @@ def create_fee_report(
     payload = {
         "peer_id": peer_id,
         "fees_earned_sats": fees_earned_sats,
+        "rebalance_costs_sats": rebalance_costs_sats,
         "period_start": period_start,
         "period_end": period_end,
         "forward_count": forward_count,
@@ -2856,7 +2859,8 @@ def get_fee_report_signing_payload(
     fees_earned_sats: int,
     period_start: int,
     period_end: int,
-    forward_count: int
+    forward_count: int,
+    rebalance_costs_sats: int = 0
 ) -> str:
     """
     Get the canonical payload for signing a fee report.
@@ -2867,9 +2871,36 @@ def get_fee_report_signing_payload(
         period_start: Period start timestamp
         period_end: Period end timestamp
         forward_count: Number of forwards
+        rebalance_costs_sats: Rebalancing costs in the period
 
     Returns:
         String to be signed with signmessage()
+    """
+    # Include costs in signed payload for verification
+    return f"fee_report:{peer_id}:{fees_earned_sats}:{rebalance_costs_sats}:{period_start}:{period_end}:{forward_count}"
+
+
+def get_fee_report_signing_payload_legacy(
+    peer_id: str,
+    fees_earned_sats: int,
+    period_start: int,
+    period_end: int,
+    forward_count: int
+) -> str:
+    """
+    Get the legacy signing payload (without costs) for backward compatibility.
+
+    Used to verify signatures from old nodes that don't include rebalance_costs.
+
+    Args:
+        peer_id: Member's node public key
+        fees_earned_sats: Cumulative fees earned
+        period_start: Period start timestamp
+        period_end: Period end timestamp
+        forward_count: Number of forwards
+
+    Returns:
+        String in legacy format for signature verification
     """
     return f"fee_report:{peer_id}:{fees_earned_sats}:{period_start}:{period_end}:{forward_count}"
 
@@ -2904,6 +2935,13 @@ def validate_fee_report(payload: Dict[str, Any]) -> bool:
         return False
     if not isinstance(payload["signature"], str):
         return False
+
+    # Optional field validation: rebalance_costs_sats (backward compat - defaults to 0)
+    if "rebalance_costs_sats" in payload:
+        if not isinstance(payload["rebalance_costs_sats"], int):
+            return False
+        if payload["rebalance_costs_sats"] < 0:
+            return False
 
     # Bounds checks
     if len(payload["peer_id"]) > MAX_PEER_ID_LEN:

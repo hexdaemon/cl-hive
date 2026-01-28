@@ -638,3 +638,203 @@ class TestAntiGaming:
 
         assert is_suspect is True
         assert is_high_risk is True
+
+
+# =============================================================================
+# NET PROFIT SETTLEMENT TESTS (Issue #42)
+# =============================================================================
+
+class TestNetProfitSettlement:
+    """Tests for net profit settlement (Issue #42).
+
+    Settlement now uses net_profit = fees_earned - rebalance_costs instead of
+    gross fees. This ensures members who spend heavily on rebalancing don't
+    subsidize those who don't.
+    """
+
+    def test_net_profit_calculation(self):
+        """Verify net profit = fees - costs with proper capping."""
+        # Member earns 1000 sats, spends 300 on rebalancing
+        contrib = MemberContribution(
+            peer_id='02' + 'a' * 64,
+            capacity_sats=1_000_000,
+            forwards_sats=500_000,
+            fees_earned_sats=1000,
+            rebalance_costs_sats=300,
+            uptime_pct=99.0
+        )
+
+        assert contrib.net_profit_sats == 700  # 1000 - 300
+
+    def test_net_profit_capped_at_zero(self):
+        """Verify net profit is capped at 0 (no negative contributions)."""
+        # Member earns 500 sats but spends 800 on rebalancing (loss)
+        contrib = MemberContribution(
+            peer_id='02' + 'b' * 64,
+            capacity_sats=1_000_000,
+            forwards_sats=500_000,
+            fees_earned_sats=500,
+            rebalance_costs_sats=800,
+            uptime_pct=99.0
+        )
+
+        assert contrib.net_profit_sats == 0  # max(0, 500 - 800) = 0
+
+    def test_fair_share_uses_net_profit(self, mock_database, mock_plugin):
+        """Verify fair share distribution uses net profit, not gross fees.
+
+        Example scenario from Issue #42:
+        - Node A: earns 1000 sats, spends 800 rebalancing → net profit 200 sats
+        - Node B: earns 500 sats, spends 0 rebalancing → net profit 500 sats
+
+        The fair share is based on capacity/forwards/uptime (equal in this test),
+        so both get equal fair share. But the BALANCE is based on net profit:
+        - balance = fair_share - net_profit
+        - Node A: fair_share - 200 = positive (owed money)
+        - Node B: fair_share - 500 = negative (owes money)
+        """
+        settlement_manager = SettlementManager(mock_database, mock_plugin)
+
+        contributions = [
+            MemberContribution(
+                peer_id='02' + 'a' * 64,
+                capacity_sats=1_000_000,
+                forwards_sats=500_000,
+                fees_earned_sats=1000,
+                rebalance_costs_sats=800,  # High rebalancing costs
+                uptime_pct=99.0
+            ),
+            MemberContribution(
+                peer_id='02' + 'b' * 64,
+                capacity_sats=1_000_000,
+                forwards_sats=500_000,
+                fees_earned_sats=500,
+                rebalance_costs_sats=0,  # No rebalancing costs
+                uptime_pct=99.0
+            ),
+        ]
+
+        results = settlement_manager.calculate_fair_shares(contributions)
+
+        assert len(results) == 2
+
+        result_a = next(r for r in results if r.peer_id == '02' + 'a' * 64)
+        result_b = next(r for r in results if r.peer_id == '02' + 'b' * 64)
+
+        # Verify net profit is captured correctly
+        assert result_a.net_profit == 200  # 1000 - 800
+        assert result_b.net_profit == 500  # 500 - 0
+
+        # Fair share is based on capacity/forwards/uptime (equal), not net profit
+        # Both should get equal fair share
+        assert result_a.fair_share == result_b.fair_share
+
+        # KEY TEST: Balance is now based on net profit, not gross fees
+        # balance = fair_share - net_profit
+        assert result_a.balance == result_a.fair_share - 200  # 349 - 200 = 149 (owed)
+        assert result_b.balance == result_b.fair_share - 500  # 349 - 500 = -151 (owes)
+
+        # Node A (low net profit) is owed money (positive balance)
+        assert result_a.balance > 0
+        # Node B (high net profit) owes money (negative balance)
+        assert result_b.balance < 0
+
+        # Total balance should be approximately zero (accounting identity)
+        total_balance = result_a.balance + result_b.balance
+        assert abs(total_balance) <= 2  # Allow small rounding error
+
+        # Verify costs are tracked
+        assert result_a.rebalance_costs == 800
+        assert result_b.rebalance_costs == 0
+
+    def test_hash_includes_costs(self):
+        """Verify settlement hash changes when costs are included."""
+        period = "2025-05"
+        contributions_no_costs = [
+            {'peer_id': '02' + 'a' * 64, 'fees_earned': 1000, 'capacity': 1000000, 'uptime': 99},
+            {'peer_id': '02' + 'b' * 64, 'fees_earned': 500, 'capacity': 1000000, 'uptime': 99},
+        ]
+
+        contributions_with_costs = [
+            {'peer_id': '02' + 'a' * 64, 'fees_earned': 1000, 'rebalance_costs': 300, 'capacity': 1000000, 'uptime': 99},
+            {'peer_id': '02' + 'b' * 64, 'fees_earned': 500, 'rebalance_costs': 0, 'capacity': 1000000, 'uptime': 99},
+        ]
+
+        hash_no_costs = SettlementManager.calculate_settlement_hash(period, contributions_no_costs)
+        hash_with_costs = SettlementManager.calculate_settlement_hash(period, contributions_with_costs)
+
+        # Hashes should be different when costs are included
+        assert hash_no_costs != hash_with_costs
+
+    def test_backward_compatible_default_costs(self, mock_database, mock_plugin):
+        """Verify old nodes without costs work (defaults to 0)."""
+        settlement_manager = SettlementManager(mock_database, mock_plugin)
+
+        # Old-style contribution without rebalance_costs field
+        contributions = [
+            MemberContribution(
+                peer_id='02' + 'a' * 64,
+                capacity_sats=1_000_000,
+                forwards_sats=500_000,
+                fees_earned_sats=1000,
+                # rebalance_costs_sats not set - should default to 0
+                uptime_pct=99.0
+            ),
+        ]
+
+        results = settlement_manager.calculate_fair_shares(contributions)
+
+        assert len(results) == 1
+        result = results[0]
+
+        # Net profit should equal gross fees when costs default to 0
+        assert result.net_profit == 1000
+        assert result.rebalance_costs == 0
+
+    def test_zero_total_net_profit(self, mock_database, mock_plugin):
+        """Handle edge case where total net profit is zero."""
+        settlement_manager = SettlementManager(mock_database, mock_plugin)
+
+        contributions = [
+            MemberContribution(
+                peer_id='02' + 'a' * 64,
+                capacity_sats=1_000_000,
+                forwards_sats=500_000,
+                fees_earned_sats=500,
+                rebalance_costs_sats=500,  # net = 0
+                uptime_pct=99.0
+            ),
+            MemberContribution(
+                peer_id='02' + 'b' * 64,
+                capacity_sats=1_000_000,
+                forwards_sats=500_000,
+                fees_earned_sats=0,
+                rebalance_costs_sats=0,  # net = 0
+                uptime_pct=99.0
+            ),
+        ]
+
+        results = settlement_manager.calculate_fair_shares(contributions)
+
+        assert len(results) == 2
+        # With zero total net profit, all balances should be zero
+        for result in results:
+            assert result.fair_share == 0
+            assert result.balance == 0
+
+    def test_settlement_result_includes_cost_fields(self, mock_database, mock_plugin):
+        """Verify SettlementResult dataclass has new cost fields."""
+        result = SettlementResult(
+            peer_id='02' + 'a' * 64,
+            fees_earned=1000,
+            rebalance_costs=300,
+            net_profit=700,
+            fair_share=800,
+            balance=100,
+            bolt12_offer="lno1...",
+        )
+
+        assert result.rebalance_costs == 300
+        assert result.net_profit == 700
+        assert result.fees_earned == 1000
+        assert result.balance == 100  # fair_share - net_profit = 800 - 700 = 100

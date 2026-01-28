@@ -84,9 +84,16 @@ class MemberContribution:
     fees_earned_sats: int
     uptime_pct: float
     bolt12_offer: Optional[str] = None
+    # Rebalancing costs for net profit calculation (Issue #42)
+    rebalance_costs_sats: int = 0
     # Network position metrics (Use Case 6)
     hive_centrality: float = 0.0
     rebalance_hub_score: float = 0.0
+
+    @property
+    def net_profit_sats(self) -> int:
+        """Net profit capped at 0 (no negative contributions)."""
+        return max(0, self.fees_earned_sats - self.rebalance_costs_sats)
 
 
 @dataclass
@@ -97,6 +104,9 @@ class SettlementResult:
     fair_share: int
     balance: int  # positive = owed money, negative = owes money
     bolt12_offer: Optional[str] = None
+    # Rebalancing costs for net profit settlement (Issue #42)
+    rebalance_costs: int = 0
+    net_profit: int = 0
     # Network position contribution (Use Case 6)
     network_score: float = 0.0
     network_bonus_sats: int = 0
@@ -193,6 +203,8 @@ class SettlementManager:
                 uptime_pct REAL NOT NULL,
                 fair_share_sats INTEGER NOT NULL,
                 balance_sats INTEGER NOT NULL,
+                rebalance_costs_sats INTEGER NOT NULL DEFAULT 0,
+                net_profit_sats INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (period_id) REFERENCES settlement_periods(period_id),
                 UNIQUE (period_id, peer_id)
             )
@@ -202,6 +214,19 @@ class SettlementManager:
             CREATE INDEX IF NOT EXISTS idx_settlement_contrib_period
             ON settlement_contributions(period_id)
         """)
+        # Add columns if upgrading from older schema (Issue #42: net profit settlement)
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_contributions ADD COLUMN rebalance_costs_sats INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass  # Column already exists
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_contributions ADD COLUMN net_profit_sats INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass  # Column already exists
 
         # =====================================================================
         # SETTLEMENT PAYMENTS TABLE
@@ -378,10 +403,14 @@ class SettlementManager:
         Network position rewards members who maintain better fleet connectivity,
         contributing to overall routing capability even if they don't earn direct fees.
 
-        Each member's fair_share = total_fees * weighted_contribution_score
-        Balance = fair_share - fees_earned
+        Each member's fair_share = total_net_profit * weighted_contribution_score
+        Balance = fair_share - net_profit (what member keeps minus their fair share)
         - Positive balance = member is owed money
         - Negative balance = member owes money
+
+        Issue #42: Settlement now uses NET PROFIT (fees - rebalance costs) instead of
+        gross fees. This ensures members who spend heavily on rebalancing don't
+        subsidize those who don't. Net profit is capped at 0 (no negative contributions).
 
         Args:
             contributions: List of member contributions
@@ -393,17 +422,19 @@ class SettlementManager:
         if not contributions:
             return []
 
-        # Calculate totals
+        # Calculate totals - use net profit instead of gross fees (Issue #42)
         total_capacity = sum(c.capacity_sats for c in contributions)
         total_forwards = sum(c.forwards_sats for c in contributions)
-        total_fees = sum(c.fees_earned_sats for c in contributions)
+        total_net_profit = sum(c.net_profit_sats for c in contributions)
         total_uptime = sum(c.uptime_pct for c in contributions)
 
-        if total_fees == 0:
+        if total_net_profit == 0:
             return [
                 SettlementResult(
                     peer_id=c.peer_id,
-                    fees_earned=0,
+                    fees_earned=c.fees_earned_sats,
+                    rebalance_costs=c.rebalance_costs_sats,
+                    net_profit=c.net_profit_sats,
                     fair_share=0,
                     balance=0,
                     bolt12_offer=c.bolt12_offer
@@ -421,6 +452,9 @@ class SettlementManager:
         results = []
 
         for member in contributions:
+            # Calculate member's net profit (capped at 0)
+            member_net_profit = member.net_profit_sats
+
             # Calculate contribution scores (0.0 to 1.0)
             capacity_score = (
                 member.capacity_sats / total_capacity
@@ -459,12 +493,12 @@ class SettlementManager:
                 )
 
                 # Calculate the network bonus portion
-                base_fair_share = int(total_fees * (
+                base_fair_share = int(total_net_profit * (
                     WEIGHT_CAPACITY_NETWORK * capacity_score +
                     WEIGHT_FORWARDS_NETWORK * forwards_score +
                     WEIGHT_UPTIME_NETWORK * uptime_score
                 ))
-                network_bonus_sats = int(total_fees * WEIGHT_NETWORK_POSITION * network_score)
+                network_bonus_sats = int(total_net_profit * WEIGHT_NETWORK_POSITION * network_score)
             else:
                 # Standard weights
                 weighted_score = (
@@ -473,15 +507,18 @@ class SettlementManager:
                     WEIGHT_UPTIME * uptime_score
                 )
 
-            # Fair share of total fees
-            fair_share = int(total_fees * weighted_score)
+            # Fair share of total net profit (not gross fees)
+            fair_share = int(total_net_profit * weighted_score)
 
             # Balance: positive = owed money, negative = owes money
-            balance = fair_share - member.fees_earned_sats
+            # Based on net profit, not gross fees
+            balance = fair_share - member_net_profit
 
             results.append(SettlementResult(
                 peer_id=member.peer_id,
                 fees_earned=member.fees_earned_sats,
+                rebalance_costs=member.rebalance_costs_sats,
+                net_profit=member_net_profit,
                 fair_share=fair_share,
                 balance=balance,
                 bolt12_offer=member.bolt12_offer,
@@ -635,8 +672,9 @@ class SettlementManager:
             conn.execute("""
                 INSERT INTO settlement_contributions (
                     period_id, peer_id, capacity_sats, forwards_sats,
-                    fees_earned_sats, uptime_pct, fair_share_sats, balance_sats
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    fees_earned_sats, uptime_pct, fair_share_sats, balance_sats,
+                    rebalance_costs_sats, net_profit_sats
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 period_id,
                 result.peer_id,
@@ -645,7 +683,9 @@ class SettlementManager:
                 result.fees_earned,
                 contrib.uptime_pct,
                 result.fair_share,
-                result.balance
+                result.balance,
+                result.rebalance_costs,
+                result.net_profit
             ))
 
         # Update period totals
@@ -854,7 +894,7 @@ class SettlementManager:
 
         Args:
             period: Settlement period (YYYY-WW)
-            contributions: List of contribution dicts with peer_id, fees_earned, capacity
+            contributions: List of contribution dicts with peer_id, fees_earned, capacity, costs
 
         Returns:
             SHA256 hash (64 hex chars)
@@ -864,14 +904,15 @@ class SettlementManager:
         # Sort contributions by peer_id for determinism
         sorted_contribs = sorted(contributions, key=lambda x: x.get('peer_id', ''))
 
-        # Build canonical string
+        # Build canonical string - include costs for net profit settlement (Issue #42)
         canonical_parts = [period]
         for c in sorted_contribs:
             peer_id = c.get('peer_id', '')
             fees = c.get('fees_earned', 0)
+            costs = c.get('rebalance_costs', 0)
             capacity = c.get('capacity', 0)
             uptime = c.get('uptime', 100)
-            canonical_parts.append(f"{peer_id}:{fees}:{capacity}:{uptime}")
+            canonical_parts.append(f"{peer_id}:{fees}:{costs}:{capacity}:{uptime}")
 
         canonical_string = "|".join(canonical_parts)
         return hashlib.sha256(canonical_string.encode()).hexdigest()
@@ -892,7 +933,7 @@ class SettlementManager:
             period: Settlement period (for filtering)
 
         Returns:
-            List of contribution dicts with peer_id, fees_earned, capacity, uptime
+            List of contribution dicts with peer_id, fees_earned, rebalance_costs, capacity, uptime
         """
         contributions = []
 
@@ -911,11 +952,13 @@ class SettlementManager:
                 db_report = db_fees_by_peer[peer_id]
                 fees_earned = db_report.get('fees_earned_sats', 0)
                 forward_count = db_report.get('forward_count', 0)
+                rebalance_costs = db_report.get('rebalance_costs_sats', 0)
             else:
                 # Fall back to in-memory state (may be from current session)
                 fee_data = state_manager.get_peer_fees(peer_id)
                 fees_earned = fee_data.get('fees_earned_sats', 0)
                 forward_count = fee_data.get('forward_count', 0)
+                rebalance_costs = fee_data.get('rebalance_costs_sats', 0)
 
             # Get capacity from state
             peer_state = state_manager.get_peer_state(peer_id)
@@ -923,6 +966,7 @@ class SettlementManager:
             contributions.append({
                 'peer_id': peer_id,
                 'fees_earned': fees_earned,
+                'rebalance_costs': rebalance_costs,
                 'capacity': peer_state.capacity_sats if peer_state else 0,
                 'uptime': int(member.get('uptime_pct', 100)),
                 'forward_count': forward_count,

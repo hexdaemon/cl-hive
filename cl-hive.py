@@ -341,6 +341,7 @@ _local_fees_forward_count: int = 0
 _local_fees_period_start: int = 0
 _local_fees_last_broadcast: int = 0
 _local_fees_last_broadcast_amount: int = 0  # Tracks fees at last broadcast
+_local_rebalance_costs_sats: int = 0  # Rebalance costs for net profit settlement (Issue #42)
 _local_fees_lock = threading.Lock()
 
 # Fee broadcast thresholds
@@ -2893,6 +2894,7 @@ def _update_and_broadcast_fees(new_fee_sats: int):
         fees_to_broadcast = _local_fees_earned_sats
         forwards_to_broadcast = _local_fees_forward_count
         period_start = _local_fees_period_start
+        costs_to_broadcast = _local_rebalance_costs_sats
         _local_fees_last_broadcast = now
         _local_fees_last_broadcast_amount = _local_fees_earned_sats
 
@@ -2900,17 +2902,19 @@ def _update_and_broadcast_fees(new_fee_sats: int):
     if safe_plugin:
         safe_plugin.log(
             f"FEE_GOSSIP: Broadcasting fee report - {fees_to_broadcast} sats, "
-            f"{forwards_to_broadcast} forwards",
+            f"costs={costs_to_broadcast}, {forwards_to_broadcast} forwards",
             level="info"
         )
-    _broadcast_fee_report(fees_to_broadcast, forwards_to_broadcast, period_start, now)
+    _broadcast_fee_report(fees_to_broadcast, forwards_to_broadcast, period_start, now,
+                          costs_to_broadcast)
 
     # Save state after broadcast (captures last_broadcast values updated in the lock)
     _save_fee_tracking_state()
 
 
 def _broadcast_fee_report(fees_earned: int, forward_count: int,
-                          period_start: int, period_end: int):
+                          period_start: int, period_end: int,
+                          rebalance_costs: int = 0):
     """
     Broadcast a FEE_REPORT message to all hive members.
 
@@ -2919,6 +2923,7 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
         forward_count: Number of forwards in period
         period_start: Period start timestamp
         period_end: Current timestamp
+        rebalance_costs: Rebalancing costs in period (for net profit settlement)
     """
     from modules.protocol import (
         create_fee_report, get_fee_report_signing_payload, HiveMessageType
@@ -2928,9 +2933,10 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
         return
 
     try:
-        # Sign the fee report
+        # Sign the fee report (with costs for net profit settlement)
         signing_payload = get_fee_report_signing_payload(
-            our_pubkey, fees_earned, period_start, period_end, forward_count
+            our_pubkey, fees_earned, period_start, period_end, forward_count,
+            rebalance_costs
         )
         sig_result = safe_plugin.rpc.signmessage(signing_payload)
         signature = sig_result["zbase"]
@@ -2942,7 +2948,8 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
             period_start=period_start,
             period_end=period_end,
             forward_count=forward_count,
-            signature=signature
+            signature=signature,
+            rebalance_costs_sats=rebalance_costs
         )
 
         # Get hive members
@@ -2966,7 +2973,7 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
 
         if broadcast_count > 0:
             safe_plugin.log(
-                f"[FeeReport] Broadcast: {fees_earned} sats, "
+                f"[FeeReport] Broadcast: {fees_earned} sats, costs={rebalance_costs}, "
                 f"{forward_count} forwards -> {broadcast_count} member(s)",
                 level="info"
             )
@@ -2983,7 +2990,8 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
                 fees_earned_sats=fees_earned,
                 forward_count=forward_count,
                 period_start=period_start,
-                period_end=period_end
+                period_end=period_end,
+                rebalance_costs_sats=rebalance_costs
             )
 
         # Persist our own fee report to database for settlement
@@ -2995,7 +3003,8 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
             fees_earned_sats=fees_earned,
             forward_count=forward_count,
             period_start=period_start,
-            period_end=period_end
+            period_end=period_end,
+            rebalance_costs_sats=rebalance_costs
         )
 
     except Exception as e:
@@ -6492,7 +6501,10 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     Stores the member's fee earnings for use in settlement calculations.
     This enables real-time fee tracking across the fleet.
     """
-    from modules.protocol import get_fee_report_signing_payload, validate_fee_report
+    from modules.protocol import (
+        get_fee_report_signing_payload, get_fee_report_signing_payload_legacy,
+        validate_fee_report
+    )
 
     if not state_manager or not database:
         return {"result": "continue"}
@@ -6515,6 +6527,8 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     period_end = payload.get("period_end")
     forward_count = payload.get("forward_count")
     signature = payload.get("signature")
+    # Extract rebalance costs (backward compat - defaults to 0)
+    rebalance_costs_sats = payload.get("rebalance_costs_sats", 0)
 
     # Verify sender (supports relay) - report_peer_id is the original sender
     if not _validate_relay_sender(peer_id, report_peer_id, payload):
@@ -6527,17 +6541,34 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"[FeeReport] Rejected: non-member or banned {report_peer_id[:16]}...", level='info')
         return {"result": "continue"}
 
-    # Verify the signature
-    signing_payload = get_fee_report_signing_payload(
-        report_peer_id, fees_earned_sats, period_start, period_end, forward_count
-    )
+    # Verify the signature - try new format with costs first, then legacy format
+    verified = False
     try:
+        # Try new format (with costs) first
+        signing_payload = get_fee_report_signing_payload(
+            report_peer_id, fees_earned_sats, period_start, period_end, forward_count,
+            rebalance_costs_sats
+        )
         verify_result = safe_plugin.rpc.call("checkmessage", {
             "message": signing_payload,
             "zbase": signature,
             "pubkey": report_peer_id
         })
-        if not verify_result.get("verified"):
+        verified = verify_result.get("verified", False)
+
+        # If new format fails and costs are 0, try legacy format (backward compat)
+        if not verified and rebalance_costs_sats == 0:
+            legacy_payload = get_fee_report_signing_payload_legacy(
+                report_peer_id, fees_earned_sats, period_start, period_end, forward_count
+            )
+            verify_result = safe_plugin.rpc.call("checkmessage", {
+                "message": legacy_payload,
+                "zbase": signature,
+                "pubkey": report_peer_id
+            })
+            verified = verify_result.get("verified", False)
+
+        if not verified:
             plugin.log(f"cl-hive: FEE_REPORT invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
     except Exception as e:
@@ -6550,7 +6581,8 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         fees_earned_sats=fees_earned_sats,
         forward_count=forward_count,
         period_start=period_start,
-        period_end=period_end
+        period_end=period_end,
+        rebalance_costs_sats=rebalance_costs_sats
     )
 
     # Also persist to database for settlement calculations
@@ -6562,14 +6594,16 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         fees_earned_sats=fees_earned_sats,
         forward_count=forward_count,
         period_start=period_start,
-        period_end=period_end
+        period_end=period_end,
+        rebalance_costs_sats=rebalance_costs_sats
     )
 
     if updated:
         is_relayed = _is_relayed_message(payload)
         relay_info = " (relayed)" if is_relayed else ""
+        costs_info = f", costs={rebalance_costs_sats}" if rebalance_costs_sats > 0 else ""
         plugin.log(
-            f"FEE_GOSSIP: Received FEE_REPORT from {report_peer_id[:16]}...{relay_info}: {fees_earned_sats} sats, "
+            f"FEE_GOSSIP: Received FEE_REPORT from {report_peer_id[:16]}...{relay_info}: {fees_earned_sats} sats{costs_info}, "
             f"{forward_count} forwards (period {period})",
             level='info'
         )
@@ -9890,6 +9924,40 @@ def hive_status(plugin: Plugin):
         Dict with hive state, member count, governance mode, etc.
     """
     return rpc_status(_get_hive_context())
+
+
+@plugin.method("hive-report-period-costs")
+def hive_report_period_costs(plugin: Plugin, rebalance_costs_sats: int):
+    """
+    Report rebalancing costs for the current settlement period.
+
+    Called by cl-revenue-ops to report accumulated rebalance costs for
+    net profit settlement calculation (Issue #42). The costs are included
+    in the next fee report broadcast to other hive members.
+
+    Args:
+        rebalance_costs_sats: Total rebalancing costs in sats for the current period
+
+    Returns:
+        Dict with status and accepted costs value
+    """
+    global _local_rebalance_costs_sats
+
+    if not isinstance(rebalance_costs_sats, int) or rebalance_costs_sats < 0:
+        return {"error": "rebalance_costs_sats must be a non-negative integer"}
+
+    with _local_fees_lock:
+        _local_rebalance_costs_sats = rebalance_costs_sats
+
+    plugin.log(
+        f"[Settlement] Updated period costs: {rebalance_costs_sats} sats",
+        level="info"
+    )
+
+    return {
+        "status": "accepted",
+        "rebalance_costs_sats": rebalance_costs_sats
+    }
 
 
 @plugin.method("hive-config")
@@ -14159,6 +14227,8 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
             period_data = dashboard.get("period", {})
             fees_earned = period_data.get("gross_revenue_sats", 0)
             forwards = period_data.get("total_forwards", 0)
+            # Include rebalance costs for net profit settlement (Issue #42)
+            rebalance_costs = period_data.get("rebalance_cost_sats", 0)
 
             # Calculate period timestamps using ISO week (proper handling)
             year, week = map(int, period.split('-'))
@@ -14177,7 +14247,8 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
                 fees_earned_sats=fees_earned,
                 forward_count=forwards,
                 period_start=period_start,
-                period_end=period_end
+                period_end=period_end,
+                rebalance_costs_sats=rebalance_costs
             )
 
             # Also update local_fee_tracking so gossip loop broadcasts correct fees
@@ -14197,16 +14268,18 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
             """, (fees_earned, forwards, period_start, now, fees_earned, now))
 
             # Trigger immediate fee report broadcast
-            _broadcast_fee_report(fees_earned, forwards, period_start, period_end)
+            _broadcast_fee_report(fees_earned, forwards, period_start, period_end,
+                                  rebalance_costs)
 
             results["backfilled"].append({
                 "peer_id": our_pubkey[:16] + "...",
                 "fees_earned_sats": fees_earned,
+                "rebalance_costs_sats": rebalance_costs,
                 "forward_count": forwards,
                 "broadcast": True
             })
 
-            plugin.log(f"Backfilled fees for {period}: {fees_earned} sats (broadcast triggered)", level='info')
+            plugin.log(f"Backfilled fees for {period}: {fees_earned} sats, costs={rebalance_costs} (broadcast triggered)", level='info')
 
         except Exception as e:
             results["error"] = f"Failed to get data from cl-revenue-ops: {e}"

@@ -82,6 +82,7 @@ class HivePeerState:
     fees_forward_count: int = 0
     fees_period_start: int = 0
     fees_last_report: int = 0
+    fees_costs_sats: int = 0  # Rebalance costs in period (for net profit settlement)
     # Capabilities for version-aware feature negotiation (e.g., ["mcf"])
     capabilities: List[str] = field(default_factory=list)
     
@@ -116,6 +117,7 @@ class HivePeerState:
         fees_forward_count = data.get("fees_forward_count", 0)
         fees_period_start = data.get("fees_period_start", 0)
         fees_last_report = data.get("fees_last_report", 0)
+        fees_costs_sats = data.get("fees_costs_sats", 0)
 
         # Capabilities (optional, backward compatible - old nodes have no capabilities)
         capabilities = data.get("capabilities", [])
@@ -136,6 +138,7 @@ class HivePeerState:
             fees_forward_count=fees_forward_count,
             fees_period_start=fees_period_start,
             fees_last_report=fees_last_report,
+            fees_costs_sats=fees_costs_sats,
             capabilities=capabilities,
         )
     
@@ -340,7 +343,7 @@ class StateManager:
 
     def update_peer_fees(self, peer_id: str, fees_earned_sats: int,
                          forward_count: int, period_start: int,
-                         period_end: int) -> bool:
+                         period_end: int, rebalance_costs_sats: int = 0) -> bool:
         """
         Update fee reporting data for a peer from FEE_REPORT message.
 
@@ -354,6 +357,7 @@ class StateManager:
             forward_count: Number of forwards in the period
             period_start: Period start timestamp
             period_end: Period end timestamp (report time)
+            rebalance_costs_sats: Rebalancing costs in the period
 
         Returns:
             True if fee data was updated, False if rejected
@@ -363,6 +367,8 @@ class StateManager:
         # Basic validation
         if not peer_id or fees_earned_sats < 0 or forward_count < 0:
             return False
+        if rebalance_costs_sats < 0:
+            rebalance_costs_sats = 0
 
         # Get or create peer state
         existing = self._local_state.get(peer_id)
@@ -378,6 +384,7 @@ class StateManager:
             existing.fees_forward_count = forward_count
             existing.fees_period_start = period_start
             existing.fees_last_report = period_end
+            existing.fees_costs_sats = rebalance_costs_sats
         else:
             # Create minimal state entry with just fee data
             new_state = HivePeerState(
@@ -391,12 +398,13 @@ class StateManager:
                 fees_earned_sats=fees_earned_sats,
                 fees_forward_count=forward_count,
                 fees_period_start=period_start,
-                fees_last_report=period_end
+                fees_last_report=period_end,
+                fees_costs_sats=rebalance_costs_sats
             )
             self._local_state[peer_id] = new_state
 
         self._log(f"Updated fees for {peer_id[:16]}...: {fees_earned_sats} sats, "
-                 f"{forward_count} forwards")
+                 f"{forward_count} forwards, costs={rebalance_costs_sats}")
         return True
 
     def get_peer_fees(self, peer_id: str) -> Dict[str, int]:
@@ -407,7 +415,7 @@ class StateManager:
             peer_id: The peer's public key
 
         Returns:
-            Dict with fees_earned_sats, forward_count, period_start, last_report
+            Dict with fees_earned_sats, forward_count, period_start, last_report, rebalance_costs_sats
         """
         state = self._local_state.get(peer_id)
         if not state:
@@ -415,14 +423,16 @@ class StateManager:
                 "fees_earned_sats": 0,
                 "forward_count": 0,
                 "period_start": 0,
-                "last_report": 0
+                "last_report": 0,
+                "rebalance_costs_sats": 0
             }
 
         return {
             "fees_earned_sats": state.fees_earned_sats,
             "forward_count": state.fees_forward_count,
             "period_start": state.fees_period_start,
-            "last_report": state.fees_last_report
+            "last_report": state.fees_last_report,
+            "rebalance_costs_sats": state.fees_costs_sats
         }
 
     def get_all_peer_fees(self) -> Dict[str, Dict[str, int]]:
@@ -438,7 +448,8 @@ class StateManager:
                 "fees_earned_sats": state.fees_earned_sats,
                 "forward_count": state.fees_forward_count,
                 "period_start": state.fees_period_start,
-                "last_report": state.fees_last_report
+                "last_report": state.fees_last_report,
+                "rebalance_costs_sats": state.fees_costs_sats
             }
         return result
 
