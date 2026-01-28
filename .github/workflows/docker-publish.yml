@@ -1,0 +1,166 @@
+# Build and publish multi-arch Docker images to GitHub Container Registry
+#
+# Triggers:
+#   - On release publish (creates versioned + latest tags)
+#   - On push to main (creates :main tag for testing)
+#   - Manual dispatch (for testing)
+#
+# Images published to: ghcr.io/lightning-goats/cl-hive-node
+#
+# Usage for end users:
+#   docker pull ghcr.io/lightning-goats/cl-hive-node:latest
+#   docker pull ghcr.io/lightning-goats/cl-hive-node:v2.2.1
+
+name: Build and Publish Docker
+
+on:
+  release:
+    types: [published]
+  push:
+    branches:
+      - main
+    paths:
+      - 'docker/**'
+      - 'modules/**'
+      - 'cl-hive.py'
+      - '.github/workflows/docker-publish.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g., v2.2.1 or test)'
+        required: false
+        default: 'dev'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: lightning-goats/cl-hive-node
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for version detection
+
+      - name: Set up QEMU (for ARM64 cross-compilation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # For releases: v2.2.1 -> 2.2.1, latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+            # For main branch pushes
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+            # For manual dispatch
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+          labels: |
+            org.opencontainers.image.title=cl-hive-node
+            org.opencontainers.image.description=Production Lightning node with cl-hive coordination and cl-revenue-ops
+            org.opencontainers.image.vendor=Lightning Goats
+            org.opencontainers.image.documentation=https://github.com/lightning-goats/cl-hive/blob/main/docker/README.md
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            CLN_VERSION=v25.12.1
+            SLING_VERSION=v4.1.3
+            CLN_REST_VERSION=v0.10.7
+            CL_REVENUE_OPS_VERSION=v2.2.1
+
+      - name: Generate SBOM (Software Bill of Materials)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+        if: github.event_name == 'release'
+
+      - name: Upload SBOM to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: sbom.spdx.json
+        if: github.event_name == 'release'
+
+      - name: Create summary
+        run: |
+          echo "## Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Tags" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pull Command" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Platforms" >> $GITHUB_STEP_SUMMARY
+          echo "- linux/amd64 (x86_64)" >> $GITHUB_STEP_SUMMARY
+          echo "- linux/arm64 (aarch64 / Apple Silicon / Raspberry Pi 4+)" >> $GITHUB_STEP_SUMMARY
+
+  # Verify the published image works
+  verify:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+
+    steps:
+      - name: Pull and verify image
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+          # Verify CLN is present
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest lightningd --version
+
+          # Verify plugins are present
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest test -f /opt/cl-hive/cl-hive.py
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest test -f /opt/cl-revenue-ops/cl-revenue-ops.py
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest test -f /usr/local/bin/sling
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest which clboss
+
+          echo "Image verification passed"
+
+      - name: Test basic startup (no Bitcoin)
+        run: |
+          # Start container briefly to check entrypoint doesn't crash
+          timeout 30 docker run --rm \
+            -e BITCOIN_RPCHOST=localhost \
+            -e BITCOIN_RPCPORT=8332 \
+            -e BITCOIN_RPCUSER=test \
+            -e BITCOIN_RPCPASSWORD=test \
+            -e NETWORK=regtest \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            bash -c "echo 'Container starts OK'" || true

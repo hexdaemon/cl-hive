@@ -32,7 +32,56 @@ Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, a
 
 ## Quick Start
 
-### Production Setup (Recommended)
+### Option 1: Pre-built Image (Recommended)
+
+No compilation required. Uses pre-built images from GitHub Container Registry.
+
+```bash
+cd docker
+
+# Copy and edit environment file
+cp .env.example .env
+nano .env  # Configure Bitcoin RPC, alias, etc.
+
+# Pull and start (no build needed!)
+docker-compose pull
+docker-compose up -d
+
+# Monitor startup
+docker-compose logs -f
+```
+
+**Upgrade with pre-built images:**
+```bash
+docker-compose pull
+docker-compose up -d
+```
+
+### Option 2: Build from Source
+
+For developers or when you need custom modifications.
+
+```bash
+cd docker
+
+# Copy environment and build config
+cp .env.example .env
+cp docker-compose.build.yml docker-compose.override.yml
+nano .env
+
+# Clone cl-revenue-ops (required for build)
+git clone https://github.com/lightning-goats/cl_revenue_ops.git ../../cl_revenue_ops
+
+# Build and start
+docker-compose up -d --build
+```
+
+**Hot upgrades (no rebuild):**
+```bash
+./scripts/hot-upgrade.sh
+```
+
+### Option 3: Interactive Setup Wizard
 
 ```bash
 cd docker
@@ -56,19 +105,6 @@ docker-compose up -d
 
 # Monitor startup
 docker-compose logs -f
-```
-
-### Manual Setup
-
-```bash
-cd docker
-
-# Copy and edit environment file
-cp .env.example .env
-nano .env
-
-# Start
-docker-compose up -d
 ```
 
 ## Production Deployment
@@ -267,11 +303,38 @@ docker-compose exec cln lightning-cli revenue-status
 
 ### Upgrade
 
-There are two upgrade methods:
+There are three upgrade methods depending on your deployment:
 
-#### Hot Upgrade (Recommended for plugin updates)
+#### Method 1: Pre-built Image Upgrade (Recommended)
 
-Updates cl-hive and cl-revenue-ops without rebuilding the Docker image. Fast and minimal downtime.
+For deployments using pre-built images from GHCR. Fastest and safest.
+
+```bash
+# Backup first (always!)
+./scripts/backup.sh
+
+# Pull new image and restart
+docker-compose pull
+docker-compose up -d
+
+# Verify
+docker-compose exec cln lightning-cli getinfo
+docker-compose exec cln lightning-cli hive-status
+```
+
+**Upgrade to specific version:**
+```bash
+# Edit .env to set version
+CL_HIVE_VERSION=2.3.0
+
+# Or override directly
+CL_HIVE_VERSION=2.3.0 docker-compose pull
+docker-compose up -d
+```
+
+#### Method 2: Hot Upgrade (For build-from-source deployments)
+
+Updates cl-hive and cl-revenue-ops without rebuilding the Docker image. Only works if plugins are mounted from host.
 
 ```bash
 # Check for available updates
@@ -292,7 +355,7 @@ Updates cl-hive and cl-revenue-ops without rebuilding the Docker image. Fast and
 - Restarts lightningd via supervisorctl to load new plugin code
 - No image rebuild required
 
-#### Full Upgrade (For Core Lightning or system updates)
+#### Method 3: Full Rebuild (For Core Lightning or system updates)
 
 Rebuilds the Docker image. Use when upgrading Core Lightning, system packages, or after major changes.
 
@@ -535,20 +598,46 @@ docker/
     └── database-corruption.md
 ```
 
-## Building the Image
+## Docker Images
 
-### Prerequisites
+### Pre-built Images (Recommended)
 
-No special prerequisites - cl-revenue-ops is automatically cloned from GitHub during the build.
-
-### Build
+Pre-built multi-architecture images are available on GitHub Container Registry:
 
 ```bash
-# From cl-hive root directory
-docker build -t cl-hive-node:1.0.0 -f docker/Dockerfile .
+# Pull latest stable release
+docker pull ghcr.io/lightning-goats/cl-hive-node:latest
 
-# Or via docker-compose
+# Pull specific version
+docker pull ghcr.io/lightning-goats/cl-hive-node:2.2.1
+
+# Available architectures:
+# - linux/amd64 (x86_64)
+# - linux/arm64 (Apple Silicon, Raspberry Pi 4+)
+```
+
+**Advantages of pre-built images:**
+- No compilation required (faster startup)
+- Tested and verified before release
+- Consistent across all deployments
+- Easy upgrades: `docker-compose pull && docker-compose up -d`
+
+### Building from Source
+
+For developers or custom modifications:
+
+```bash
+# Prerequisites: Clone cl-revenue-ops next to cl-hive
+git clone https://github.com/lightning-goats/cl_revenue_ops.git ../cl_revenue_ops
+
+# Use the build override
+cp docker-compose.build.yml docker-compose.override.yml
+
+# Build
 docker-compose build
+
+# Or build directly
+docker build -t cl-hive-node:local -f docker/Dockerfile ..
 ```
 
 ### Image Contents

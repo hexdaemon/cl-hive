@@ -1,31 +1,31 @@
 # cl-hive Production Node - Docker Compose
 #
-# Quick Start:
+# Quick Start (Pre-built Image - Recommended):
+#   1. cd cl-hive/docker
+#   2. cp .env.example .env && nano .env  # Configure Bitcoin RPC, etc.
+#   3. docker-compose up -d
+#
+# Quick Start (Build from Source):
 #   1. Clone both repos side by side:
 #        git clone https://github.com/lightning-goats/cl-hive.git
 #        git clone https://github.com/lightning-goats/cl_revenue_ops.git
 #   2. cd cl-hive/docker
-#   3. cp .env.example .env && nano .env  # Configure Bitcoin RPC, etc.
-#   4. docker-compose up -d
+#   3. cp .env.example .env && nano .env
+#   4. cp docker-compose.build.yml docker-compose.override.yml
+#   5. docker-compose up -d --build
 #
-# Hot Upgrades (no rebuild needed):
-#   ./scripts/hot-upgrade.sh       # Pull latest code and restart plugins
+# Upgrade (Pre-built Image):
+#   docker-compose pull && docker-compose up -d
 #
 # Access lightning-cli:
 #   docker-compose exec cln lightning-cli getinfo
 #
-# IMPORTANT: Both cl-hive and cl_revenue_ops are mounted from the host.
-# This enables hot upgrades. The directory structure should be:
-#   parent/
-#     cl-hive/          <- this repo
-#     cl_revenue_ops/   <- clone from GitHub
+# For developers wanting hot upgrades, see docker-compose.build.yml
 
 services:
   cln:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: cl-hive-node:2.2.1
+    # Pre-built image from GitHub Container Registry (no compilation needed)
+    image: ghcr.io/lightning-goats/cl-hive-node:${CL_HIVE_VERSION:-latest}
     container_name: cl-hive-node
     restart: unless-stopped
 
@@ -122,20 +122,15 @@ services:
       - ./supervisord.conf:/etc/supervisor/conf.d/supervisord.conf:ro
 
       # =================================================================
-      # PLUGIN MOUNTS - Required for hot upgrades via ./scripts/hot-upgrade.sh
-      # These mount the git repos so updates can be pulled without rebuilding.
+      # NOTE: Plugin mounts are NOT needed when using pre-built image.
+      # The image includes cl-hive and cl-revenue-ops baked in.
+      #
+      # For development/hot-upgrades, use docker-compose.build.yml:
+      #   cp docker-compose.build.yml docker-compose.override.yml
       # =================================================================
 
-      # cl-hive (coordination layer)
-      - ..:/opt/cl-hive:ro
-
-      # cl-revenue-ops (execution layer) - clone it next to cl-hive:
-      #   git clone https://github.com/lightning-goats/cl_revenue_ops.git ../cl_revenue_ops
-      - ../../cl_revenue_ops:/opt/cl-revenue-ops:ro
-
-      # bitcoin-cli mount (needed when build fails to download from bitcoincore.org)
-      # Copy your host's bitcoin-cli first: cp /usr/local/bin/bitcoin-cli ./bitcoin-cli
-      - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
+      # bitcoin-cli mount (only needed if host has newer version)
+      # - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
 
       # Backup directory for database replication and emergency.recover
       - ${BACKUP_LOCATION:-./backups}:/backups
