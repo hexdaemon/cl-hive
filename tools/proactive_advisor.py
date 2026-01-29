@@ -472,12 +472,13 @@ class ProactiveAdvisor:
                 )
                 # Convert settlement timestamps to ISO week periods
                 # settlement_history returns period_id (int), not period (YYYY-WW)
-                # so we calculate the period from end_time
+                # Use start_time to determine which period was settled (Issue #44)
+                # start_time = beginning of settled period, end_time = when executed
                 settled_periods = []
                 for p in history.get("settlement_periods", []):
-                    if p.get("status") == "completed" and p.get("end_time"):
-                        end_dt = datetime.fromtimestamp(p["end_time"])
-                        week_period = f"{end_dt.year}-{end_dt.isocalendar()[1]:02d}"
+                    if p.get("status") == "completed" and p.get("start_time"):
+                        start_dt = datetime.fromtimestamp(p["start_time"])
+                        week_period = f"{start_dt.year}-{start_dt.isocalendar()[1]:02d}"
                         settled_periods.append(week_period)
             except Exception:
                 settled_periods = []

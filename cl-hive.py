@@ -13870,21 +13870,22 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
         response["message"] = f"Dry run - {len(payments)} payments would be executed"
         return response
 
-    # CRITICAL: Check if this ISO week was already settled to prevent duplicates
-    # This is a safety check - the advisor should also prevent duplicates
-    from datetime import datetime
+    # CRITICAL: Check if previous week was already settled to prevent duplicates
+    # Use start_time to determine which period was settled (Issue #44)
+    from datetime import datetime, timedelta
     now = datetime.now()
-    current_week = f"{now.year}-{now.isocalendar()[1]:02d}"
+    prev_date = now - timedelta(days=7)
+    previous_week = f"{prev_date.year}-{prev_date.isocalendar()[1]:02d}"
 
     existing_periods = settlement_mgr.get_settlement_history(limit=10)
     for p in existing_periods:
-        if p.get("status") == "completed" and p.get("end_time"):
-            end_dt = datetime.fromtimestamp(p["end_time"])
-            settled_week = f"{end_dt.year}-{end_dt.isocalendar()[1]:02d}"
-            if settled_week == current_week:
+        if p.get("status") == "completed" and p.get("start_time"):
+            start_dt = datetime.fromtimestamp(p["start_time"])
+            settled_week = f"{start_dt.year}-{start_dt.isocalendar()[1]:02d}"
+            if settled_week == previous_week:
                 return {
                     "error": "duplicate_settlement",
-                    "message": f"Week {current_week} was already settled (period_id={p['period_id']})",
+                    "message": f"Week {previous_week} was already settled (period_id={p['period_id']})",
                     "existing_period_id": p["period_id"],
                     "settled_at": p.get("settled_at")
                 }
