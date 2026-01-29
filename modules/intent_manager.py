@@ -412,30 +412,16 @@ class IntentManager:
     def get_pending_intents_ready_to_commit(self) -> List[Dict]:
         """
         Get local intents that are ready to commit.
-        
+
         An intent is ready if:
         - Status is 'pending'
         - Current time > timestamp + hold_seconds
-        
+        - Intent has not expired
+
         Returns:
             List of intent rows from database
         """
-        now = int(time.time())
-        
-        # Query all pending intents
-        # We need to filter those where hold period has passed
-        # The DB query returns all pending intents, we filter here
-        all_pending = []
-        
-        # Get from DB (we don't have a direct method, so we'll use
-        # get_conflicting_intents with empty filter - but that's not ideal)
-        # For now, let's add a helper method concept
-        
-        # Actually, let's query the DB directly for ready intents
-        # This requires extending the database module slightly
-        # For now, we'll use a workaround
-        
-        return all_pending  # Will be implemented via DB query
+        return self.db.get_pending_intents_ready(self.hold_seconds)
     
     def commit_intent(self, intent_id: int) -> bool:
         """
