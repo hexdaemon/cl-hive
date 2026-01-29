@@ -241,7 +241,7 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
             "max_members": ctx.config.max_members if ctx.config else 50,
             "market_share_cap": ctx.config.market_share_cap_pct if ctx.config else 0.20,
         },
-        "version": "0.1.0-dev",
+        "version": "2.2.3",
     }
 
 

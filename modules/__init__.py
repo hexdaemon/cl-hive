@@ -20,4 +20,4 @@ This package contains the core modules for the Hive swarm intelligence layer:
 - vpn_transport: VPN-based transport policy for hive gossip
 """
 
-__version__ = "0.1.0-dev"
+__version__ = "2.2.3"

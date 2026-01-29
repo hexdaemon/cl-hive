@@ -186,7 +186,7 @@ class TestStatusRPC:
                 "max_members": config.max_members,
                 "market_share_cap": config.market_share_cap_pct,
             },
-            "version": "0.1.0-dev",
+            "version": "2.2.3",
         }
 
         # Verify structure
