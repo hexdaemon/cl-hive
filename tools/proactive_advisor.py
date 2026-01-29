@@ -638,6 +638,8 @@ class ProactiveAdvisor:
             # Channel rationalization
             "rationalization": ("rationalization_summary", {"node": node_name}),
             "close_recommendations": ("close_recommendations", {"node": node_name, "our_node_only": True}),
+            # Strategic corridors (for fleet consensus scanning)
+            "valuable_corridors": ("valuable_corridors", {"node": node_name, "min_score": 0.3}),
             # Competitor analysis
             "competitor_analysis": ("revenue_competitor_analysis", {"node": node_name, "top_n": 10}),
             # Hive membership
@@ -710,6 +712,37 @@ class ProactiveAdvisor:
         successful_markers = markers.get("successful_markers", 0)
         failed_markers = markers.get("failed_markers", 0)
 
+        # Transform close_recommendations into fleet_close_proposals format
+        # for opportunity_scanner._scan_fleet_consensus()
+        close_recs = results.get("close_recommendations", {}).get("recommendations", [])
+        our_pubkey = results.get("node_info", {}).get("id", "")
+        fleet_close_proposals = []
+        for rec in close_recs:
+            fleet_close_proposals.append({
+                "target_member": our_pubkey,
+                "target_peer": rec.get("peer_id", ""),
+                "their_routing_share": rec.get("peer_routing_share", 0),
+                "our_routing_share": rec.get("our_routing_share", 0),
+                "reporters": [our_pubkey],  # Single reporter - needs fleet consensus
+                "channel_id": rec.get("channel_id", ""),
+                "reason": rec.get("reason", ""),
+            })
+
+        # Transform valuable_corridors into fleet_corridor_consensus format
+        corridors = results.get("valuable_corridors", {}).get("corridors", [])
+        fleet_corridor_consensus = {}
+        for corridor in corridors:
+            source = corridor.get("source_peer_id", "") or corridor.get("source", "")
+            dest = corridor.get("dest_peer_id", "") or corridor.get("destination", "")
+            if source and dest:
+                key = f"{source[:16]}_{dest[:16]}"
+                fleet_corridor_consensus[key] = {
+                    "source": source,
+                    "dest": dest,
+                    "reporters": [our_pubkey],  # Single reporter - needs fleet consensus
+                    "value_scores": [corridor.get("value_score", 0.5)],
+                }
+
         return {
             "summary": {
                 "total_capacity_sats": total_capacity,
@@ -761,6 +794,10 @@ class ProactiveAdvisor:
             "close_recommendations": results.get("close_recommendations", {}),
             # Competitor analysis
             "competitor_analysis": results.get("competitor_analysis", {}),
+            # Fleet consensus data (for opportunity_scanner._scan_fleet_consensus)
+            "fleet_close_proposals": fleet_close_proposals,
+            "fleet_corridor_consensus": fleet_corridor_consensus,
+            "our_pubkey": our_pubkey,
         }
 
     async def _check_goals(
