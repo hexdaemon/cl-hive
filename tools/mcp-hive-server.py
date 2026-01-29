@@ -6407,7 +6407,14 @@ def _get_proactive_advisor():
 
                 async def call(self, tool_name, params):
                     # Route to internal handlers
-                    handler_name = self.TOOL_TO_HANDLER.get(tool_name, f"handle_{tool_name}")
+                    handler_name = self.TOOL_TO_HANDLER.get(tool_name)
+                    if not handler_name:
+                        # Try handle_{tool_name} first
+                        handler_name = f"handle_{tool_name}"
+                        if handler_name not in globals():
+                            # Try stripping hive_ prefix: hive_foo -> handle_foo
+                            if tool_name.startswith("hive_"):
+                                handler_name = f"handle_{tool_name[5:]}"
                     handler = globals().get(handler_name)
                     if handler:
                         return await handler(params)
