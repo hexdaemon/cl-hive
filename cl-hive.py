@@ -8035,6 +8035,26 @@ def fee_intelligence_loop():
             except Exception as e:
                 safe_plugin.log(f"cl-hive: State cleanup error: {e}", level='warn')
 
+            # Step 8a: Verify hive channel zero-fee policy (security check)
+            try:
+                if bridge and membership_mgr:
+                    # Get all current hive members
+                    members = membership_mgr.get_all_members()
+                    violations = []
+                    for member in members:
+                        peer_id = member.get('peer_id')
+                        if peer_id and peer_id != our_pubkey:
+                            is_valid, reason = bridge.verify_hive_channel_zero_fees(peer_id)
+                            if not is_valid and reason not in ('no_channel', 'our_direction_not_found'):
+                                violations.append((peer_id[:16], reason))
+                    if violations:
+                        safe_plugin.log(
+                            f"cl-hive: SECURITY WARNING - Hive channels with non-zero fees: {violations}",
+                            level='warn'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Zero-fee verification error: {e}", level='debug')
+
             # Step 9: Cleanup old peer reputation (Phase 5 - Advanced Cooperation)
             try:
                 if peer_reputation_mgr:
