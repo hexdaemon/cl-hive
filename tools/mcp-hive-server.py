@@ -3556,7 +3556,7 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_anticipatory_predictions(arguments)
         # Phase 2: Fee Coordination tools
         elif name == "coord_fee_recommendation":
-            result = await handle_fee_recommendation(arguments)
+            result = await handle_coord_fee_recommendation(arguments)
         elif name == "corridor_assignments":
             result = await handle_corridor_assignments(arguments)
         elif name == "stigmergic_markers":
@@ -6893,7 +6893,7 @@ async def handle_anticipatory_predictions(args: Dict) -> Dict:
 # Phase 2: Fee Coordination Handlers
 # =============================================================================
 
-async def handle_fee_recommendation(args: Dict) -> Dict:
+async def handle_coord_fee_recommendation(args: Dict) -> Dict:
     """Get coordinated fee recommendation for a channel."""
     node_name = args.get("node")
     channel_id = args.get("channel_id")
