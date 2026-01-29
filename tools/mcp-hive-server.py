@@ -675,6 +675,24 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
             }
         ),
         Tool(
+            name="hive_bump_version",
+            description="Bump the gossip state version for restart recovery. Used to force a state version increment after node restart to trigger re-sync with peers.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "version": {
+                        "type": "integer",
+                        "description": "New version number to set"
+                    }
+                },
+                "required": ["node", "version"]
+            }
+        ),
+        Tool(
             name="hive_gossip_stats",
             description="Get gossip statistics and state versions for debugging. Shows version numbers for each peer to verify state synchronization is working correctly.",
             inputSchema={
