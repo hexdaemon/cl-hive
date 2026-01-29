@@ -390,7 +390,7 @@ class OpportunityScanner:
                     peer_id=ch.get("peer_id"),
                     node_name=node_name,
                     priority_score=0.6,
-                    confidence_score=0.75,
+                    confidence_score=0.82,  # Raised for auto-execute (Issue #45)
                     roi_estimate=0.5,
                     description=f"Stagnant channel {channel_id} - 100% local, no flow",
                     reasoning="Channel is fully local with no routing activity",
@@ -931,7 +931,7 @@ class OpportunityScanner:
                     peer_id=rec.get("peer_id"),
                     node_name=node_name,
                     priority_score=0.5,
-                    confidence_score=0.75,
+                    confidence_score=0.82,  # Raised for auto-execute (Issue #45)
                     roi_estimate=0.5,
                     description=f"Young channel {channel_id} needs stimulation",
                     reasoning="New channel with low flow - reduce fees to attract traffic",
