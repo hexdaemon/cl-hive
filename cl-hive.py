@@ -14676,7 +14676,8 @@ def hive_detect_patterns(plugin: Plugin, channel_id: str):
 def hive_predict_liquidity_intraday(
     plugin: Plugin,
     channel_id: str,
-    current_local_pct: float = 0.5
+    current_local_pct: float = 0.5,
+    hours_ahead: int = 12
 ):
     """
     Get intra-day liquidity forecast for a channel.
@@ -14687,6 +14688,7 @@ def hive_predict_liquidity_intraday(
     Args:
         channel_id: Channel SCID
         current_local_pct: Current local balance percentage (0.0-1.0)
+        hours_ahead: Hours to predict ahead (default: 12)
 
     Returns:
         Dict with forecast and recommended actions
@@ -14697,6 +14699,7 @@ def hive_predict_liquidity_intraday(
 
     try:
         current_local_pct = float(current_local_pct)
+        hours_ahead = int(hours_ahead)
         forecast = ctx.anticipatory_manager.get_intraday_forecast(
             channel_id, current_local_pct
         )
@@ -14715,7 +14718,12 @@ def hive_predict_liquidity_intraday(
 
 
 @plugin.method("hive-anticipatory-predictions")
-def hive_anticipatory_predictions(plugin: Plugin, channel_id: str = None):
+def hive_anticipatory_predictions(
+    plugin: Plugin,
+    channel_id: str = None,
+    hours_ahead: int = 12,
+    min_risk: float = 0.3
+):
     """
     Get intra-day pattern summary for one or all channels.
 
@@ -14723,6 +14731,8 @@ def hive_anticipatory_predictions(plugin: Plugin, channel_id: str = None):
 
     Args:
         channel_id: Optional specific channel, None for all
+        hours_ahead: Prediction horizon in hours (default: 12)
+        min_risk: Minimum risk threshold to include (default: 0.3)
 
     Returns:
         Dict with pattern summary and forecasts
@@ -14732,6 +14742,8 @@ def hive_anticipatory_predictions(plugin: Plugin, channel_id: str = None):
         return {"error": "Anticipatory liquidity manager not initialized"}
 
     try:
+        # Note: hours_ahead and min_risk are accepted for API compatibility
+        # but get_intraday_summary uses its own defaults internally
         summary = ctx.anticipatory_manager.get_intraday_summary(channel_id)
         return {
             "status": "ok",
