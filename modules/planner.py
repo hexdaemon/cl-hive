@@ -221,11 +221,11 @@ class ChannelSizer:
     # Mid-size preference thresholds (avoid very large nodes with high minimums)
     # Nodes with 300+ channels or 500+ BTC often require 5M+ sat minimums
     PREFER_MID_SIZE = True  # Enable mid-size node preference
-    MID_SIZE_OPTIMAL_CHANNELS_MIN = 30   # Sweet spot lower bound
-    MID_SIZE_OPTIMAL_CHANNELS_MAX = 150  # Sweet spot upper bound
-    MID_SIZE_OPTIMAL_BTC_MIN = 20        # Optimal capacity lower bound (BTC)
-    MID_SIZE_OPTIMAL_BTC_MAX = 200       # Optimal capacity upper bound (BTC)
-    LARGE_NODE_PENALTY = 0.7             # Score multiplier for very large nodes
+    MID_SIZE_OPTIMAL_CHANNELS_MIN = 20   # Sweet spot lower bound
+    MID_SIZE_OPTIMAL_CHANNELS_MAX = 100  # Sweet spot upper bound
+    MID_SIZE_OPTIMAL_BTC_MIN = 10        # Optimal capacity lower bound (BTC)
+    MID_SIZE_OPTIMAL_BTC_MAX = 100       # Optimal capacity upper bound (BTC)
+    LARGE_NODE_PENALTY = 0.5             # Score multiplier for very large nodes
 
     # Economic assumptions
     EXPECTED_ANNUAL_FEE_RATE = 0.001  # 0.1% annual return on channel capacity
