@@ -6837,58 +6837,6 @@ async def handle_kalman_velocity_query(args: Dict) -> Dict:
     })
 
 
-async def handle_detect_patterns(args: Dict) -> Dict:
-    """Detect intra-day flow patterns for a channel."""
-    node_name = args.get("node")
-    channel_id = args.get("channel_id")
-
-    node = fleet.get_node(node_name)
-    if not node:
-        return {"error": f"Unknown node: {node_name}"}
-
-    if not channel_id:
-        return {"error": "channel_id is required"}
-
-    return await node.call("hive-detect-patterns", {
-        "channel_id": channel_id
-    })
-
-
-async def handle_predict_liquidity(args: Dict) -> Dict:
-    """Get intra-day liquidity forecast for a channel."""
-    node_name = args.get("node")
-    channel_id = args.get("channel_id")
-    current_local_pct = args.get("current_local_pct", 0.5)
-
-    node = fleet.get_node(node_name)
-    if not node:
-        return {"error": f"Unknown node: {node_name}"}
-
-    if not channel_id:
-        return {"error": "channel_id is required"}
-
-    return await node.call("hive-predict-liquidity", {
-        "channel_id": channel_id,
-        "current_local_pct": current_local_pct
-    })
-
-
-async def handle_anticipatory_predictions(args: Dict) -> Dict:
-    """Get intra-day pattern summary."""
-    node_name = args.get("node")
-    channel_id = args.get("channel_id")  # Optional
-
-    node = fleet.get_node(node_name)
-    if not node:
-        return {"error": f"Unknown node: {node_name}"}
-
-    params = {}
-    if channel_id:
-        params["channel_id"] = channel_id
-
-    return await node.call("hive-anticipatory-predictions", params)
-
-
 # =============================================================================
 # Phase 2: Fee Coordination Handlers
 # =============================================================================
