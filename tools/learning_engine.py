@@ -16,6 +16,7 @@ Usage:
 """
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -515,9 +516,11 @@ class LearningEngine:
             opportunity_type, self.DEFAULT_SUCCESS_RATE
         )
 
-        # Combine: base * action_mult * (0.5 + opp_rate * 0.5)
-        # This means opp_rate of 0.5 is neutral, 1.0 adds 50% boost, 0 reduces by 50%
-        adjusted = base_confidence * action_mult * (0.5 + opp_rate * 0.5)
+        # Use sqrt of action_mult to avoid over-penalizing (Issue #45)
+        # sqrt makes the learned penalty less severe as confidence grows
+        # Example: 0.59 -> sqrt(0.59) = 0.77, so 0.85 * 0.77 = 0.65 (passable)
+        # opp_rate: 0.5 = neutral, 1.0 = 50% boost, 0 = 50% reduction
+        adjusted = base_confidence * math.sqrt(action_mult) * (0.5 + opp_rate * 0.5)
 
         # Clamp to valid range
         return min(0.99, max(0.1, adjusted))
