@@ -491,9 +491,10 @@ class GossipManager:
             return list(self._active_peers)
     
     def mark_peer_inactive(self, peer_id: str) -> None:
-        """Mark a peer as inactive (disconnected)."""
+        """Mark a peer as inactive (disconnected) and cleanup tracking data."""
         with self._lock:
             self._active_peers.discard(peer_id)
+            self._peer_gossip_times.pop(peer_id, None)
     
     def can_send_gossip_to(self, peer_id: str) -> bool:
         """
