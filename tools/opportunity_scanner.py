@@ -350,7 +350,21 @@ class OpportunityScanner:
         """Scan for profitability-related opportunities."""
         opportunities = []
 
-        prof_list = state.get("profitability", [])
+        # Extract channel list from profitability dict structure (Issue #45)
+        prof_data = state.get("profitability", {})
+        if isinstance(prof_data, dict):
+            channels_by_class = prof_data.get("channels_by_class", {})
+            prof_list = []
+            for channels in channels_by_class.values():
+                if isinstance(channels, list):
+                    prof_list.extend(channels)
+        else:
+            prof_list = prof_data  # Legacy list format
+
+        # Use channels data for balance info (prof_list may not have it)
+        channels = state.get("channels", [])
+        channel_map = {ch.get("channel_id") or ch.get("scid"): ch for ch in channels}
+
         dashboard = state.get("dashboard", {})
         bleeders = dashboard.get("bleeder_warnings", [])
 
@@ -380,9 +394,18 @@ class OpportunityScanner:
             opportunities.append(opp)
 
         # Stagnant channels (100% local, no flow)
-        for ch in prof_list:
-            if ch.get("balance_ratio", 0) > 0.95 and ch.get("forward_count", 0) == 0:
-                channel_id = ch.get("channel_id") or ch.get("scid")
+        # Use channels data for balance info, merge with profitability
+        for ch in channels:
+            channel_id = ch.get("channel_id") or ch.get("scid")
+            balance_ratio = ch.get("balance_ratio", 0)
+            forward_count = ch.get("forward_count", 0)
+
+            if balance_ratio > 0.95 and forward_count == 0:
+                # Merge with profitability data if available
+                current_state = dict(ch)
+                if channel_id in channel_map:
+                    current_state.update(channel_map.get(channel_id, {}))
+
                 opp = Opportunity(
                     opportunity_type=OpportunityType.STAGNANT_CHANNEL,
                     action_type=ActionType.FEE_CHANGE,
@@ -398,7 +421,7 @@ class OpportunityScanner:
                     predicted_benefit=500,
                     classification=ActionClassification.AUTO_EXECUTE,
                     auto_execute_safe=True,
-                    current_state=ch
+                    current_state=current_state
                 )
                 opportunities.append(opp)
 
