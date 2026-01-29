@@ -7,7 +7,7 @@
 FROM ubuntu:24.04
 
 LABEL maintainer="Lightning Goats Team"
-LABEL version="2.2.1"
+LABEL version="2.2.2"
 LABEL description="Production Lightning node with cl-hive coordination"
 
 # Prevent interactive prompts during install
@@ -187,7 +187,7 @@ RUN git clone --depth 1 --branch ${CLN_REST_VERSION} https://github.com/Ride-The
 # For hot upgrades, mount from host in docker-compose.yml:
 #   - /path/to/cl_revenue_ops:/opt/cl-revenue-ops:ro
 
-ARG CL_REVENUE_OPS_VERSION=v2.2.1
+ARG CL_REVENUE_OPS_VERSION=v2.2.2
 RUN git clone --depth 1 --branch ${CL_REVENUE_OPS_VERSION} https://github.com/lightning-goats/cl_revenue_ops.git /opt/cl-revenue-ops \
     && chmod +x /opt/cl-revenue-ops/cl-revenue-ops.py
 
