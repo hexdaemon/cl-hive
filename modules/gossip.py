@@ -13,6 +13,7 @@ Threshold Rules:
 Author: Lightning Goats Team
 """
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -70,18 +71,18 @@ class GossipState:
 class GossipManager:
     """
     Manages gossip broadcasting with threshold-based filtering.
-    
+
     Responsibilities:
     - Track last broadcast state to detect meaningful changes
     - Determine if current state warrants a broadcast
     - Create gossip payloads for transmission
     - Process incoming gossip and delegate to StateManager
-    
+
     Thread Safety:
-    - All state is local to this manager instance
-    - No shared mutable state between threads
+    - _last_broadcast_state, _peer_gossip_times, and _active_peers protected by _lock
+    - Multiple background loops (gossip_loop, custommsg handler) access this manager
     """
-    
+
     def __init__(self, state_manager, plugin=None,
                  heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL,
                  get_membership_hash: Optional[Callable[[], str]] = None):
@@ -98,6 +99,9 @@ class GossipManager:
         self.plugin = plugin
         self.heartbeat_interval = heartbeat_interval
         self.get_membership_hash = get_membership_hash
+
+        # Lock protecting _last_broadcast_state, _peer_gossip_times, _active_peers
+        self._lock = threading.Lock()
 
         # Track our last broadcast state
         self._last_broadcast_state = GossipState()
@@ -116,10 +120,11 @@ class GossipManager:
         the version number after a restart.
         """
         our_state = self.state_manager.get_peer_state(our_pubkey)
-        if our_state and our_state.version > self._last_broadcast_state.version:
-            old_version = self._last_broadcast_state.version
-            self._last_broadcast_state.version = our_state.version
-            self._log(f"Synced version from state manager: v{old_version} -> v{our_state.version}")
+        with self._lock:
+            if our_state and our_state.version > self._last_broadcast_state.version:
+                old_version = self._last_broadcast_state.version
+                self._last_broadcast_state.version = our_state.version
+                self._log(f"Synced version from state manager: v{old_version} -> v{our_state.version}")
     
     def _log(self, msg: str, level: str = "info") -> None:
         """Log a message if plugin is available."""
@@ -136,63 +141,65 @@ class GossipManager:
                          force_status: bool = False) -> bool:
         """
         Determine if current state warrants a gossip broadcast.
-        
+
         Threshold Rules (OR logic - any trigger broadcasts):
         1. Capacity change > 10% from last broadcast
         2. Any change in fee_policy (base_fee, fee_rate, etc.)
         3. force_status=True (ban/unban events)
         4. Heartbeat timeout exceeded
-        
+
         Args:
             new_capacity: Current total capacity in sats
             new_available: Current available liquidity in sats
             new_fee_policy: Current fee policy dict
             new_topology: Current external peer list
             force_status: True to force broadcast (status change)
-            
+
         Returns:
             True if broadcast should be sent, False otherwise
         """
-        old = self._last_broadcast_state
         now = int(time.time())
-        
+
         # Rule 3: Force on status change (bans, promotions)
         if force_status:
             self._log("Broadcast triggered: Status change (forced)")
             return True
-        
-        # Rule 4: Heartbeat timeout
-        time_since_last = now - old.last_broadcast
-        if time_since_last >= self.heartbeat_interval:
-            self._log(f"Broadcast triggered: Heartbeat ({time_since_last}s elapsed)")
-            return True
-        
-        # Rule 1: Capacity change > 10%
-        if old.capacity_sats > 0:
-            capacity_delta = abs(new_capacity - old.capacity_sats)
-            capacity_ratio = capacity_delta / old.capacity_sats
-            if capacity_ratio > CAPACITY_CHANGE_THRESHOLD:
-                self._log(f"Broadcast triggered: Capacity change ({capacity_ratio:.1%})")
+
+        with self._lock:
+            old = self._last_broadcast_state
+
+            # Rule 4: Heartbeat timeout
+            time_since_last = now - old.last_broadcast
+            if time_since_last >= self.heartbeat_interval:
+                self._log(f"Broadcast triggered: Heartbeat ({time_since_last}s elapsed)")
                 return True
-        elif new_capacity > 0:
-            # First time having capacity
-            self._log("Broadcast triggered: First capacity")
-            return True
-        
-        # Rule 2: Any fee policy change
-        if self._fee_policy_changed(old.fee_policy, new_fee_policy):
-            self._log("Broadcast triggered: Fee policy change")
-            return True
-        
-        # Rule 2b: Topology change (new external connections)
-        old_topo_set = set(old.topology)
-        new_topo_set = set(new_topology)
-        if old_topo_set != new_topo_set:
-            added = new_topo_set - old_topo_set
-            removed = old_topo_set - new_topo_set
-            self._log(f"Broadcast triggered: Topology change (+{len(added)}/-{len(removed)})")
-            return True
-        
+
+            # Rule 1: Capacity change > 10%
+            if old.capacity_sats > 0:
+                capacity_delta = abs(new_capacity - old.capacity_sats)
+                capacity_ratio = capacity_delta / old.capacity_sats
+                if capacity_ratio > CAPACITY_CHANGE_THRESHOLD:
+                    self._log(f"Broadcast triggered: Capacity change ({capacity_ratio:.1%})")
+                    return True
+            elif new_capacity > 0:
+                # First time having capacity
+                self._log("Broadcast triggered: First capacity")
+                return True
+
+            # Rule 2: Any fee policy change
+            if self._fee_policy_changed(old.fee_policy, new_fee_policy):
+                self._log("Broadcast triggered: Fee policy change")
+                return True
+
+            # Rule 2b: Topology change (new external connections)
+            old_topo_set = set(old.topology)
+            new_topo_set = set(new_topology)
+            if old_topo_set != new_topo_set:
+                added = new_topo_set - old_topo_set
+                removed = old_topo_set - new_topo_set
+                self._log(f"Broadcast triggered: Topology change (+{len(added)}/-{len(removed)})")
+                return True
+
         return False
     
     def _fee_policy_changed(self, old_policy: Dict, new_policy: Dict) -> bool:
@@ -242,24 +249,26 @@ class GossipManager:
             Dict payload ready for GOSSIP message serialization
         """
         now = int(time.time())
-        new_version = self._last_broadcast_state.version + 1
 
         # Default capabilities include MCF support (this node has it)
         if capabilities is None:
             capabilities = [CAPABILITY_MCF]
 
-        # Update our tracking state
-        self._last_broadcast_state = GossipState(
-            capacity_sats=capacity_sats,
-            available_sats=available_sats,
-            fee_policy=fee_policy.copy(),
-            topology=topology.copy(),
-            last_broadcast=now,
-            version=new_version,
-            budget_available_sats=budget_available_sats,
-            budget_reserved_until=budget_reserved_until,
-            capabilities=capabilities.copy(),
-        )
+        with self._lock:
+            new_version = self._last_broadcast_state.version + 1
+
+            # Update our tracking state
+            self._last_broadcast_state = GossipState(
+                capacity_sats=capacity_sats,
+                available_sats=available_sats,
+                fee_policy=fee_policy.copy(),
+                topology=topology.copy(),
+                last_broadcast=now,
+                version=new_version,
+                budget_available_sats=budget_available_sats,
+                budget_reserved_until=budget_reserved_until,
+                capabilities=capabilities.copy(),
+            )
 
         # Also update the state manager with our local state
         # Pass the gossip version to ensure it gets persisted for restart recovery
@@ -331,8 +340,9 @@ class GossipManager:
             return False
 
         # Track active peer
-        self._active_peers.add(sender_id)
-        
+        with self._lock:
+            self._active_peers.add(sender_id)
+
         # Delegate to state manager
         return self.state_manager.update_peer_state(sender_id, payload)
     
@@ -477,31 +487,35 @@ class GossipManager:
     
     def get_active_peers(self) -> List[str]:
         """Get list of peers we've received gossip from."""
-        return list(self._active_peers)
+        with self._lock:
+            return list(self._active_peers)
     
     def mark_peer_inactive(self, peer_id: str) -> None:
         """Mark a peer as inactive (disconnected)."""
-        self._active_peers.discard(peer_id)
+        with self._lock:
+            self._active_peers.discard(peer_id)
     
     def can_send_gossip_to(self, peer_id: str) -> bool:
         """
         Check if we can send gossip to a peer (rate limiting).
-        
+
         Enforces minimum interval between gossip to same peer.
-        
+
         Args:
             peer_id: Target peer's public key
-            
+
         Returns:
             True if enough time has passed since last gossip
         """
         now = int(time.time())
-        last_time = self._peer_gossip_times.get(peer_id, 0)
+        with self._lock:
+            last_time = self._peer_gossip_times.get(peer_id, 0)
         return (now - last_time) >= MIN_GOSSIP_INTERVAL
     
     def record_gossip_sent(self, peer_id: str) -> None:
         """Record that we sent gossip to a peer."""
-        self._peer_gossip_times[peer_id] = int(time.time())
+        with self._lock:
+            self._peer_gossip_times[peer_id] = int(time.time())
     
     # =========================================================================
     # STATISTICS
@@ -510,17 +524,21 @@ class GossipManager:
     def get_gossip_stats(self) -> Dict[str, Any]:
         """
         Get gossip statistics.
-        
+
         Returns:
             Dict with gossip metrics
         """
         now = int(time.time())
-        last_broadcast = self._last_broadcast_state.last_broadcast
-        
+        with self._lock:
+            last_broadcast = self._last_broadcast_state.last_broadcast
+            version = self._last_broadcast_state.version
+            active_peers_count = len(self._active_peers)
+            tracked_peers_count = len(self._peer_gossip_times)
+
         return {
-            "version": self._last_broadcast_state.version,
+            "version": version,
             "last_broadcast_ago": now - last_broadcast if last_broadcast else None,
             "heartbeat_interval": self.heartbeat_interval,
-            "active_peers": len(self._active_peers),
-            "tracked_peers": len(self._peer_gossip_times)
+            "active_peers": active_peers_count,
+            "tracked_peers": tracked_peers_count
         }
