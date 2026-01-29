@@ -2179,101 +2179,6 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 "required": ["node", "channel_id"]
             }
         ),
-        Tool(
-            name="detect_patterns",
-            description="""Detect Kalman-enhanced intra-day flow patterns for a channel.
-
-**What it detects:**
-- Morning surge (05:00-08:00) - Pre-market positioning
-- Morning active (08:00-12:00) - Active trading hours
-- Afternoon (12:00-17:00) - Lunch lull to afternoon
-- Evening peak (17:00-21:00) - High activity period
-- Night (21:00-00:00) - Wind down
-- Overnight (00:00-05:00) - Low activity, rebalance window
-
-**How Kalman improves detection:**
-- Velocity tracking for earlier pattern onset detection
-- Regime change detection to invalidate stale patterns
-- Uncertainty-weighted confidence
-
-**When to use:** To understand a channel's daily flow patterns and plan preemptive actions.""",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name"
-                    },
-                    "channel_id": {
-                        "type": "string",
-                        "description": "Channel ID to analyze"
-                    }
-                },
-                "required": ["node", "channel_id"]
-            }
-        ),
-        Tool(
-            name="predict_liquidity",
-            description="""Get intra-day liquidity forecast for a channel.
-
-**What it predicts:**
-- Expected velocity in the next phase
-- Direction of flow (inbound/outbound/balanced)
-- Risk of depletion or saturation
-- Recommended action and urgency
-
-**Recommended actions:**
-- preposition: Move liquidity before pattern hits
-- raise_fees: Capture premium during high-demand period
-- lower_fees: Attract flow during low period
-- monitor: No action needed
-
-**When to use:** Before each day phase transition to take preemptive action.""",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name"
-                    },
-                    "channel_id": {
-                        "type": "string",
-                        "description": "Channel ID"
-                    },
-                    "current_local_pct": {
-                        "type": "number",
-                        "description": "Current local balance percentage (0.0-1.0)"
-                    }
-                },
-                "required": ["node", "channel_id"]
-            }
-        ),
-        Tool(
-            name="anticipatory_predictions",
-            description="""Get intra-day pattern summary for one or all channels.
-
-**What it shows:**
-- Total patterns detected and actionable ones
-- Pattern type distribution (surge, drain, active, quiet, transition)
-- Forecasts with recommended actions
-- Urgent forecasts requiring immediate attention
-
-**When to use:** For a dashboard view of all channels' intra-day patterns and upcoming actions needed.""",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name"
-                    },
-                    "channel_id": {
-                        "type": "string",
-                        "description": "Optional: specific channel, omit for all"
-                    }
-                },
-                "required": ["node"]
-            }
-        ),
         # =======================================================================
         # Phase 2: Fee Coordination Tools
         # =======================================================================
@@ -3547,13 +3452,6 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
         # Kalman Velocity Integration tools
         elif name == "kalman_velocity_query":
             result = await handle_kalman_velocity_query(arguments)
-        # Intra-Day Pattern Detection tools
-        elif name == "detect_patterns":
-            result = await handle_detect_patterns(arguments)
-        elif name == "predict_liquidity":
-            result = await handle_predict_liquidity(arguments)
-        elif name == "anticipatory_predictions":
-            result = await handle_anticipatory_predictions(arguments)
         # Phase 2: Fee Coordination tools
         elif name == "coord_fee_recommendation":
             result = await handle_coord_fee_recommendation(arguments)
