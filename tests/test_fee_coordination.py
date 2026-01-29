@@ -499,13 +499,17 @@ class TestMyceliumDefenseSystem:
 
         assert threat is None
 
-    def test_handle_warning(self):
-        """Test handling incoming warning."""
+    def test_handle_warning_self_detected(self):
+        """Test self-detected threat triggers immediate defense."""
+        our_pubkey = "02" + "c" * 64
+        self.defense.set_our_pubkey(our_pubkey)
+
+        # Self-detected threat should trigger immediately (no quorum needed)
         warning = PeerWarning(
             peer_id="02" + "a" * 64,
             threat_type="drain",
             severity=0.7,
-            reporter="02" + "b" * 64,
+            reporter=our_pubkey,  # Self-reported
             timestamp=time.time(),
             ttl=24 * 3600
         )
@@ -515,20 +519,52 @@ class TestMyceliumDefenseSystem:
         assert result is not None
         assert result["multiplier"] > 1.0
 
+    def test_handle_warning_quorum_required(self):
+        """Test remote warnings require quorum before defense activates."""
+        peer_id = "02" + "a" * 64
+
+        # First remote warning - quorum not met
+        warning1 = PeerWarning(
+            peer_id=peer_id,
+            threat_type="drain",
+            severity=0.7,
+            reporter="02" + "b" * 64,
+            timestamp=time.time(),
+            ttl=24 * 3600
+        )
+        result = self.defense.handle_warning(warning1)
+        assert result is None  # Quorum not met
+
+        # Second independent report - quorum met
+        warning2 = PeerWarning(
+            peer_id=peer_id,
+            threat_type="drain",
+            severity=0.6,
+            reporter="02" + "c" * 64,  # Different reporter
+            timestamp=time.time(),
+            ttl=24 * 3600
+        )
+        result = self.defense.handle_warning(warning2)
+        assert result is not None
+        assert result["multiplier"] > 1.0
+        assert result["report_count"] == 2
+
     def test_defensive_multiplier(self):
         """Test getting defensive multiplier."""
         peer_id = "02" + "a" * 64
+        our_pubkey = "02" + "d" * 64
+        self.defense.set_our_pubkey(our_pubkey)
 
         # No warning - should be 1.0
         mult = self.defense.get_defensive_multiplier(peer_id)
         assert mult == 1.0
 
-        # Add warning
+        # Add self-detected warning (triggers immediately)
         warning = PeerWarning(
             peer_id=peer_id,
             threat_type="drain",
             severity=0.5,
-            reporter="02" + "b" * 64,
+            reporter=our_pubkey,  # Self-detected
             timestamp=time.time(),
             ttl=24 * 3600
         )

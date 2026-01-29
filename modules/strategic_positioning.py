@@ -1102,6 +1102,9 @@ class PhysarumChannelManager:
         Calculate flow intensity for a channel.
 
         Flow intensity = Daily volume / Capacity
+
+        Uses actual channel age from SCID block height for accurate
+        daily volume estimation instead of assuming 30 days.
         """
         channels = self._get_channel_data(channel_id)
         if not channels:
@@ -1129,10 +1132,13 @@ class PhysarumChannelManager:
 
         total_volume_sats = (in_fulfilled_msat + out_fulfilled_msat) // 1000
 
-        # Estimate daily volume (assuming channel has been open for a while)
-        # In a real implementation, we'd track this over time
-        # For now, assume this is monthly volume
-        daily_volume_sats = total_volume_sats / 30
+        # Get actual channel age for accurate daily volume calculation
+        age_days = self._get_channel_age_days(channel_id)
+        if age_days <= 0:
+            age_days = 30  # Fallback to 30 days if age unknown
+
+        # Calculate daily volume using actual channel lifetime
+        daily_volume_sats = total_volume_sats / age_days
 
         # Flow intensity = daily volume / capacity
         flow_intensity = daily_volume_sats / capacity_sats
@@ -1140,10 +1146,37 @@ class PhysarumChannelManager:
         return flow_intensity
 
     def _get_channel_age_days(self, channel_id: str) -> int:
-        """Get channel age in days."""
-        # In a real implementation, this would use funding blockheight
-        # For now, return a default
-        return 60
+        """
+        Get channel age in days from funding block height.
+
+        Extracts block height from SCID (format: block_height x tx_index x output_index)
+        and compares to current block height to get age.
+
+        Returns:
+            Channel age in days, or 0 if unable to determine
+        """
+        try:
+            # Normalize SCID format
+            normalized = channel_id.replace(":", "x")
+            parts = normalized.split("x")
+            if len(parts) != 3:
+                return 0
+
+            funding_block = int(parts[0])
+
+            # Get current block height
+            if self.plugin:
+                info = self.plugin.rpc.getinfo()
+                current_block = info.get("blockheight", 0)
+                if current_block > funding_block:
+                    # Approximate: 144 blocks per day on average
+                    blocks_elapsed = current_block - funding_block
+                    age_days = max(1, blocks_elapsed // 144)
+                    return age_days
+
+            return 0
+        except Exception:
+            return 0
 
     def _get_channel_revenue(self, channel_id: str) -> int:
         """Get channel revenue in sats."""

@@ -8089,6 +8089,18 @@ def fee_intelligence_loop():
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Remote pheromone cleanup error: {e}", level='warn')
 
+            # Step 10a: Evaporate local pheromones (time-based decay for idle channels)
+            try:
+                if fee_coordination_mgr:
+                    evaporated = fee_coordination_mgr.adaptive_controller.evaporate_all_pheromones()
+                    if evaporated > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Applied time-based decay to {evaporated} channel pheromones",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Local pheromone evaporation error: {e}", level='warn')
+
             # Step 11: Cleanup old remote yield metrics (Phase 14)
             try:
                 if yield_metrics_mgr:

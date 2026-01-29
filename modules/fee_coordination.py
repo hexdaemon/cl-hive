@@ -46,6 +46,7 @@ MARKER_MIN_STRENGTH = 0.1         # Below this, markers are ignored
 
 # Mycelium defense
 DRAIN_RATIO_THRESHOLD = 5.0       # 5:1 outflow ratio = drain attack
+DEFENSE_QUORUM_THRESHOLD = 2      # Min independent reports before fleet defense activates
 FAILURE_RATE_THRESHOLD = 0.5      # >50% failures = unreliable peer
 WARNING_TTL_HOURS = 24            # Warnings expire after 24 hours
 DEFENSIVE_FEE_MAX_MULTIPLIER = 3.0  # Max 3x fee increase for defense
@@ -645,6 +646,9 @@ class AdaptiveFeeController:
         # Track the fee that earned each pheromone level
         self._pheromone_fee: Dict[str, int] = {}
 
+        # Track when each pheromone was last updated (for time-based decay)
+        self._pheromone_last_update: Dict[str, float] = {}
+
         # Map channel_id to peer_id for sharing
         self._channel_peer_map: Dict[str, str] = {}
 
@@ -736,11 +740,31 @@ class AdaptiveFeeController:
         Success → deposit pheromone (reinforce this fee)
         Failure → no deposit (let it evaporate)
         High revenue → stronger deposit
+
+        Time-based decay: Pheromone decays exponentially based on time since
+        last update, not just per-call. This ensures idle channels properly
+        lose their pheromone over time.
         """
+        now = time.time()
         evap_rate = self.calculate_evaporation_rate(channel_id)
 
-        # Evaporate existing pheromone
-        self._pheromone[channel_id] *= (1 - evap_rate)
+        # Apply time-based exponential decay (half-life model)
+        # If no timestamp exists, apply at least one cycle of decay
+        if channel_id in self._pheromone_last_update:
+            last_update = self._pheromone_last_update[channel_id]
+            hours_elapsed = (now - last_update) / 3600.0
+            if hours_elapsed > 0 and self._pheromone[channel_id] > 0:
+                # Convert per-cycle evaporation to continuous decay
+                # If evap_rate = 0.2 means 20% loss per hour, apply proportionally
+                decay_factor = math.pow(1 - evap_rate, hours_elapsed)
+                self._pheromone[channel_id] *= decay_factor
+        elif self._pheromone[channel_id] > 0:
+            # No timestamp but has pheromone - apply one cycle of decay
+            # This handles legacy data and ensures evaporation on failure
+            self._pheromone[channel_id] *= (1 - evap_rate)
+
+        # Update timestamp
+        self._pheromone_last_update[channel_id] = now
 
         if routing_success:
             # Deposit proportional to revenue
@@ -991,6 +1015,44 @@ class AdaptiveFeeController:
                 del self._remote_pheromones[peer_id]
 
         return cleaned
+
+    def evaporate_all_pheromones(self) -> int:
+        """
+        Apply time-based decay to ALL local pheromones.
+
+        Called periodically from maintenance loop to ensure idle channels
+        properly lose their pheromone over time, even if they haven't routed.
+
+        Returns:
+            Number of channels that had pheromone evaporated
+        """
+        now = time.time()
+        evaporated = 0
+        min_pheromone = 0.01  # Below this, remove entirely
+
+        for channel_id in list(self._pheromone.keys()):
+            if self._pheromone[channel_id] <= 0:
+                continue
+
+            last_update = self._pheromone_last_update.get(channel_id, now)
+            hours_elapsed = (now - last_update) / 3600.0
+
+            if hours_elapsed > 0:
+                evap_rate = self.calculate_evaporation_rate(channel_id)
+                decay_factor = math.pow(1 - evap_rate, hours_elapsed)
+                old_level = self._pheromone[channel_id]
+                self._pheromone[channel_id] *= decay_factor
+                self._pheromone_last_update[channel_id] = now
+
+                if old_level > min_pheromone and self._pheromone[channel_id] <= min_pheromone:
+                    # Pheromone dropped below threshold, clean up
+                    del self._pheromone[channel_id]
+                    self._pheromone_fee.pop(channel_id, None)
+                    self._pheromone_last_update.pop(channel_id, None)
+
+                evaporated += 1
+
+        return evaporated
 
 
 # =============================================================================
@@ -1244,6 +1306,11 @@ class MyceliumDefenseSystem:
 
     When one member detects a threat, all members respond.
     Like chemical signals through mycelium network.
+
+    Quorum Requirement (anti-false-positive):
+    - Local self-detected threats: immediate defense (self-preservation)
+    - Remote warnings: require DEFENSE_QUORUM_THRESHOLD independent reports
+      before activating fleet-wide defense (prevents manipulation)
     """
 
     def __init__(self, database: Any, plugin: Any, gossip_mgr: Any = None):
@@ -1252,8 +1319,11 @@ class MyceliumDefenseSystem:
         self.gossip_mgr = gossip_mgr
         self.our_pubkey: Optional[str] = None
 
-        # Active warnings
+        # Active warnings (most recent per peer)
         self._warnings: Dict[str, PeerWarning] = {}
+
+        # Track all reports per peer for quorum (peer_id -> {reporter_id: warning})
+        self._warning_reports: Dict[str, Dict[str, PeerWarning]] = defaultdict(dict)
 
         # Temporary defensive fees
         self._defensive_fees: Dict[str, Dict] = {}
@@ -1355,30 +1425,69 @@ class MyceliumDefenseSystem:
         """
         Respond to warning from another fleet member.
 
-        Returns defensive fee adjustment if applicable.
+        Implements quorum requirement for remote warnings:
+        - Self-detected threats (reporter == our_pubkey): immediate defense
+        - Remote warnings: require DEFENSE_QUORUM_THRESHOLD independent reports
+
+        Returns defensive fee adjustment if applicable, None if quorum not met.
         """
-        # Store warning
-        self._warnings[warning.peer_id] = warning
+        peer_id = warning.peer_id
+        reporter = warning.reporter
 
-        # Calculate defensive fee increase
-        multiplier = 1 + (warning.severity * (DEFENSIVE_FEE_MAX_MULTIPLIER - 1))
+        # Store warning in reports tracker
+        self._warning_reports[peer_id][reporter] = warning
 
-        self._defensive_fees[warning.peer_id] = {
+        # Clean expired reports for this peer
+        now = time.time()
+        self._warning_reports[peer_id] = {
+            r: w for r, w in self._warning_reports[peer_id].items()
+            if now < (w.timestamp + w.ttl)
+        }
+
+        # Store most recent warning
+        self._warnings[peer_id] = warning
+
+        # Check if this is a self-detected threat (immediate defense)
+        is_self_detected = (reporter == self.our_pubkey)
+
+        # Count independent reports (excluding self if also reported by others)
+        report_count = len(self._warning_reports[peer_id])
+
+        # Quorum check: self-detected OR enough independent reports
+        quorum_met = is_self_detected or (report_count >= DEFENSE_QUORUM_THRESHOLD)
+
+        if not quorum_met:
+            self._log(
+                f"Warning for {peer_id[:12]} from {reporter[:12]} "
+                f"(reports: {report_count}/{DEFENSE_QUORUM_THRESHOLD}, awaiting quorum)",
+                level="debug"
+            )
+            return None
+
+        # Calculate defensive fee increase (average severity from all reporters)
+        total_severity = sum(w.severity for w in self._warning_reports[peer_id].values())
+        avg_severity = total_severity / report_count
+        multiplier = 1 + (avg_severity * (DEFENSIVE_FEE_MAX_MULTIPLIER - 1))
+
+        self._defensive_fees[peer_id] = {
             "multiplier": multiplier,
             "expires_at": warning.timestamp + warning.ttl,
             "threat_type": warning.threat_type,
-            "reporter": warning.reporter
+            "reporter": reporter,
+            "report_count": report_count
         }
 
         self._log(
             f"Defensive fee multiplier {multiplier:.2f}x applied to "
-            f"{warning.peer_id[:12]} (warning from {warning.reporter[:12]})"
+            f"{peer_id[:12]} (quorum: {report_count} reports, "
+            f"{'self-detected' if is_self_detected else 'fleet consensus'})"
         )
 
         return {
-            "peer_id": warning.peer_id,
+            "peer_id": peer_id,
             "multiplier": multiplier,
-            "expires_at": warning.timestamp + warning.ttl
+            "expires_at": warning.timestamp + warning.ttl,
+            "report_count": report_count
         }
 
     def get_defensive_multiplier(self, peer_id: str) -> float:
@@ -1413,6 +1522,16 @@ class MyceliumDefenseSystem:
                 del self._defensive_fees[peer_id]
                 if peer_id not in expired:
                     expired.append(peer_id)
+
+        # Clean up expired reports from quorum tracking
+        for peer_id in list(self._warning_reports.keys()):
+            self._warning_reports[peer_id] = {
+                r: w for r, w in self._warning_reports[peer_id].items()
+                if now < (w.timestamp + w.ttl)
+            }
+            # Remove peer entry if no reports left
+            if not self._warning_reports[peer_id]:
+                del self._warning_reports[peer_id]
 
         if expired:
             self._log(f"Expired warnings for {len(expired)} peers")
