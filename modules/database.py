@@ -19,7 +19,8 @@ import time
 import json
 import threading
 import hashlib
-from typing import Dict, List, Optional, Any, Tuple
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Any, Tuple, Generator
 from pathlib import Path
 
 
@@ -67,21 +68,51 @@ class HiveDatabase:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             
             # Create new connection for this thread
+            # Use default isolation_level ('DEFERRED') to enable transaction support.
+            # This allows multi-step operations to be atomic via BEGIN/COMMIT/ROLLBACK.
+            # Single statements still auto-commit when not in an explicit transaction.
             self._local.conn = sqlite3.connect(
                 self.db_path,
-                isolation_level=None  # Autocommit mode
+                timeout=30.0  # Wait up to 30s for locks instead of failing immediately
             )
             self._local.conn.row_factory = sqlite3.Row
-            
+
             # Enable Write-Ahead Logging for better multi-thread concurrency
             self._local.conn.execute("PRAGMA journal_mode=WAL;")
+            # Ensure foreign keys are enforced
+            self._local.conn.execute("PRAGMA foreign_keys=ON;")
             
             self.plugin.log(
                 f"HiveDatabase: Created thread-local connection (thread={threading.current_thread().name})",
                 level='debug'
             )
         return self._local.conn
-    
+
+    @contextmanager
+    def transaction(self) -> Generator[sqlite3.Connection, None, None]:
+        """
+        Context manager for atomic database transactions.
+
+        Use this for multi-step operations that must succeed or fail together.
+
+        Example:
+            with self.transaction() as conn:
+                conn.execute("INSERT INTO table1 ...")
+                conn.execute("INSERT INTO table2 ...")
+            # Both inserts committed, or both rolled back on error
+
+        Yields:
+            sqlite3.Connection: The thread-local connection in transaction mode
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN")
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
     def initialize(self):
         """Create database tables if they don't exist."""
         conn = self._get_connection()
