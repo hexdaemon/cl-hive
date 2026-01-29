@@ -726,7 +726,7 @@ class ProactiveAdvisor:
                 "routing_intelligence_status": routing_intel.get("status", "unknown"),
             },
             "channels": channels,
-            "profitability": prof_list,
+            "profitability": prof_data,
             "context": results.get("context", {}),
             "velocities": results.get("velocities", {}),
             "dashboard": dashboard,
