@@ -124,7 +124,7 @@ MAX_FEE_CHANGE_PCT = 15  # Max 15% per change (more conservative than 25%)
 # - Default conservative threshold for new deployments
 # - Lower threshold unlocked after proven performance
 MIN_AUTO_EXECUTE_CONFIDENCE_DEFAULT = 0.8
-MIN_AUTO_EXECUTE_CONFIDENCE_PROVEN = 0.6
+MIN_AUTO_EXECUTE_CONFIDENCE_PROVEN = 0.55
 PROVEN_OUTCOMES_THRESHOLD = 200
 PROVEN_SUCCESS_RATE_THRESHOLD = 0.95
 
