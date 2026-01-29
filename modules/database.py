@@ -68,11 +68,12 @@ class HiveDatabase:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             
             # Create new connection for this thread
-            # Use default isolation_level ('DEFERRED') to enable transaction support.
-            # This allows multi-step operations to be atomic via BEGIN/COMMIT/ROLLBACK.
-            # Single statements still auto-commit when not in an explicit transaction.
+            # Use isolation_level=None (autocommit mode) - each statement commits immediately.
+            # This prevents long-running implicit transactions from holding locks.
+            # For explicit transactions, use BEGIN/COMMIT/ROLLBACK directly.
             self._local.conn = sqlite3.connect(
                 self.db_path,
+                isolation_level=None,  # Autocommit mode - critical for multi-threaded access
                 timeout=30.0  # Wait up to 30s for locks instead of failing immediately
             )
             self._local.conn.row_factory = sqlite3.Row
@@ -106,7 +107,8 @@ class HiveDatabase:
         """
         conn = self._get_connection()
         try:
-            conn.execute("BEGIN")
+            # BEGIN IMMEDIATE acquires write lock immediately, preventing deadlocks
+            conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.execute("COMMIT")
         except Exception:
@@ -140,7 +142,7 @@ class HiveDatabase:
             conn.execute(
                 "ALTER TABLE hive_members ADD COLUMN addresses TEXT"
             )
-        except Exception:
+        except sqlite3.OperationalError:
             pass  # Column already exists
 
         # =====================================================================
@@ -277,7 +279,7 @@ class HiveDatabase:
             conn.execute(
                 "ALTER TABLE ban_proposals ADD COLUMN proposal_type TEXT NOT NULL DEFAULT 'standard'"
             )
-        except Exception:
+        except sqlite3.OperationalError:
             pass  # Column already exists
 
         conn.execute("""
@@ -1062,7 +1064,7 @@ class HiveDatabase:
             conn.execute(
                 "ALTER TABLE fee_reports ADD COLUMN rebalance_costs_sats INTEGER NOT NULL DEFAULT 0"
             )
-        except Exception:
+        except sqlite3.OperationalError:
             pass  # Column already exists
 
         conn.execute("PRAGMA optimize;")
