@@ -300,25 +300,27 @@ All options can be set in your CLN config file or passed as CLI arguments. Most 
 | `hive-vpn-peers` | `` | VPN peer mappings (pubkey@ip:port) |
 | `hive-vpn-required-messages` | `all` | Messages requiring VPN: all, gossip, intent, sync, none |
 
-## Claude Code Integration (MCP Server)
+## AI Agent Integration (MCP Server)
 
-The `mcp-hive-server.py` allows Claude Code to act as an AI oracle for your Hive fleet. This enables natural language fleet management:
+The `mcp-hive-server.py` provides Model Context Protocol (MCP) tools for AI-assisted fleet management. Works with any MCP-compatible agent: Moltbots, Claude Code, Clawdbot, or similar.
 
 ```
 "Show me the status of all hive nodes"
 "What pending actions need approval?"
-"Approve action 5 on alice - good expansion target"
+"Check the revenue dashboard for both nodes"
 ```
 
-See [MCP Server Documentation](docs/MCP_SERVER.md) for setup instructions.
+See:
+- [MOLTY.md](MOLTY.md) - Agent instructions for using cl-hive tools
+- [MCP Server Documentation](docs/MCP_SERVER.md) - Full setup and tool reference
 
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
 | [Joining the Hive](docs/JOINING_THE_HIVE.md) | How to join an existing hive |
-| [MCP Server](docs/MCP_SERVER.md) | Claude Code integration guide |
-| [AI Advisor Setup](docs/AI_ADVISOR_SETUP.md) | AI-assisted fleet management |
+| [MOLTY.md](MOLTY.md) | AI agent instructions |
+| [MCP Server](docs/MCP_SERVER.md) | MCP server setup and tool reference |
 | [Cooperative Fee Coordination](docs/design/cooperative-fee-coordination.md) | Fee coordination design |
 | [VPN Transport](docs/design/VPN_HIVE_TRANSPORT.md) | VPN transport design |
 | [Liquidity Integration](docs/design/LIQUIDITY_INTEGRATION.md) | cl-revenue-ops integration |

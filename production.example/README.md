@@ -1,5 +1,11 @@
 # Production AI Advisor Deployment
 
+> ⚠️ **DEPRECATED**: The automated systemd timer approach is deprecated. Instead, integrate the MCP server with your preferred AI agent (Moltbots, Claude Code, Clawdbot, etc.) and let it manage monitoring directly. See [MOLTY.md](../MOLTY.md) for agent integration instructions.
+>
+> This folder remains useful for the **node configuration templates** (`nodes.production.json`, `mcp-config.json`) and **strategy prompts**, but the systemd timer is no longer recommended.
+
+---
+
 This folder contains templates for deploying the cl-hive AI Advisor on a production management server. The advisor runs automatically every 15 minutes, reviewing pending actions, monitoring financial health, and flagging problematic channels.
 
 ## Architecture
@@ -316,6 +322,6 @@ lightning-cli createrune restrictions='[["method^hive-","method^getinfo","method
 
 ## Related Documentation
 
+- [MOLTY.md](../MOLTY.md) - AI agent integration instructions (recommended)
 - [MCP Server Reference](../docs/MCP_SERVER.md) - Full tool documentation
-- [AI Advisor Setup Guide](../docs/AI_ADVISOR_SETUP.md) - Detailed setup walkthrough
 - [Governance Modes](../README.md#governance-modes) - Advisor vs autonomous mode

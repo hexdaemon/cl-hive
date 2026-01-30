@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> 📖 **For fleet monitoring**: See [MOLTY.md](MOLTY.md) for AI agent instructions on using cl-hive's MCP tools to monitor and manage Lightning node fleets.
+
 ## Project Overview
 
 cl-hive is a Core Lightning plugin implementing distributed "Swarm Intelligence" for Lightning node fleets. It coordinates multiple nodes through PKI authentication, shared state gossip, and distributed governance. Designed to work alongside [cl-revenue-ops](https://github.com/lightning-goats/cl_revenue_ops) which handles local fee/rebalancing decisions.

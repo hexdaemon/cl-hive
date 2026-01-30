@@ -1,15 +1,17 @@
-# MCP Server for Claude Code Integration
+# MCP Server for AI Agent Integration
 
-The `tools/mcp-hive-server.py` provides a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows Claude Code to manage your Hive fleet directly. This turns Claude Code into an AI advisor that can monitor, analyze, and execute decisions across your Lightning node fleet.
+The `tools/mcp-hive-server.py` provides a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows AI agents to manage your Hive fleet directly. This works with any MCP-compatible agent: Moltbots, Claude Code, Clawdbot, or similar tools.
+
+> 📖 **For AI agents**: See [MOLTY.md](../MOLTY.md) for agent-specific instructions on how to use these tools effectively.
 
 ## Overview
 
-Instead of running an embedded oracle plugin on each node, this approach lets Claude Code itself act as the AI decision-maker:
+Instead of running an embedded oracle plugin on each node, this approach lets an external AI agent act as the decision-maker:
 
 ```
 ┌─────────────────┐
-│   Claude Code   │  ← AI Decision Making
-│  (MCP Client)   │
+│   AI Agent      │  ← AI Decision Making
+│  (MCP Client)   │     (Moltbots, Claude Code, Clawdbot, etc.)
 └────────┬────────┘
          │ MCP Protocol
          ▼
@@ -103,7 +105,26 @@ For testing with Polar or local Docker containers:
 }
 ```
 
-### 3. Configure Claude Code
+### 3. Configure Your AI Agent
+
+#### Option A: mcporter (recommended for Moltbots/Clawdbot)
+
+Add to `~/.mcporter/mcporter.json`:
+
+```json
+{
+  "servers": {
+    "hive": {
+      "command": ["/path/to/cl-hive/.venv/bin/python", "/path/to/cl-hive/tools/mcp-hive-server.py"],
+      "env": {
+        "HIVE_NODES_CONFIG": "/path/to/cl-hive/production/nodes.production.json"
+      }
+    }
+  }
+}
+```
+
+#### Option B: Claude Code native MCP
 
 Create `.mcp.json` in your cl-hive directory:
 
@@ -121,9 +142,17 @@ Create `.mcp.json` in your cl-hive directory:
 }
 ```
 
-### 4. Enable the MCP Server
+### 4. Verify Connection
 
-Restart Claude Code in the cl-hive directory. It will detect the `.mcp.json` and prompt you to enable the hive server.
+Test the MCP server is working:
+
+```bash
+# With mcporter
+mcporter call hive.hive_status
+
+# With Claude Code
+claude -p "Use hive_status to check the fleet"
+```
 
 ## Available Tools
 
@@ -222,7 +251,7 @@ MCP Resources allow Claude to automatically see fleet status:
 
 ## Usage Examples
 
-Once enabled, you can ask Claude Code to manage your fleet:
+Once configured, your AI agent can manage the fleet:
 
 ```
 "Show me the status of all hive nodes"
@@ -232,6 +261,8 @@ Once enabled, you can ask Claude Code to manage your fleet:
 "What's the current topology analysis for carol?"
 "Switch alice to autonomous mode"
 ```
+
+For detailed agent instructions, see [MOLTY.md](../MOLTY.md).
 
 ## Security Considerations
 
@@ -340,12 +371,14 @@ The `tools/hive-monitor.py` daemon provides real-time monitoring and daily repor
 ./tools/hive-monitor.py --config nodes.json monitor --interval 60
 ```
 
-## Production AI Advisor Setup
+## AI Agent Integration
 
-For automated AI advisor running on a management server, see the following guides:
+For integrating with your AI agent:
 
-- [Production AI Advisor Guide](AI_ADVISOR_SETUP.md) - Complete setup guide for automated operation
-- [production.example/README.md](../production.example/README.md) - Quick start for production deployment
+- [MOLTY.md](../MOLTY.md) - Agent instructions for using cl-hive tools
+- [CLAUDE.md](../CLAUDE.md) - Development guidance for working on the codebase
+
+> ⚠️ **Deprecated**: The automated systemd timer approach in [AI_ADVISOR_SETUP.md](AI_ADVISOR_SETUP.md) is deprecated. Use direct agent integration instead.
 
 ## Related Documentation
 

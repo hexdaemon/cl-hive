@@ -1,5 +1,11 @@
 # AI Advisor Setup Guide
 
+> ⚠️ **DEPRECATED**: The automated systemd timer approach described in this guide is deprecated. Instead, integrate the MCP server with your preferred AI agent (Moltbots, Claude Code, Clawdbot, etc.) and let it manage monitoring directly. See [MOLTY.md](../MOLTY.md) for agent integration instructions.
+>
+> The MCP server and tools documented here remain fully supported — only the automated timer-based execution is deprecated.
+
+---
+
 This guide walks through setting up an automated AI advisor for your Lightning node using Claude Code and the cl-hive MCP server. The advisor runs on a separate management server and connects to your production node via REST API.
 
 ## Table of Contents
