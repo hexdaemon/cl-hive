@@ -1376,7 +1376,7 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                         "description": "Configuration key (for get/set/reset)"
                     },
                     "value": {
-                        "type": "string",
+                        "type": ["string", "number", "boolean"],
                         "description": "New value (for set action)"
                     }
                 },
