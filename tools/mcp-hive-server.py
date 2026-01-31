@@ -293,12 +293,46 @@ class HiveFleet:
         """Get a node by name."""
         return self.nodes.get(name)
 
-    async def call_all(self, method: str, params: Dict = None) -> Dict[str, Any]:
-        """Call an RPC method on all nodes."""
-        results = {}
-        for name, node in self.nodes.items():
-            results[name] = await node.call(method, params)
-        return results
+    async def call_all(self, method: str, params: Dict = None, timeout: float = 30.0) -> Dict[str, Any]:
+        """Call an RPC method on all nodes in parallel."""
+        async def call_with_timeout(name: str, node: NodeConnection) -> tuple:
+            try:
+                result = await asyncio.wait_for(node.call(method, params), timeout=timeout)
+                return (name, result)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout calling {method} on {name}")
+                return (name, {"error": f"Timeout after {timeout}s"})
+            except Exception as e:
+                logger.error(f"Error calling {method} on {name}: {e}")
+                return (name, {"error": str(e)})
+        
+        tasks = [call_with_timeout(name, node) for name, node in self.nodes.items()]
+        results_list = await asyncio.gather(*tasks)
+        return dict(results_list)
+    
+    async def health_check(self, timeout: float = 5.0) -> Dict[str, Any]:
+        """Quick health check on all nodes - returns status without heavy operations."""
+        async def check_node(name: str, node: NodeConnection) -> tuple:
+            try:
+                start = asyncio.get_event_loop().time()
+                result = await asyncio.wait_for(node.call("getinfo"), timeout=timeout)
+                latency = asyncio.get_event_loop().time() - start
+                if "error" in result:
+                    return (name, {"status": "error", "error": result["error"]})
+                return (name, {
+                    "status": "healthy",
+                    "latency_ms": round(latency * 1000),
+                    "alias": result.get("alias", "unknown"),
+                    "blockheight": result.get("blockheight", 0)
+                })
+            except asyncio.TimeoutError:
+                return (name, {"status": "timeout", "error": f"No response in {timeout}s"})
+            except Exception as e:
+                return (name, {"status": "error", "error": str(e)})
+        
+        tasks = [check_node(name, node) for name, node in self.nodes.items()]
+        results_list = await asyncio.gather(*tasks)
+        return dict(results_list)
 
 
 # Global fleet instance
@@ -320,6 +354,19 @@ server = Server("hive-fleet-manager")
 async def list_tools() -> List[Tool]:
     """List available tools for Hive management."""
     return [
+        Tool(
+            name="hive_health",
+            description="Quick health check on all nodes. Returns status, latency, and basic info without heavy operations. Use this for fast connectivity checks.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "timeout": {
+                        "type": "number",
+                        "description": "Timeout in seconds per node (default: 5)"
+                    }
+                }
+            }
+        ),
         Tool(
             name="hive_status",
             description="Get status of all Hive nodes in the fleet. Shows membership, health, and pending actions.",
@@ -3285,7 +3332,10 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
     """Handle tool calls."""
 
     try:
-        if name == "hive_status":
+        if name == "hive_health":
+            timeout = arguments.get("timeout", 5.0)
+            result = await fleet.health_check(timeout=timeout)
+        elif name == "hive_status":
             result = await handle_hive_status(arguments)
         elif name == "hive_pending_actions":
             result = await handle_pending_actions(arguments)
@@ -5123,8 +5173,11 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
     import time
     since_timestamp = int(time.time()) - (window_days * 86400)
 
-    # Fetch goat feeder revenue from LNbits
-    goat_feeder = await get_goat_feeder_revenue(since_timestamp)
+    # Fetch goat feeder revenue from LNbits (only for hive-nexus-01)
+    if node_name == "hive-nexus-01":
+        goat_feeder = await get_goat_feeder_revenue(since_timestamp)
+    else:
+        goat_feeder = {"total_sats": 0, "payment_count": 0}
 
     # Extract routing P&L data from cl-revenue-ops dashboard structure
     # Data is in "period" and "financial_health", not "pnl_summary"
