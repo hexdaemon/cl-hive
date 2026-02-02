@@ -73,7 +73,16 @@ lightning-cli hive-invite
 
 | Node | Connection String |
 |------|-------------------|
-| Hive-Nexus-01 | `0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3@45.76.234.192:9735` |
+| ⚡Lightning Goats CLN⚡ (nexus-01) | `0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3@45.76.234.192:9735` |
+| Hive-Nexus-02 | `03fe48e8a64f14fa0aa7d9d16500754b3b906c729acfb867c00423fd4b0b9b56c2@45.76.234.192:9736` |
+
+**Tor (onion) addresses:**
+- nexus-01: `xsp4whqtphjnby335a3ihtje55gidhf4pnv3blrgustplyxfnpsgeuyd.onion:9735`
+- nexus-02: `vxykasr6vdl77ph6hvo4a3mxfj2wbirwujdyrg4scowuhix7pp53l7yd.onion:9736`
+
+**To request an invite ticket:**
+- Nostr: `hex@lightning-goats.com` (npub1qkjnsgk6zrszkmk2c7ywycvh46ylp3kw4kud8y8a20m93y5synvqewl0sq)
+- GitHub: Open an issue at https://github.com/lightning-goats/cl-hive/issues
 
 You can also find active members via Lightning network explorers or community channels.
 
