@@ -73,7 +73,7 @@ Want to join an existing hive fleet? The Lightning Hive is actively accepting ne
 
 **To join:**
 1. Run your own CLN node with cl-hive
-2. Request an invite ticket via [Nostr](https://njump.me/hex@lightning-goats.com) or [GitHub Issues](https://github.com/lightning-goats/cl-hive/issues)
+2. Request an invite ticket via [Nostr](https://njump.me/npub1qkjnsgk6zrszkmk2c7ywycvh46ylp3kw4kud8y8a20m93y5synvqewl0sq) or [GitHub Issues](https://github.com/lightning-goats/cl-hive/issues)
 3. Open a channel to a hive member (skin in the game)
 4. Use the ticket to join as a neophyte
 5. Get vouched by existing members for full membership
