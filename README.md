@@ -59,7 +59,6 @@ Optional WireGuard VPN integration for secure fleet communication.
 |------|----------|
 | `advisor` | Log recommendations and queue actions for manual approval (default) |
 | `autonomous` | Execute actions automatically within strict safety bounds |
-| `oracle` | Delegate decisions to external API |
 
 ## Join the Lightning Hive
 
