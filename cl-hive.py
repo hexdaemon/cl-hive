@@ -8177,6 +8177,11 @@ def fee_intelligence_loop():
 # Settlement check interval (1 hour)
 SETTLEMENT_CHECK_INTERVAL = 3600
 
+# Settlement rebroadcast interval (4 hours) - Issue #49
+# Pending proposals are rebroadcast to ensure members who missed the initial
+# broadcast can still vote. Only the proposer rebroadcasts their own proposals.
+SETTLEMENT_REBROADCAST_INTERVAL = 4 * 3600
+
 
 def settlement_loop():
     """
@@ -8184,9 +8189,10 @@ def settlement_loop():
 
     Runs hourly to:
     1. Check if we should propose settlement for previous week
-    2. Process any pending proposals (auto-vote if hash matches)
-    3. Execute any ready settlements we haven't paid yet
-    4. Cleanup expired proposals
+    2. Rebroadcast pending proposals that haven't reached quorum (Issue #49)
+    3. Process any pending proposals (auto-vote if hash matches)
+    4. Execute any ready settlements we haven't paid yet
+    5. Cleanup expired proposals
     """
     from modules.protocol import (
         create_settlement_propose,
@@ -8268,7 +8274,72 @@ def settlement_loop():
             except Exception as e:
                 safe_plugin.log(f"SETTLEMENT: Error proposing settlement: {e}", level='warn')
 
-            # Step 2: Process pending proposals
+            # Step 2: Rebroadcast pending proposals that need it (Issue #49)
+            try:
+                proposals_to_rebroadcast = database.get_proposals_needing_rebroadcast(
+                    rebroadcast_interval_seconds=SETTLEMENT_REBROADCAST_INTERVAL,
+                    our_peer_id=our_pubkey
+                )
+                for proposal in proposals_to_rebroadcast:
+                    proposal_id = proposal.get('proposal_id')
+                    period = proposal.get('period')
+                    member_count = proposal.get('member_count', 0)
+
+                    # Check if quorum already reached
+                    vote_count = database.count_settlement_ready_votes(proposal_id)
+                    quorum_needed = (member_count // 2) + 1
+                    if vote_count >= quorum_needed:
+                        continue  # No need to rebroadcast
+
+                    # Load contributions from stored JSON
+                    contributions_json = proposal.get('contributions_json')
+                    if not contributions_json:
+                        safe_plugin.log(
+                            f"SETTLEMENT: Cannot rebroadcast {proposal_id[:16]}... - no stored contributions",
+                            level='debug'
+                        )
+                        continue
+
+                    try:
+                        contributions = json.loads(contributions_json)
+                    except Exception:
+                        safe_plugin.log(
+                            f"SETTLEMENT: Cannot rebroadcast {proposal_id[:16]}... - invalid contributions JSON",
+                            level='warn'
+                        )
+                        continue
+
+                    # Sign and create the proposal message
+                    signing_payload = get_settlement_propose_signing_payload(proposal)
+                    try:
+                        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+                        signature = sig_result.get('zbase', '')
+                    except Exception as e:
+                        safe_plugin.log(f"SETTLEMENT: Failed to sign rebroadcast: {e}", level='warn')
+                        continue
+
+                    if signature:
+                        propose_msg = create_settlement_propose(
+                            proposal_id=proposal_id,
+                            period=period,
+                            proposer_peer_id=proposal.get('proposer_peer_id'),
+                            data_hash=proposal.get('data_hash'),
+                            total_fees_sats=proposal.get('total_fees_sats'),
+                            member_count=member_count,
+                            contributions=contributions,
+                            timestamp=int(time.time()),
+                            signature=signature
+                        )
+                        sent = _broadcast_to_members(propose_msg)
+                        database.update_proposal_broadcast_time(proposal_id)
+                        safe_plugin.log(
+                            f"SETTLEMENT: Rebroadcast proposal {proposal_id[:16]}... for {period} "
+                            f"to {sent} member(s) (votes: {vote_count}/{quorum_needed} needed)"
+                        )
+            except Exception as e:
+                safe_plugin.log(f"SETTLEMENT: Error rebroadcasting: {e}", level='warn')
+
+            # Step 3: Process pending proposals (vote if hash matches)
             try:
                 pending = database.get_pending_settlement_proposals()
                 for proposal in pending:
@@ -8300,7 +8371,7 @@ def settlement_loop():
             except Exception as e:
                 safe_plugin.log(f"SETTLEMENT: Error processing pending: {e}", level='warn')
 
-            # Step 3: Execute ready settlements
+            # Step 4: Execute ready settlements
             try:
                 ready = database.get_ready_settlement_proposals()
                 for proposal in ready:
@@ -8350,7 +8421,7 @@ def settlement_loop():
             except Exception as e:
                 safe_plugin.log(f"SETTLEMENT: Error executing ready: {e}", level='warn')
 
-            # Step 4: Cleanup expired proposals
+            # Step 5: Cleanup expired proposals
             try:
                 expired = database.cleanup_expired_settlement_proposals()
                 if expired > 0:
@@ -8358,7 +8429,7 @@ def settlement_loop():
             except Exception as e:
                 safe_plugin.log(f"SETTLEMENT: Cleanup error: {e}", level='warn')
 
-            # Step 5: Check for gaming behavior and auto-propose bans
+            # Step 6: Check for gaming behavior and auto-propose bans
             try:
                 _check_settlement_gaming_and_propose_bans()
             except Exception as e:

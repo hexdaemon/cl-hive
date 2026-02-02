@@ -838,3 +838,185 @@ class TestNetProfitSettlement:
         assert result.net_profit == 700
         assert result.fees_earned == 1000
         assert result.balance == 100  # fair_share - net_profit = 800 - 700 = 100
+
+
+# =============================================================================
+# SETTLEMENT REBROADCAST TESTS (Issue #49)
+# =============================================================================
+
+class TestSettlementRebroadcast:
+    """Tests for settlement proposal rebroadcast functionality (Issue #49)."""
+
+    def test_proposal_stores_contributions_json(self, mock_database, mock_plugin, mock_rpc, mock_state_manager):
+        """Verify proposals store contributions_json for rebroadcast."""
+        settlement_manager = SettlementManager(mock_database, mock_plugin, mock_rpc)
+
+        # Set up mock state manager
+        mock_state_manager.get_peer_fees.return_value = {
+            'fees_earned_sats': 1000,
+            'forward_count': 10,
+            'rebalance_costs_sats': 100
+        }
+        mock_state_manager.get_peer_state.return_value = MagicMock(capacity_sats=10_000_000)
+        mock_database.get_fee_reports_for_period.return_value = []
+
+        proposal = settlement_manager.create_proposal(
+            period="2025-01",
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        # Verify add_settlement_proposal was called with contributions_json
+        assert mock_database.add_settlement_proposal.called
+        call_kwargs = mock_database.add_settlement_proposal.call_args
+        # Check that contributions_json was passed
+        if call_kwargs.kwargs:
+            assert 'contributions_json' in call_kwargs.kwargs
+            contributions_json = call_kwargs.kwargs['contributions_json']
+            assert contributions_json is not None
+            # Verify it's valid JSON
+            contributions = json.loads(contributions_json)
+            assert isinstance(contributions, list)
+
+    def test_get_proposals_needing_rebroadcast_filters_correctly(self):
+        """Test database method filters proposals correctly for rebroadcast."""
+        import sqlite3
+        import tempfile
+        import os
+
+        # Create a real temporary database for this test
+        fd, db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            now = int(time.time())
+
+            # Create table with all columns
+            conn.execute("""
+                CREATE TABLE settlement_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    period TEXT NOT NULL UNIQUE,
+                    proposer_peer_id TEXT NOT NULL,
+                    proposed_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    data_hash TEXT NOT NULL,
+                    total_fees_sats INTEGER NOT NULL,
+                    member_count INTEGER NOT NULL,
+                    last_broadcast_at INTEGER,
+                    contributions_json TEXT
+                )
+            """)
+
+            our_peer_id = '02' + 'a' * 64
+            other_peer_id = '02' + 'b' * 64
+
+            # Insert test proposals
+            proposals = [
+                # Should be returned: pending, not expired, our proposal, broadcast long ago
+                ('prop1', '2025-01', our_peer_id, now - 7200, now + 86400, 'pending', 'hash1', 1000, 3, now - 20000, '[]'),
+                # Should NOT be: broadcast recently (within interval)
+                ('prop2', '2025-02', our_peer_id, now - 3600, now + 86400, 'pending', 'hash2', 1000, 3, now - 1000, '[]'),
+                # Should NOT be: different proposer
+                ('prop3', '2025-03', other_peer_id, now - 7200, now + 86400, 'pending', 'hash3', 1000, 3, now - 20000, '[]'),
+                # Should NOT be: expired
+                ('prop4', '2025-04', our_peer_id, now - 100000, now - 1000, 'pending', 'hash4', 1000, 3, now - 20000, '[]'),
+                # Should NOT be: status is 'ready' (already at quorum)
+                ('prop5', '2025-05', our_peer_id, now - 7200, now + 86400, 'ready', 'hash5', 1000, 3, now - 20000, '[]'),
+                # Should be returned: never broadcast (NULL last_broadcast_at)
+                ('prop6', '2025-06', our_peer_id, now - 7200, now + 86400, 'pending', 'hash6', 1000, 3, None, '[]'),
+            ]
+
+            for p in proposals:
+                conn.execute("""
+                    INSERT INTO settlement_proposals
+                    (proposal_id, period, proposer_peer_id, proposed_at, expires_at,
+                     status, data_hash, total_fees_sats, member_count, last_broadcast_at, contributions_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, p)
+            conn.commit()
+
+            # Query for proposals needing rebroadcast (4 hour interval = 14400 seconds)
+            rebroadcast_interval = 14400
+            cutoff = now - rebroadcast_interval
+
+            rows = conn.execute("""
+                SELECT * FROM settlement_proposals
+                WHERE status = 'pending'
+                AND expires_at > ?
+                AND proposer_peer_id = ?
+                AND (last_broadcast_at IS NULL OR last_broadcast_at < ?)
+                ORDER BY proposed_at ASC
+            """, (now, our_peer_id, cutoff)).fetchall()
+
+            # Should return prop1 and prop6
+            results = [dict(row) for row in rows]
+            assert len(results) == 2
+            proposal_ids = [r['proposal_id'] for r in results]
+            assert 'prop1' in proposal_ids  # Broadcast long ago
+            assert 'prop6' in proposal_ids  # Never broadcast
+
+        finally:
+            os.unlink(db_path)
+
+    def test_update_proposal_broadcast_time(self):
+        """Test database method updates broadcast timestamp."""
+        import sqlite3
+        import tempfile
+        import os
+
+        fd, db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            now = int(time.time())
+
+            conn.execute("""
+                CREATE TABLE settlement_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    period TEXT NOT NULL,
+                    proposer_peer_id TEXT NOT NULL,
+                    proposed_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    data_hash TEXT NOT NULL,
+                    total_fees_sats INTEGER NOT NULL,
+                    member_count INTEGER NOT NULL,
+                    last_broadcast_at INTEGER,
+                    contributions_json TEXT
+                )
+            """)
+
+            # Insert a proposal with old broadcast time
+            conn.execute("""
+                INSERT INTO settlement_proposals
+                (proposal_id, period, proposer_peer_id, proposed_at, expires_at,
+                 status, data_hash, total_fees_sats, member_count, last_broadcast_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+            """, ('prop1', '2025-01', '02' + 'a' * 64, now - 3600, now + 86400, 'hash1', 1000, 3, now - 20000))
+            conn.commit()
+
+            # Update broadcast time
+            new_time = now
+            conn.execute("""
+                UPDATE settlement_proposals
+                SET last_broadcast_at = ?
+                WHERE proposal_id = ?
+            """, (new_time, 'prop1'))
+            conn.commit()
+
+            # Verify update
+            row = conn.execute(
+                "SELECT last_broadcast_at FROM settlement_proposals WHERE proposal_id = ?",
+                ('prop1',)
+            ).fetchone()
+
+            assert row['last_broadcast_at'] == new_time
+
+        finally:
+            os.unlink(db_path)

@@ -996,6 +996,20 @@ class HiveDatabase:
             "CREATE INDEX IF NOT EXISTS idx_settlement_proposals_status "
             "ON settlement_proposals(status)"
         )
+        # Add last_broadcast_at column if upgrading from older schema (Issue #49)
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_proposals ADD COLUMN last_broadcast_at INTEGER"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        # Add contributions_json column for rebroadcast support (Issue #49)
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_proposals ADD COLUMN contributions_json TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # Settlement ready votes - quorum tracking (51%)
         conn.execute("""
@@ -5462,7 +5476,8 @@ class HiveDatabase:
         data_hash: str,
         total_fees_sats: int,
         member_count: int,
-        expires_in_seconds: int = 86400  # 24 hours
+        expires_in_seconds: int = 86400,  # 24 hours
+        contributions_json: Optional[str] = None
     ) -> bool:
         """
         Add a new settlement proposal.
@@ -5475,6 +5490,7 @@ class HiveDatabase:
             total_fees_sats: Total fees to distribute
             member_count: Number of participating members
             expires_in_seconds: Time until proposal expires
+            contributions_json: JSON-encoded contributions for rebroadcast (Issue #49)
 
         Returns:
             True if created, False if proposal for this period already exists
@@ -5487,10 +5503,11 @@ class HiveDatabase:
             conn.execute("""
                 INSERT INTO settlement_proposals
                 (proposal_id, period, proposer_peer_id, proposed_at, expires_at,
-                 status, data_hash, total_fees_sats, member_count)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                 status, data_hash, total_fees_sats, member_count, last_broadcast_at,
+                 contributions_json)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
             """, (proposal_id, period, proposer_peer_id, now, expires_at,
-                  data_hash, total_fees_sats, member_count))
+                  data_hash, total_fees_sats, member_count, now, contributions_json))
             return True
         except sqlite3.IntegrityError:
             # Period already has a proposal
@@ -5533,6 +5550,67 @@ class HiveDatabase:
             ORDER BY proposed_at ASC
         """).fetchall()
         return [dict(row) for row in rows]
+
+    def get_proposals_needing_rebroadcast(
+        self,
+        rebroadcast_interval_seconds: int,
+        our_peer_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Get pending proposals that need rebroadcast (Issue #49).
+
+        Returns proposals where:
+        - Status is 'pending' (not yet at quorum)
+        - Not expired
+        - We are the proposer
+        - Last broadcast was more than rebroadcast_interval_seconds ago
+
+        Args:
+            rebroadcast_interval_seconds: Minimum seconds between broadcasts
+            our_peer_id: Our node's public key (only proposer rebroadcasts)
+
+        Returns:
+            List of proposals needing rebroadcast
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        cutoff = now - rebroadcast_interval_seconds
+
+        rows = conn.execute("""
+            SELECT * FROM settlement_proposals
+            WHERE status = 'pending'
+            AND expires_at > ?
+            AND proposer_peer_id = ?
+            AND (last_broadcast_at IS NULL OR last_broadcast_at < ?)
+            ORDER BY proposed_at ASC
+        """, (now, our_peer_id, cutoff)).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_proposal_broadcast_time(
+        self,
+        proposal_id: str,
+        timestamp: Optional[int] = None
+    ) -> bool:
+        """
+        Update the last_broadcast_at timestamp for a proposal (Issue #49).
+
+        Args:
+            proposal_id: Proposal to update
+            timestamp: Broadcast timestamp (defaults to now)
+
+        Returns:
+            True if updated, False if proposal not found
+        """
+        conn = self._get_connection()
+        if timestamp is None:
+            timestamp = int(time.time())
+
+        result = conn.execute("""
+            UPDATE settlement_proposals
+            SET last_broadcast_at = ?
+            WHERE proposal_id = ?
+        """, (timestamp, proposal_id))
+        return result.rowcount > 0
 
     def update_settlement_proposal_status(
         self, proposal_id: str, status: str

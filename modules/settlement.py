@@ -1033,14 +1033,16 @@ class SettlementManager:
         proposal_id = secrets.token_hex(16)
         timestamp = int(time.time())
 
-        # Create proposal in database
+        # Create proposal in database (store contributions for rebroadcast - Issue #49)
+        contributions_json = json.dumps(contributions)
         if not self.db.add_settlement_proposal(
             proposal_id=proposal_id,
             period=period,
             proposer_peer_id=our_peer_id,
             data_hash=data_hash,
             total_fees_sats=total_fees,
-            member_count=member_count
+            member_count=member_count,
+            contributions_json=contributions_json
         ):
             return None
 
