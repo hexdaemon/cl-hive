@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+from urllib.parse import urlparse
 
 # Add tools directory to path for advisor_db import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -79,14 +80,24 @@ logger = logging.getLogger("mcp-hive")
 # Goat Feeder configuration
 # Revenue is tracked via LNbits API - payments with "⚡CyberHerd Treats⚡" in memo
 GOAT_FEEDER_PATTERN = "⚡CyberHerd Treats⚡"
-LNBITS_URL = "http://127.0.0.1:3002"
-LNBITS_INVOICE_KEY = "ac0dcb0cdab94f72b757d0f3aa85d08a"
+LNBITS_URL = os.environ.get("LNBITS_URL", "http://127.0.0.1:3002")
+LNBITS_INVOICE_KEY = os.environ.get("LNBITS_INVOICE_KEY", "")
+LNBITS_ALLOW_INSECURE = os.environ.get("LNBITS_ALLOW_INSECURE", "false").lower() == "true"
+LNBITS_TIMEOUT_SECS = float(os.environ.get("LNBITS_TIMEOUT_SECS", "10"))
 
 # =============================================================================
 # Strategy Prompt Loading
 # =============================================================================
 
 STRATEGY_DIR = os.environ.get('HIVE_STRATEGY_DIR', '')
+STRATEGY_MAX_CHARS = int(os.environ.get("HIVE_STRATEGY_MAX_CHARS", "4000"))
+
+# TLS safety controls
+HIVE_ALLOW_INSECURE_TLS = os.environ.get("HIVE_ALLOW_INSECURE_TLS", "false").lower() == "true"
+# Allow cleartext REST to non-local hosts (not recommended)
+HIVE_ALLOW_INSECURE_HTTP = os.environ.get("HIVE_ALLOW_INSECURE_HTTP", "false").lower() == "true"
+# Normalize tool responses (wrap in ok/data or ok/error)
+HIVE_NORMALIZE_RESPONSES = os.environ.get("HIVE_NORMALIZE_RESPONSES", "false").lower() == "true"
 
 
 def load_strategy(name: str) -> str:
@@ -103,11 +114,14 @@ def load_strategy(name: str) -> str:
         Content of the strategy file, or empty string
     """
     if not STRATEGY_DIR:
+        logger.debug(f"Strategy dir not set; skipping strategy load for {name}")
         return ""
     path = os.path.join(STRATEGY_DIR, f"{name}.md")
     try:
         with open(path, 'r') as f:
             content = f.read().strip()
+            if len(content) > STRATEGY_MAX_CHARS:
+                content = content[:STRATEGY_MAX_CHARS].rstrip() + "\n\n[truncated]"
             logger.debug(f"Loaded strategy prompt: {name}")
             return "\n\n" + content
     except FileNotFoundError:
@@ -121,6 +135,50 @@ def load_strategy(name: str) -> str:
 # =============================================================================
 # Node Connection
 # =============================================================================
+
+def _is_local_host(hostname: str) -> bool:
+    return hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def _validate_lnbits_config() -> Optional[str]:
+    parsed = urlparse(LNBITS_URL)
+    if not parsed.scheme or not parsed.netloc:
+        return "LNBITS_URL is invalid or missing a scheme/host."
+    if parsed.scheme != "https" and not _is_local_host(parsed.hostname or ""):
+        if not LNBITS_ALLOW_INSECURE:
+            return "LNBITS_URL must use https for non-localhost targets."
+    return None
+
+
+def _validate_node_config(node_config: Dict, node_mode: str) -> Optional[str]:
+    name = node_config.get("name")
+    if not name:
+        return "Node missing required 'name' field."
+
+    if node_mode == "docker":
+        if not node_config.get("docker_container"):
+            return f"Node '{name}' is docker mode but missing docker_container."
+        return None
+
+    rest_url = node_config.get("rest_url")
+    rune = node_config.get("rune")
+    if not rest_url:
+        return f"Node '{name}' is rest mode but missing rest_url."
+    if not rune:
+        return f"Node '{name}' is rest mode but missing rune."
+    parsed = urlparse(rest_url)
+    if not parsed.scheme or not parsed.netloc:
+        return f"Node '{name}' has invalid rest_url."
+    if parsed.scheme == "http" and not _is_local_host(parsed.hostname or "") and not HIVE_ALLOW_INSECURE_HTTP:
+        return f"Node '{name}' uses http for non-local host. Set HIVE_ALLOW_INSECURE_HTTP=true to override."
+    return None
+
+
+def _normalize_response(result: Any) -> Dict[str, Any]:
+    if isinstance(result, dict) and "error" in result:
+        return {"ok": False, "error": result.get("error"), "details": result}
+    return {"ok": True, "data": result}
+
 
 @dataclass
 class NodeConnection:
@@ -146,10 +204,26 @@ class NodeConnection:
             ssl_context = ssl.create_default_context()
             ssl_context.load_verify_locations(self.ca_cert)
 
+        verify: Any
+        if ssl_context:
+            verify = ssl_context
+        else:
+            if self.rest_url.startswith("https://"):
+                if not HIVE_ALLOW_INSECURE_TLS:
+                    raise ValueError(
+                        f"TLS verification required for {self.name} but no ca_cert configured. "
+                        "Set HIVE_ALLOW_INSECURE_TLS=true to override (not recommended)."
+                    )
+                logger.warning(
+                    "TLS verification disabled for %s (no ca_cert configured).",
+                    self.name
+                )
+            verify = False
+
         self.client = httpx.AsyncClient(
             base_url=self.rest_url,
             headers={"Rune": self.rune},
-            verify=ssl_context if ssl_context else False,
+            verify=verify,
             timeout=30.0
         )
         logger.info(f"Connected to {self.name} at {self.rest_url}")
@@ -176,6 +250,14 @@ class NodeConnection:
             )
             response.raise_for_status()
             return response.json()
+        except httpx.HTTPStatusError as e:
+            body = {}
+            try:
+                body = e.response.json()
+            except Exception:
+                body = {"error": e.response.text.strip()} if e.response.text else {}
+            logger.error(f"RPC error on {self.name}: {e}")
+            return {"error": str(e), "details": body}
         except httpx.HTTPError as e:
             logger.error(f"RPC error on {self.name}: {e}")
             return {"error": str(e)}
@@ -252,9 +334,17 @@ class HiveFleet:
         global_network = config.get("network", "regtest")
         global_lightning_dir = config.get("lightning_dir", "/home/clightning/.lightning")
 
+        seen_names = set()
         for node_config in config.get("nodes", []):
             # Per-node mode overrides global mode
             node_mode = node_config.get("mode", global_mode)
+            error = _validate_node_config(node_config, node_mode)
+            if error:
+                raise ValueError(error)
+            name = node_config.get("name")
+            if name in seen_names:
+                raise ValueError(f"Duplicate node name '{name}' in config.")
+            seen_names.add(name)
 
             if node_mode == "docker":
                 # Docker exec mode
@@ -365,6 +455,115 @@ async def list_tools() -> List[Tool]:
                         "description": "Timeout in seconds per node (default: 5)"
                     }
                 }
+            }
+        ),
+        Tool(
+            name="hive_fleet_snapshot",
+            description="Consolidated fleet snapshot for quick monitoring. Returns node health, channel stats, 24h routing stats, pending actions, and top issues.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Specific node name (optional, defaults to all nodes)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="hive_anomalies",
+            description="Detect anomalies outside normal ranges (revenue drops, drain patterns, peer disconnects).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Specific node name (optional, defaults to all nodes)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="hive_compare_periods",
+            description="Compare routing performance across two periods with channel-level improvements/degradations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (required)"
+                    },
+                    "period1_days": {
+                        "type": "integer",
+                        "description": "Days for period 1 (default: 7)"
+                    },
+                    "period2_days": {
+                        "type": "integer",
+                        "description": "Days for period 2 (default: 7)"
+                    },
+                    "offset_days": {
+                        "type": "integer",
+                        "description": "Days offset for period 2 end (default: 7)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_channel_deep_dive",
+            description="Get comprehensive context for a channel or peer (balances, profitability, flow, fees, forwards, issues).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel short ID"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Peer pubkey"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_recommended_actions",
+            description="Return prioritized recommended actions with reasoning and estimated effort.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, defaults to all nodes)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max actions to return (default: 10)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="hive_peer_search",
+            description="Search peers by alias substring (case-insensitive).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Alias substring to search for"
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, defaults to all nodes)"
+                    }
+                },
+                "required": ["query"]
             }
         ),
         Tool(
@@ -3335,6 +3534,18 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
         if name == "hive_health":
             timeout = arguments.get("timeout", 5.0)
             result = await fleet.health_check(timeout=timeout)
+        elif name == "hive_fleet_snapshot":
+            result = await handle_fleet_snapshot(arguments)
+        elif name == "hive_anomalies":
+            result = await handle_anomalies(arguments)
+        elif name == "hive_compare_periods":
+            result = await handle_compare_periods(arguments)
+        elif name == "hive_channel_deep_dive":
+            result = await handle_channel_deep_dive(arguments)
+        elif name == "hive_recommended_actions":
+            result = await handle_recommended_actions(arguments)
+        elif name == "hive_peer_search":
+            result = await handle_peer_search(arguments)
         elif name == "hive_status":
             result = await handle_hive_status(arguments)
         elif name == "hive_pending_actions":
@@ -3633,6 +3844,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
         else:
             result = {"error": f"Unknown tool: {name}"}
 
+        if HIVE_NORMALIZE_RESPONSES:
+            result = _normalize_response(result)
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     except Exception as e:
@@ -3658,6 +3871,741 @@ async def handle_hive_status(args: Dict) -> Dict:
         return await fleet.call_all("hive-status")
 
 
+def _extract_msat(value: Any) -> int:
+    if isinstance(value, dict) and "msat" in value:
+        return int(value.get("msat", 0))
+    if isinstance(value, str) and value.endswith("msat"):
+        try:
+            return int(value[:-4])
+        except ValueError:
+            return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
+
+
+def _channel_totals(channel: Dict) -> Dict[str, int]:
+    total_msat = _extract_msat(
+        channel.get("total_msat")
+        or channel.get("channel_total_msat")
+        or channel.get("amount_msat")
+    )
+    local_msat = _extract_msat(
+        channel.get("to_us_msat")
+        or channel.get("our_amount_msat")
+        or channel.get("our_msat")
+    )
+    return {"total_msat": total_msat, "local_msat": local_msat}
+
+
+def _coerce_ts(value: Any) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _forward_stats(forwards: List[Dict], start_ts: int, end_ts: int) -> Dict[str, Any]:
+    forward_count = 0
+    total_volume_msat = 0
+    total_revenue_msat = 0
+    per_channel: Dict[str, Dict[str, int]] = {}
+
+    for fwd in forwards:
+        resolved = _coerce_ts(fwd.get("resolved_time") or fwd.get("resolved_at") or 0)
+        if resolved <= 0 or resolved < start_ts or resolved > end_ts:
+            continue
+
+        forward_count += 1
+        in_msat = _extract_msat(fwd.get("in_msat"))
+        out_msat = _extract_msat(fwd.get("out_msat"))
+        volume_msat = out_msat if out_msat else in_msat
+        revenue_msat = max(0, in_msat - out_msat) if in_msat and out_msat else 0
+
+        total_volume_msat += volume_msat
+        total_revenue_msat += revenue_msat
+
+        out_channel = fwd.get("out_channel") or fwd.get("out_channel_id") or fwd.get("out_scid")
+        if out_channel:
+            entry = per_channel.setdefault(out_channel, {"revenue_msat": 0, "volume_msat": 0, "count": 0})
+            entry["revenue_msat"] += revenue_msat
+            entry["volume_msat"] += volume_msat
+            entry["count"] += 1
+
+    avg_fee_ppm = int((total_revenue_msat * 1_000_000) / total_volume_msat) if total_volume_msat else 0
+
+    return {
+        "forward_count": forward_count,
+        "total_volume_msat": total_volume_msat,
+        "total_revenue_msat": total_revenue_msat,
+        "avg_fee_ppm": avg_fee_ppm,
+        "per_channel": per_channel
+    }
+
+
+def _flow_profile(channel: Dict) -> Dict[str, Any]:
+    in_fulfilled = channel.get("in_payments_fulfilled", 0)
+    out_fulfilled = channel.get("out_payments_fulfilled", 0)
+    in_msat = channel.get("in_fulfilled_msat", 0)
+    out_msat = channel.get("out_fulfilled_msat", 0)
+
+    total = in_fulfilled + out_fulfilled
+    if total == 0:
+        flow_profile = "inactive"
+        ratio = 0.0
+    elif out_fulfilled == 0:
+        flow_profile = "inbound_only"
+        ratio = float("inf")
+    elif in_fulfilled == 0:
+        flow_profile = "outbound_only"
+        ratio = 0.0
+    else:
+        ratio = round(in_fulfilled / out_fulfilled, 2)
+        if ratio > 3.0:
+            flow_profile = "inbound_dominant"
+        elif ratio < 0.33:
+            flow_profile = "outbound_dominant"
+        else:
+            flow_profile = "balanced"
+
+    return {
+        "flow_profile": flow_profile,
+        "inbound_outbound_ratio": ratio if ratio != float("inf") else "infinite",
+        "inbound_payments": in_fulfilled,
+        "outbound_payments": out_fulfilled,
+        "inbound_volume_sats": _extract_msat(in_msat) // 1000,
+        "outbound_volume_sats": _extract_msat(out_msat) // 1000
+    }
+
+
+async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
+    import time
+
+    now = int(time.time())
+    since_24h = now - 86400
+
+    info = await node.call("getinfo")
+    peers = await node.call("listpeers")
+    channels_result = await node.call("listpeerchannels")
+    pending = await node.call("hive-pending-actions")
+
+    # Routing stats (24h) from listforwards
+    forwards = await node.call("listforwards", {"status": "settled"})
+    forward_count = 0
+    total_volume_msat = 0
+    total_revenue_msat = 0
+    stats_24h = _forward_stats(forwards.get("forwards", []), since_24h, now)
+    forward_count = stats_24h["forward_count"]
+    total_volume_msat = stats_24h["total_volume_msat"]
+    total_revenue_msat = stats_24h["total_revenue_msat"]
+
+    # Channel stats
+    channels = channels_result.get("channels", [])
+    channel_count = len(channels)
+    total_capacity_msat = 0
+    total_local_msat = 0
+    low_balance_channels = []
+
+    for ch in channels:
+        totals = _channel_totals(ch)
+        total_msat = totals["total_msat"]
+        local_msat = totals["local_msat"]
+        if total_msat <= 0:
+            continue
+        total_capacity_msat += total_msat
+        total_local_msat += local_msat
+        local_pct = local_msat / total_msat if total_msat else 0.0
+        if local_pct < 0.2:
+            low_balance_channels.append({
+                "channel_id": ch.get("short_channel_id"),
+                "peer_id": ch.get("peer_id"),
+                "local_pct": round(local_pct * 100, 2)
+            })
+
+    local_balance_pct = round((total_local_msat / total_capacity_msat) * 100, 2) if total_capacity_msat else 0.0
+
+    # Issues (bleeders, zombies) from revenue-profitability if available
+    issues = []
+    try:
+        profitability = await node.call("revenue-profitability")
+        channels_by_class = profitability.get("channels_by_class", {})
+        for class_name in ("bleeder", "zombie"):
+            for ch in channels_by_class.get(class_name, [])[:3]:
+                issues.append({
+                    "type": class_name,
+                    "severity": "warning" if class_name == "bleeder" else "info",
+                    "channel_id": ch.get("channel_id"),
+                    "peer_id": ch.get("peer_id"),
+                    "details": {
+                        "net_profit_sats": ch.get("net_profit_sats"),
+                        "roi_percentage": ch.get("roi_percentage")
+                    }
+                })
+    except Exception:
+        pass
+
+    for ch in low_balance_channels:
+        issues.append({
+            "type": "critical_low_balance",
+            "severity": "critical",
+            "channel_id": ch.get("channel_id"),
+            "peer_id": ch.get("peer_id"),
+            "details": {"local_pct": ch.get("local_pct")}
+        })
+
+    # Sort issues: critical first, then warning, then info
+    severity_rank = {"critical": 0, "warning": 1, "info": 2}
+    issues_sorted = sorted(issues, key=lambda x: severity_rank.get(x.get("severity", "info"), 3))
+    top_issues = issues_sorted[:3]
+
+    return {
+        "node": node.name,
+        "health": {
+            "alias": info.get("alias", "unknown"),
+            "pubkey": info.get("id", "unknown"),
+            "blockheight": info.get("blockheight", 0),
+            "peers": len(peers.get("peers", [])),
+            "sync_status": info.get("warning_bitcoind_sync", "") or info.get("warning_lightningd_sync", "")
+        },
+        "channels": {
+            "count": channel_count,
+            "total_capacity_msat": total_capacity_msat,
+            "total_local_msat": total_local_msat,
+            "local_balance_pct": local_balance_pct
+        },
+        "routing_24h": {
+            "forward_count": forward_count,
+            "total_volume_msat": total_volume_msat,
+            "total_revenue_msat": total_revenue_msat
+        },
+        "pending_actions": len(pending.get("actions", [])),
+        "top_issues": top_issues
+    }
+
+
+async def handle_fleet_snapshot(args: Dict) -> Dict:
+    """Get consolidated fleet snapshot."""
+    node_name = args.get("node")
+
+    if node_name:
+        node = fleet.get_node(node_name)
+        if not node:
+            return {"error": f"Unknown node: {node_name}"}
+        return await _node_fleet_snapshot(node)
+
+    tasks = []
+    for node in fleet.nodes.values():
+        tasks.append(_node_fleet_snapshot(node))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    snapshots = {}
+    for idx, result in enumerate(results):
+        node = list(fleet.nodes.values())[idx]
+        if isinstance(result, Exception):
+            snapshots[node.name] = {"error": str(result)}
+        else:
+            snapshots[node.name] = result
+    return snapshots
+
+
+async def _node_anomalies(node: NodeConnection) -> Dict[str, Any]:
+    import time
+
+    anomalies: List[Dict[str, Any]] = []
+    now = int(time.time())
+
+    # Revenue velocity drop: last 24h vs 7-day daily average
+    forwards = await node.call("listforwards", {"status": "settled"})
+    forwards_list = forwards.get("forwards", [])
+    last_24h = _forward_stats(forwards_list, now - 86400, now)
+    last_7d = _forward_stats(forwards_list, now - (7 * 86400), now)
+    avg_daily_revenue = last_7d["total_revenue_msat"] / 7 if last_7d["total_revenue_msat"] else 0
+
+    if avg_daily_revenue > 0 and last_24h["total_revenue_msat"] < avg_daily_revenue * 0.5:
+        anomalies.append({
+            "type": "revenue_velocity_drop",
+            "severity": "warning",
+            "channel": None,
+            "peer": None,
+            "details": {
+                "last_24h_revenue_msat": last_24h["total_revenue_msat"],
+                "avg_daily_revenue_msat": int(avg_daily_revenue)
+            },
+            "recommendation": "Investigate fee changes, liquidity imbalance, or peer connectivity issues."
+        })
+
+    # Drain patterns: channels losing >10% balance per day (requires advisor DB velocity)
+    try:
+        db = ensure_advisor_db()
+        channels = await node.call("listpeerchannels")
+        for ch in channels.get("channels", []):
+            scid = ch.get("short_channel_id")
+            if not scid:
+                continue
+            velocity = db.get_channel_velocity(node.name, scid)
+            if not velocity:
+                continue
+            # 10% per day ~= 0.4167% per hour
+            if velocity.velocity_pct_per_hour <= -0.4167:
+                anomalies.append({
+                    "type": "drain_pattern",
+                    "severity": "critical" if velocity.velocity_pct_per_hour <= -1.0 else "warning",
+                    "channel": scid,
+                    "peer": ch.get("peer_id"),
+                    "details": {
+                        "velocity_pct_per_hour": round(velocity.velocity_pct_per_hour, 3),
+                        "trend": velocity.trend,
+                        "hours_until_depleted": velocity.hours_until_depleted
+                    },
+                    "recommendation": "Consider rebalancing or adjusting fees to slow depletion."
+                })
+    except Exception:
+        pass
+
+    # Peer connectivity: frequent disconnects (best-effort heuristics)
+    peers = await node.call("listpeers")
+    for peer in peers.get("peers", []):
+        peer_id = peer.get("id")
+        num_disconnects = peer.get("num_disconnects") or peer.get("disconnects")
+        num_connects = peer.get("num_connects") or peer.get("connects")
+        if num_disconnects is None:
+            continue
+        if num_disconnects >= 5 and (num_connects is None or num_disconnects > num_connects):
+            anomalies.append({
+                "type": "peer_disconnects",
+                "severity": "warning",
+                "channel": None,
+                "peer": peer_id,
+                "details": {
+                    "num_disconnects": num_disconnects,
+                    "num_connects": num_connects
+                },
+                "recommendation": "Monitor peer reliability and consider defensive fee policy."
+            })
+
+    return {
+        "node": node.name,
+        "anomalies": anomalies
+    }
+
+
+async def handle_anomalies(args: Dict) -> Dict:
+    """Detect anomalies outside normal ranges."""
+    node_name = args.get("node")
+
+    if node_name:
+        node = fleet.get_node(node_name)
+        if not node:
+            return {"error": f"Unknown node: {node_name}"}
+        return await _node_anomalies(node)
+
+    tasks = [ _node_anomalies(node) for node in fleet.nodes.values() ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    output = {}
+    for idx, result in enumerate(results):
+        node = list(fleet.nodes.values())[idx]
+        if isinstance(result, Exception):
+            output[node.name] = {"error": str(result)}
+        else:
+            output[node.name] = result
+    return output
+
+
+async def handle_compare_periods(args: Dict) -> Dict:
+    """Compare two routing periods for a node."""
+    import time
+
+    node_name = args.get("node")
+    period1_days = int(args.get("period1_days", 7))
+    period2_days = int(args.get("period2_days", 7))
+    offset_days = int(args.get("offset_days", 7))
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    now = int(time.time())
+    p1_start = now - (period1_days * 86400)
+    p1_end = now
+    p2_end = now - (offset_days * 86400)
+    p2_start = p2_end - (period2_days * 86400)
+
+    forwards = await node.call("listforwards", {"status": "settled"})
+    forwards_list = forwards.get("forwards", [])
+
+    p1 = _forward_stats(forwards_list, p1_start, p1_end)
+    p2 = _forward_stats(forwards_list, p2_start, p2_end)
+
+    def metric_compare(key: str) -> Dict[str, Any]:
+        v1 = p1.get(key, 0)
+        v2 = p2.get(key, 0)
+        delta = v1 - v2
+        pct = round((delta / v2) * 100, 2) if v2 else None
+        return {"period1": v1, "period2": v2, "delta": delta, "percent_change": pct}
+
+    metrics = {
+        "total_revenue_msat": metric_compare("total_revenue_msat"),
+        "total_volume_msat": metric_compare("total_volume_msat"),
+        "forward_count": metric_compare("forward_count"),
+        "avg_fee_ppm": metric_compare("avg_fee_ppm")
+    }
+
+    # Channel improvements/degradations based on revenue delta
+    channel_deltas: List[Dict[str, Any]] = []
+    all_channels = set(p1["per_channel"].keys()) | set(p2["per_channel"].keys())
+    for ch_id in all_channels:
+        rev1 = p1["per_channel"].get(ch_id, {}).get("revenue_msat", 0)
+        rev2 = p2["per_channel"].get(ch_id, {}).get("revenue_msat", 0)
+        delta = rev1 - rev2
+        pct = round((delta / rev2) * 100, 2) if rev2 else None
+        channel_deltas.append({
+            "channel_id": ch_id,
+            "period1_revenue_msat": rev1,
+            "period2_revenue_msat": rev2,
+            "delta_revenue_msat": delta,
+            "percent_change": pct
+        })
+
+    improved = sorted(channel_deltas, key=lambda x: x["delta_revenue_msat"], reverse=True)[:5]
+    degraded = sorted(channel_deltas, key=lambda x: x["delta_revenue_msat"])[:5]
+
+    return {
+        "node": node_name,
+        "periods": {
+            "period1": {"start_ts": p1_start, "end_ts": p1_end, "days": period1_days},
+            "period2": {"start_ts": p2_start, "end_ts": p2_end, "days": period2_days, "offset_days": offset_days}
+        },
+        "metrics": metrics,
+        "improved_channels": improved,
+        "degraded_channels": degraded
+    }
+
+
+async def handle_channel_deep_dive(args: Dict) -> Dict:
+    """Get comprehensive context for a channel or peer."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    peer_id = args.get("peer_id")
+
+    if not node_name:
+        return {"error": "node is required"}
+    if not channel_id and not peer_id:
+        return {"error": "channel_id or peer_id is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Resolve channel and peer from listpeerchannels
+    channels_result = await node.call("listpeerchannels")
+    channels = channels_result.get("channels", [])
+    target_channel = None
+    if channel_id:
+        for ch in channels:
+            if ch.get("short_channel_id") == channel_id:
+                target_channel = ch
+                peer_id = ch.get("peer_id")
+                break
+    elif peer_id:
+        for ch in channels:
+            if ch.get("peer_id") == peer_id:
+                target_channel = ch
+                channel_id = ch.get("short_channel_id")
+                break
+
+    if not target_channel:
+        return {"error": "Channel not found for given channel_id/peer_id"}
+
+    # Basic info
+    totals = _channel_totals(target_channel)
+    total_msat = totals["total_msat"]
+    local_msat = totals["local_msat"]
+    remote_msat = max(0, total_msat - local_msat)
+    local_pct = round((local_msat / total_msat) * 100, 2) if total_msat else 0.0
+
+    peers = await node.call("listpeers")
+    peer_info = next((p for p in peers.get("peers", []) if p.get("id") == peer_id), {})
+    peer_alias = peer_info.get("alias") or peer_info.get("alias_or_local", "") or ""
+    connected = bool(peer_info.get("connected", False))
+
+    # Profitability
+    profitability = {}
+    try:
+        prof = await node.call("revenue-profitability", {"channel_id": channel_id})
+        for ch in prof.get("channels", []):
+            if ch.get("channel_id") == channel_id:
+                profitability = {
+                    "lifetime_revenue_sats": ch.get("revenue_sats"),
+                    "lifetime_cost_sats": ch.get("cost_sats"),
+                    "net_profit_sats": ch.get("net_profit_sats"),
+                    "roi_percentage": ch.get("roi_percentage"),
+                    "classification": ch.get("classification")
+                }
+                break
+    except Exception:
+        profitability = {}
+
+    # Flow analysis + velocity
+    flow = _flow_profile(target_channel)
+    velocity = None
+    try:
+        db = ensure_advisor_db()
+        velocity = db.get_channel_velocity(node_name, channel_id)
+    except Exception:
+        velocity = None
+
+    flow_analysis = {
+        "classification": flow.get("flow_profile"),
+        "inbound_outbound_ratio": flow.get("inbound_outbound_ratio"),
+        "recent_volumes_sats": {
+            "inbound": flow.get("inbound_volume_sats"),
+            "outbound": flow.get("outbound_volume_sats")
+        },
+        "velocity": {
+            "sats_per_hour": getattr(velocity, "velocity_sats_per_hour", None),
+            "pct_per_hour": getattr(velocity, "velocity_pct_per_hour", None),
+            "trend": getattr(velocity, "trend", None),
+            "hours_until_depleted": getattr(velocity, "hours_until_depleted", None),
+            "hours_until_full": getattr(velocity, "hours_until_full", None)
+        } if velocity else None
+    }
+
+    # Fee history (best-effort)
+    fee_history = {
+        "current_fee_ppm": target_channel.get("fee_proportional_millionths"),
+        "current_base_fee_msat": target_channel.get("fee_base_msat"),
+        "recent_changes": None
+    }
+    try:
+        debug = await node.call("revenue-fee-debug")
+        fee_history["recent_changes"] = debug.get("recent_fee_changes")
+    except Exception:
+        pass
+
+    # Recent forwards through channel
+    forwards = await node.call("listforwards", {"status": "settled"})
+    recent = []
+    for fwd in sorted(
+        forwards.get("forwards", []),
+        key=lambda f: _coerce_ts(f.get("resolved_time") or f.get("resolved_at") or 0),
+        reverse=True
+    ):
+        if fwd.get("out_channel") == channel_id or fwd.get("in_channel") == channel_id:
+            in_msat = _extract_msat(fwd.get("in_msat"))
+            out_msat = _extract_msat(fwd.get("out_msat"))
+            recent.append({
+                "resolved_time": _coerce_ts(fwd.get("resolved_time") or fwd.get("resolved_at") or 0),
+                "in_msat": in_msat,
+                "out_msat": out_msat,
+                "fee_msat": max(0, in_msat - out_msat)
+            })
+        if len(recent) >= 10:
+            break
+
+    # Issues
+    issues = []
+    if local_pct < 20:
+        issues.append({"type": "critical_low_balance", "severity": "critical", "details": {"local_pct": local_pct}})
+    if profitability.get("classification") in {"bleeder", "zombie"}:
+        issues.append({
+            "type": profitability.get("classification"),
+            "severity": "warning" if profitability.get("classification") == "bleeder" else "info"
+        })
+
+    return {
+        "node": node_name,
+        "channel_id": channel_id,
+        "peer_id": peer_id,
+        "basic": {
+            "capacity_msat": total_msat,
+            "local_msat": local_msat,
+            "remote_msat": remote_msat,
+            "local_balance_pct": local_pct,
+            "peer_alias": peer_alias,
+            "connected": connected
+        },
+        "profitability": profitability,
+        "flow_analysis": flow_analysis,
+        "fee_history": fee_history,
+        "recent_forwards": recent,
+        "issues": issues
+    }
+
+
+def _action_priority(action: Dict[str, Any]) -> Dict[str, Any]:
+    action_type = action.get("action_type", "")
+    base = 5
+    effort = "medium"
+    impact = "moderate"
+
+    if action_type in {"channel_open", "channel_close"}:
+        base = 7
+        effort = "involved"
+        impact = "high"
+    elif action_type in {"fee_change", "set_fee"}:
+        base = 6
+        effort = "quick"
+        impact = "moderate"
+    elif action_type in {"rebalance", "circular_rebalance"}:
+        base = 6
+        effort = "medium"
+        impact = "moderate"
+
+    return {"priority": base, "effort": effort, "impact": impact}
+
+
+async def _node_recommended_actions(node: NodeConnection, limit: int) -> Dict[str, Any]:
+    actions: List[Dict[str, Any]] = []
+
+    pending = await node.call("hive-pending-actions")
+    for action in pending.get("actions", []):
+        meta = _action_priority(action)
+        actions.append({
+            "source": "pending_action",
+            "node": node.name,
+            "action": action,
+            "priority": meta["priority"],
+            "reasoning": action.get("reasoning") or action.get("reason") or "Pending action requires review.",
+            "expected_impact": meta["impact"],
+            "effort": meta["effort"]
+        })
+
+    # Add anomaly-driven recommendations
+    anomalies = await _node_anomalies(node)
+    for a in anomalies.get("anomalies", []):
+        priority = 7 if a.get("severity") == "critical" else 5
+        effort = "quick" if a.get("type") in {"revenue_velocity_drop", "peer_disconnects"} else "medium"
+        actions.append({
+            "source": "anomaly",
+            "node": node.name,
+            "action": {
+                "type": a.get("type"),
+                "channel": a.get("channel"),
+                "peer": a.get("peer")
+            },
+            "priority": priority,
+            "reasoning": a.get("recommendation"),
+            "expected_impact": "moderate" if priority <= 6 else "high",
+            "effort": effort
+        })
+
+    actions_sorted = sorted(actions, key=lambda x: x.get("priority", 0), reverse=True)
+    return {"node": node.name, "actions": actions_sorted[:limit]}
+
+
+async def handle_recommended_actions(args: Dict) -> Dict:
+    """Return prioritized list of recommended actions."""
+    node_name = args.get("node")
+    limit = int(args.get("limit", 10))
+
+    if node_name:
+        node = fleet.get_node(node_name)
+        if not node:
+            return {"error": f"Unknown node: {node_name}"}
+        return await _node_recommended_actions(node, limit)
+
+    tasks = [_node_recommended_actions(node, limit) for node in fleet.nodes.values()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    output = {}
+    for idx, result in enumerate(results):
+        node = list(fleet.nodes.values())[idx]
+        if isinstance(result, Exception):
+            output[node.name] = {"error": str(result)}
+        else:
+            output[node.name] = result
+    return output
+
+
+async def _node_peer_search(node: NodeConnection, query: str) -> Dict[str, Any]:
+    query_lower = query.lower()
+
+    peers = await node.call("listpeers")
+    channels_result = await node.call("listpeerchannels")
+    channels = channels_result.get("channels", [])
+
+    # Build pubkey -> alias map from listnodes (best-effort)
+    alias_map = {}
+    try:
+        nodes = await node.call("listnodes")
+        for n in nodes.get("nodes", []):
+            pubkey = n.get("nodeid")
+            alias = n.get("alias")
+            if pubkey and alias:
+                alias_map[pubkey] = alias
+    except Exception:
+        pass
+
+    channel_by_peer = {}
+    for ch in channels:
+        peer_id = ch.get("peer_id")
+        if not peer_id:
+            continue
+        channel_by_peer.setdefault(peer_id, []).append(ch)
+
+    matches = []
+    for peer in peers.get("peers", []):
+        peer_id = peer.get("id")
+        alias = alias_map.get(peer_id) or peer.get("alias") or peer.get("alias_or_local") or ""
+        if query_lower not in alias.lower():
+            continue
+
+        # Use first channel if multiple
+        ch = None
+        if peer_id in channel_by_peer:
+            ch = channel_by_peer[peer_id][0]
+
+        capacity_sats = 0
+        local_balance_pct = None
+        channel_id = None
+        if ch:
+            totals = _channel_totals(ch)
+            total_msat = totals["total_msat"]
+            local_msat = totals["local_msat"]
+            capacity_sats = total_msat // 1000 if total_msat else 0
+            local_balance_pct = round((local_msat / total_msat) * 100, 2) if total_msat else None
+            channel_id = ch.get("short_channel_id")
+
+        matches.append({
+            "pubkey": peer_id,
+            "alias": alias,
+            "channel_id": channel_id,
+            "capacity_sats": capacity_sats,
+            "local_balance_pct": local_balance_pct,
+            "connected": bool(peer.get("connected", False))
+        })
+
+    return {"node": node.name, "matches": matches}
+
+
+async def handle_peer_search(args: Dict) -> Dict:
+    """Search peers by alias substring."""
+    query = args.get("query", "")
+    node_name = args.get("node")
+
+    if not query:
+        return {"error": "query is required"}
+
+    if node_name:
+        node = fleet.get_node(node_name)
+        if not node:
+            return {"error": f"Unknown node: {node_name}"}
+        return await _node_peer_search(node, query)
+
+    tasks = [_node_peer_search(node, query) for node in fleet.nodes.values()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    output = {}
+    for idx, result in enumerate(results):
+        node = list(fleet.nodes.values())[idx]
+        if isinstance(result, Exception):
+            output[node.name] = {"error": str(result)}
+        else:
+            output[node.name] = result
+    return output
+
+
 async def handle_pending_actions(args: Dict) -> Dict:
     """Get pending actions from nodes."""
     node_name = args.get("node")
@@ -3669,10 +4617,7 @@ async def handle_pending_actions(args: Dict) -> Dict:
         result = await node.call("hive-pending-actions")
         return {node_name: result}
     else:
-        results = {}
-        for name, node in fleet.nodes.items():
-            results[name] = await node.call("hive-pending-actions")
-        return results
+        return await fleet.call_all("hive-pending-actions")
 
 
 async def handle_approve_action(args: Dict) -> Dict:
@@ -5473,16 +6418,27 @@ async def get_goat_feeder_revenue(since_timestamp: int) -> Dict[str, Any]:
     import urllib.request
     import json
 
+    validation_error = _validate_lnbits_config()
+    if validation_error:
+        return {"total_sats": 0, "payment_count": 0, "error": validation_error}
+    if not LNBITS_INVOICE_KEY:
+        return {"total_sats": 0, "payment_count": 0, "error": "LNBITS_INVOICE_KEY not configured."}
+
     try:
         # Query LNbits payments API using urllib (no external dependencies)
         req = urllib.request.Request(
             f"{LNBITS_URL}/api/v1/payments",
             headers={"X-Api-Key": LNBITS_INVOICE_KEY}
         )
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=LNBITS_TIMEOUT_SECS) as response:
             if response.status != 200:
                 return {"total_sats": 0, "payment_count": 0, "error": f"API error: {response.status}"}
-            payments = json.loads(response.read())
+            raw = json.loads(response.read())
+
+        if isinstance(raw, dict) and "data" in raw:
+            payments = raw.get("data", [])
+        else:
+            payments = raw if isinstance(raw, list) else []
 
         total_sats = 0
         payment_count = 0
@@ -8258,8 +9214,12 @@ async def main():
     # Load node configuration
     config_path = os.environ.get("HIVE_NODES_CONFIG")
     if config_path and os.path.exists(config_path):
-        fleet.load_config(config_path)
-        await fleet.connect_all()
+        try:
+            fleet.load_config(config_path)
+            await fleet.connect_all()
+        except Exception as e:
+            logger.error(f"Failed to load/connect nodes: {e}")
+            sys.exit(1)
     else:
         logger.warning("No HIVE_NODES_CONFIG set - running without nodes")
         logger.info("Set HIVE_NODES_CONFIG=/path/to/nodes.json to connect to nodes")
