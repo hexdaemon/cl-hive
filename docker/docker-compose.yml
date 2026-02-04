@@ -89,6 +89,11 @@ services:
       # CLBOSS (optional - set to false to disable)
       - CLBOSS_ENABLED=${CLBOSS_ENABLED:-true}
 
+      # Trustedcoin (optional - alternative Bitcoin backend using block explorers)
+      # When enabled without bitcoin-rpc*: explorer-only mode (no bitcoind needed)
+      # When enabled with bitcoin-rpc*: hybrid mode (bitcoind primary, explorers fallback)
+      - TRUSTEDCOIN_ENABLED=${TRUSTEDCOIN_ENABLED:-false}
+
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-info}
 
