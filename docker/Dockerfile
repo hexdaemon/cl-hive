@@ -155,6 +155,24 @@ RUN git clone --depth 1 https://github.com/ksedgwic/clboss.git \
     && rm -rf clboss
 
 # =============================================================================
+# TRUSTEDCOIN PLUGIN (OPTIONAL)
+# =============================================================================
+# Trustedcoin replaces bcli for Bitcoin backend, using block explorers.
+# Useful for VPS deployments without local bitcoind.
+# - Explorer-only mode: No bitcoind required, uses public explorers
+# - Hybrid mode: bitcoind primary with explorer fallback
+
+ARG TRUSTEDCOIN_VERSION=v0.8.6
+RUN ARCH=$(uname -m) \
+    && if [ "$ARCH" = "x86_64" ]; then ARCH="linux-amd64"; fi \
+    && if [ "$ARCH" = "aarch64" ]; then ARCH="linux-arm64"; fi \
+    && wget -O /tmp/trustedcoin.tar.gz "https://github.com/nbd-wtf/trustedcoin/releases/download/${TRUSTEDCOIN_VERSION}/trustedcoin-${TRUSTEDCOIN_VERSION}-${ARCH}.tar.gz" \
+    && tar -xzf /tmp/trustedcoin.tar.gz -C /tmp \
+    && mv /tmp/trustedcoin /usr/local/bin/trustedcoin \
+    && chmod +x /usr/local/bin/trustedcoin \
+    && rm /tmp/trustedcoin.tar.gz
+
+# =============================================================================
 # SLING PLUGIN (REQUIRED)
 # =============================================================================
 # Sling provides rebalancing capabilities required by cl-revenue-ops.
