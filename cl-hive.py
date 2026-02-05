@@ -14122,8 +14122,9 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
             # deterministic failures like: "xpay says max is 293999msat" for a 294000msat pay.
             pay_result = safe_plugin.rpc.pay(
                 bolt12_invoice,
+                # CLN constraint: cannot specify exemptfee when maxfee is set.
+                # We use a tiny maxfee to avoid xpay max-1msat failures.
                 maxfee="1sat",
-                exemptfee="1sat",
                 retry_for=30,
             )
 
