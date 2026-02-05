@@ -14116,7 +14116,16 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
             bolt12_invoice = invoice_result["invoice"]
 
             # Pay the invoice
-            pay_result = safe_plugin.rpc.pay(bolt12_invoice)
+            # NOTE: Allow a tiny fee budget. Without this, CLN xpay may report max==amount-1msat
+            # even when channels are 0ppm, due to rounding/overhead in the pay layers.
+            # 1 sat (1000 msat) is ample for these small settlement payments and prevents
+            # deterministic failures like: "xpay says max is 293999msat" for a 294000msat pay.
+            pay_result = safe_plugin.rpc.pay(
+                bolt12_invoice,
+                maxfee="1sat",
+                exemptfee="1sat",
+                retry_for=30,
+            )
 
             if pay_result.get("status") == "complete":
                 executed.append({
