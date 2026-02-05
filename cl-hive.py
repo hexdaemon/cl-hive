@@ -14123,7 +14123,7 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
             pay_result = safe_plugin.rpc.pay(
                 bolt12_invoice,
                 maxfee="1sat",
-                exemptfee="1sat",
+                # CLN constraint: cannot specify exemptfee when maxfee is set.
                 retry_for=30,
             )
 
