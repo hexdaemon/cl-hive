@@ -2,7 +2,7 @@
     "@context": "https://w3id.org/security/v2",
     "type": "RepoManifest",
     "issuer": "did:cid:bagaaieratn3qejd6mr4y2bk3nliriafoyeftt74tkl7il6bbvakfdupahkla",
-    "created": "2026-02-05T19:21:07Z",
+    "created": "2026-02-05T20:56:51Z",
     "repository": "https://github.com/lightning-goats/cl-hive",
     "files": [
         {
@@ -39,7 +39,7 @@
         },
         {
             "path": "./cl-hive.py",
-            "sha256": "a7b7e2fcd95e31b157f0c1f7e8b124be90799485bf1b468a29a82fa627064045"
+            "sha256": "2cce5f76755d5a5cdd1c71c7bb65f4324ec309946ae08d6a8ec9ec464881a594"
         },
         {
             "path": "./config/mcp-config.example.json",
@@ -71,22 +71,22 @@
         },
         {
             "path": "./docker/backups/database/lightningd.sqlite3",
-            "sha256": "93b4f4c923f1cbab88997d72d73d9f555ef14f8b5b7f4ed378b9000f91ef77f9"
+            "sha256": "8404a858137ef2bed2032c741dd5ccd79e3b5b1428072fb059a4882547b2ce5b"
         },
         {
             "path": "./docker/backups/emergency/emergency.recover",
             "sha256": ""
         },
         {
-            "path": "./docker/backups/emergency/emergency.recover.20260205_190945",
+            "path": "./docker/backups/emergency/emergency.recover.20260205_205206",
             "sha256": ""
         },
         {
-            "path": "./docker/backups/emergency/emergency.recover.20260205_191813",
+            "path": "./docker/backups/emergency/emergency.recover.20260205_205605",
             "sha256": ""
         },
         {
-            "path": "./docker/backups/emergency/emergency.recover.20260205_191814",
+            "path": "./docker/backups/emergency/emergency.recover.20260205_205608",
             "sha256": ""
         },
         {
@@ -839,7 +839,7 @@
         },
         {
             "path": "./__pycache__/cl-hive.cpython-314.pyc",
-            "sha256": "694024bf74e57900410e0427fce3190c1754ddf6db42752a236aa4d87d035c18"
+            "sha256": "5b55b15202a6ca3a46afdd169e069491b14066c3fd8a042403d0f3ed3f72bf03"
         },
         {
             "path": "./__pycache__/mcp-hive-server.cpython-312.pyc",
@@ -16404,9 +16404,9 @@
     ],
     "proof": {
         "type": "EcdsaSecp256k1Signature2019",
-        "created": "2026-02-05T19:21:20.509Z",
+        "created": "2026-02-05T20:57:04.557Z",
         "verificationMethod": "did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka#key-1",
         "proofPurpose": "assertionMethod",
-        "proofValue": "OKO2WZLlNKr2T0ivGYyvaobyOX2UMAXqV4A1VVyKKGY7PJieDE1xxhz1e_aDZ2gRozMd-lLJbN5JpWRLLT0lKQ"
+        "proofValue": "Ry9XXILVo7luML6EdgifcDUmM8G5_1xHm_KpXRIykOA8ftKNHtOPfNa2mtvKb3vSKrgrfJnNwPSYZt36jYFZpQ"
     }
 }
