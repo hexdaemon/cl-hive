@@ -1096,6 +1096,38 @@ class HiveDatabase:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # =====================================================================
+        # PEER CAPABILITIES TABLE (Phase B - Version Tolerance)
+        # =====================================================================
+        # Stores peer feature sets and max supported protocol version
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_capabilities (
+                peer_id TEXT PRIMARY KEY,
+                features TEXT NOT NULL DEFAULT '[]',
+                max_protocol_version INTEGER NOT NULL DEFAULT 1,
+                plugin_version TEXT DEFAULT '',
+                updated_at INTEGER NOT NULL
+            )
+        """)
+
+        # =====================================================================
+        # PROTO EVENTS TABLE (Phase C - Deterministic Idempotency)
+        # =====================================================================
+        # Persistent dedup for state-changing protocol messages
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS proto_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                received_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_proto_events_created
+            ON proto_events(created_at)
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -5872,3 +5904,148 @@ class HiveDatabase:
             total += result.rowcount
 
         return total
+
+    # =========================================================================
+    # PEER CAPABILITIES (Phase B - Version Tolerance)
+    # =========================================================================
+
+    def save_peer_capabilities(self, peer_id: str, features: list) -> bool:
+        """
+        Save or update a peer's advertised capabilities.
+
+        Parses 'proto-vN' from the features list to populate max_protocol_version.
+
+        Args:
+            peer_id: Peer's public key
+            features: List of feature strings from ATTEST manifest
+
+        Returns:
+            True if saved successfully
+        """
+        if not isinstance(features, list):
+            return False
+
+        max_proto = 1
+        plugin_version = ''
+        for f in features:
+            if isinstance(f, str) and f.startswith('proto-v'):
+                try:
+                    v = int(f[7:])
+                    max_proto = max(max_proto, v)
+                except ValueError:
+                    pass
+            if isinstance(f, str) and f.startswith('cl-hive'):
+                plugin_version = f
+
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """INSERT INTO peer_capabilities
+                   (peer_id, features, max_protocol_version, plugin_version, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(peer_id) DO UPDATE SET
+                       features = excluded.features,
+                       max_protocol_version = excluded.max_protocol_version,
+                       plugin_version = excluded.plugin_version,
+                       updated_at = excluded.updated_at""",
+                (peer_id, json.dumps(features), max_proto, plugin_version, int(time.time()))
+            )
+            return True
+        except Exception as e:
+            self.plugin.log(f"HiveDatabase: save_peer_capabilities error: {e}", level='warn')
+            return False
+
+    def get_peer_capabilities(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a peer's capabilities record.
+
+        Returns:
+            Dict with features, max_protocol_version, plugin_version, updated_at
+            or None if not found.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM peer_capabilities WHERE peer_id = ?",
+            (peer_id,)
+        ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        try:
+            result['features'] = json.loads(result.get('features', '[]'))
+        except (json.JSONDecodeError, TypeError):
+            result['features'] = []
+        return result
+
+    def get_peer_max_protocol_version(self, peer_id: str) -> int:
+        """
+        Get the max protocol version a peer supports.
+
+        Returns:
+            Integer version (defaults to 1 if unknown).
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT max_protocol_version FROM peer_capabilities WHERE peer_id = ?",
+            (peer_id,)
+        ).fetchone()
+        return row['max_protocol_version'] if row else 1
+
+    # =========================================================================
+    # PROTO EVENTS (Phase C - Deterministic Idempotency)
+    # =========================================================================
+
+    def record_proto_event(self, event_id: str, event_type: str, actor_id: str) -> bool:
+        """
+        Record a protocol event for idempotency.
+
+        Uses INSERT OR IGNORE so duplicate event_ids are silently skipped.
+
+        Args:
+            event_id: SHA256-based unique event identifier
+            event_type: Message type name (e.g. 'MEMBER_LEFT')
+            actor_id: Peer that originated the event
+
+        Returns:
+            True if this is a new event (inserted), False if duplicate.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        try:
+            result = conn.execute(
+                """INSERT OR IGNORE INTO proto_events
+                   (event_id, event_type, actor_id, created_at, received_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (event_id, event_type, actor_id, now, now)
+            )
+            return result.rowcount > 0
+        except Exception as e:
+            self.plugin.log(f"HiveDatabase: record_proto_event error: {e}", level='warn')
+            return False
+
+    def has_proto_event(self, event_id: str) -> bool:
+        """Check if a protocol event has already been recorded."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT 1 FROM proto_events WHERE event_id = ?",
+            (event_id,)
+        ).fetchone()
+        return row is not None
+
+    def cleanup_proto_events(self, max_age_seconds: int = 30 * 86400) -> int:
+        """
+        Remove proto_events older than max_age_seconds.
+
+        Args:
+            max_age_seconds: Maximum age in seconds (default 30 days)
+
+        Returns:
+            Number of rows pruned.
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        result = conn.execute(
+            "DELETE FROM proto_events WHERE created_at < ?",
+            (cutoff,)
+        )
+        return result.rowcount

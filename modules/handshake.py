@@ -546,7 +546,11 @@ class HandshakeManager:
                 features.append('onion-msg')
         except Exception:
             pass
-        
+
+        # Advertise max supported protocol version (Phase B hardening)
+        from modules.protocol import SUPPORTED_VERSIONS
+        features.append(f'proto-v{max(SUPPORTED_VERSIONS)}')
+
         return features
     
     def check_requirements(self, requirements: int, features: list) -> Tuple[bool, list]:

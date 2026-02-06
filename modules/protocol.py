@@ -36,6 +36,12 @@ HIVE_MAGIC_HEX = 0x48495645
 # Protocol version for compatibility checks
 PROTOCOL_VERSION = 1
 
+# Version tolerance: accept messages from this range of protocol versions.
+# Prevents fleet partition during rolling upgrades (Phase B hardening).
+MIN_SUPPORTED_VERSION = 1
+MAX_SUPPORTED_VERSION = 2
+SUPPORTED_VERSIONS = set(range(MIN_SUPPORTED_VERSION, MAX_SUPPORTED_VERSION + 1))
+
 # Maximum message size in bytes (post-hex decode)
 MAX_MESSAGE_BYTES = 65535
 
@@ -519,14 +525,18 @@ def deserialize(data: bytes) -> Tuple[Optional[HiveMessageType], Optional[Dict[s
         json_data = data[4:].decode('utf-8')
         envelope = json.loads(json_data)
         
-        if envelope.get('version') != PROTOCOL_VERSION:
+        if envelope.get('version') not in SUPPORTED_VERSIONS:
             return (None, None)
 
         msg_type = HiveMessageType(envelope['type'])
         payload = envelope.get('payload', {})
         if not isinstance(payload, dict):
             return (None, None)
-        
+
+        # Inject envelope version so handlers can check it without
+        # changing the function signature (Phase B hardening).
+        payload['_envelope_version'] = envelope.get('version')
+
         return (msg_type, payload)
         
     except (json.JSONDecodeError, KeyError, ValueError) as e:
@@ -1171,7 +1181,8 @@ def create_hello(pubkey: str) -> bytes:
     """
     return serialize(HiveMessageType.HELLO, {
         "pubkey": pubkey,
-        "protocol_version": PROTOCOL_VERSION
+        "protocol_version": PROTOCOL_VERSION,
+        "supported_versions": sorted(SUPPORTED_VERSIONS)
     })
 
 

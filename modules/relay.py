@@ -208,10 +208,20 @@ class RelayManager:
 
         Uses hash of key identifying fields to detect duplicates
         even if relay metadata differs.
+
+        Phase C hardening: if the payload carries a deterministic
+        ``_event_id`` (injected by idempotency layer), use it directly
+        instead of hashing the full payload.
         """
-        # Extract core content (exclude relay metadata)
+        # Prefer deterministic event ID when available
+        eid = payload.get("_event_id")
+        if isinstance(eid, str) and len(eid) == 32:
+            return eid
+
+        # Fallback: hash core content (exclude relay + internal metadata)
         core = {k: v for k, v in payload.items()
-                if k not in ("_relay", "msg_id", "ttl", "relay_path")}
+                if k not in ("_relay", "msg_id", "ttl", "relay_path",
+                             "_envelope_version", "_event_id")}
         content = json.dumps(core, sort_keys=True, separators=(',', ':'))
         return hashlib.sha256(content.encode()).hexdigest()[:32]
 

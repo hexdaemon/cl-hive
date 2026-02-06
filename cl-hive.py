@@ -100,6 +100,7 @@ from modules.anticipatory_liquidity import AnticipatoryLiquidityManager
 from modules.task_manager import TaskManager
 from modules.splice_manager import SpliceManager
 from modules.relay import RelayManager
+from modules.idempotency import check_and_record
 from modules import network_metrics
 from modules.rpc_commands import (
     HiveContext,
@@ -1655,8 +1656,11 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
     msg_type, msg_payload = deserialize(data)
     
     if msg_type is None:
-        # Malformed Hive message (magic matched but parse failed)
-        plugin.log(f"cl-hive: Malformed message from {peer_id[:16]}...", level='warn')
+        # Phase B: distinguish version rejection from parse errors
+        if is_hive_message(data):
+            plugin.log(f"cl-hive: Rejected Hive message from {peer_id[:16]}... (version/parse)", level='debug')
+        else:
+            plugin.log(f"cl-hive: Malformed message from {peer_id[:16]}...", level='warn')
         return {"result": "continue"}
 
     # VPN Transport Policy Check
@@ -2019,6 +2023,10 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         tier=initial_tier,
         joined_at=int(time.time())
     )
+
+    # Phase B: persist peer capabilities from manifest features
+    manifest_features = manifest_data.get("features", [])
+    database.save_peer_capabilities(peer_id, manifest_features)
 
     handshake_mgr.clear_challenge(peer_id)
 
@@ -3623,6 +3631,15 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
         plugin.log(f"cl-hive: PROMOTION_REQUEST from {peer_id[:16]}... target mismatch", level='warn')
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "PROMOTION_REQUEST", payload, target_pubkey)
+    if not is_new:
+        plugin.log(f"cl-hive: PROMOTION_REQUEST duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.PROMOTION_REQUEST, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
     # RELAY: Forward to other members before processing
     relay_count = _relay_message(HiveMessageType.PROMOTION_REQUEST, payload, peer_id)
     if relay_count > 0:
@@ -3695,6 +3712,15 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not is_relayed and voucher_pubkey != peer_id:
         plugin.log(f"cl-hive: VOUCH from {peer_id[:16]}... voucher mismatch", level='warn')
         return {"result": "continue"}
+
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "VOUCH", payload, voucher_pubkey)
+    if not is_new:
+        plugin.log(f"cl-hive: VOUCH duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.VOUCH, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
 
     # RELAY: Forward to other members before processing
     relay_count = _relay_message(HiveMessageType.VOUCH, payload, peer_id)
@@ -3797,6 +3823,15 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not validate_promotion(payload):
         plugin.log(f"cl-hive: PROMOTION from {peer_id[:16]}... invalid payload", level='warn')
         return {"result": "continue"}
+
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "PROMOTION", payload, peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: PROMOTION duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.PROMOTION, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
 
     # For relayed messages, verify peer_id is a member (relay forwarder)
     # The actual sender verification happens via signature in vouches
@@ -3902,6 +3937,15 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: MEMBER_LEFT sender mismatch: {peer_id[:16]}... != {leaving_peer_id[:16]}...", level='warn')
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "MEMBER_LEFT", payload, leaving_peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: MEMBER_LEFT duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.MEMBER_LEFT, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
     # Check if member exists
     member = database.get_member(leaving_peer_id)
     if not member:
@@ -3986,6 +4030,15 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: BAN_PROPOSAL sender mismatch", level='warn')
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "BAN_PROPOSAL", payload, proposer_peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: BAN_PROPOSAL duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.BAN_PROPOSAL, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
     # Verify proposer is a member or admin
     proposer = database.get_member(proposer_peer_id)
     if not proposer or proposer.get("tier") not in (MembershipTier.MEMBER.value,):
@@ -4057,6 +4110,15 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _validate_relay_sender(peer_id, voter_peer_id, payload):
         plugin.log(f"cl-hive: BAN_VOTE sender mismatch", level='warn')
         return {"result": "continue"}
+
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "BAN_VOTE", payload, voter_peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: BAN_VOTE duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.BAN_VOTE, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
 
     # Verify voter is a member or admin
     voter = database.get_member(voter_peer_id)
@@ -6547,6 +6609,15 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Extract rebalance costs (backward compat - defaults to 0)
     rebalance_costs_sats = payload.get("rebalance_costs_sats", 0)
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "FEE_REPORT", payload, report_peer_id or peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: FEE_REPORT duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.FEE_REPORT, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
     # Verify sender (supports relay) - report_peer_id is the original sender
     if not _validate_relay_sender(peer_id, report_peer_id, payload):
         plugin.log(f"cl-hive: FEE_REPORT peer_id mismatch from {peer_id[:16]}...", level='warn')
@@ -6670,6 +6741,15 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
         )
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "SETTLEMENT_PROPOSE", payload, proposer_peer_id or peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: SETTLEMENT_PROPOSE duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.SETTLEMENT_PROPOSE, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
     # Verify original sender is a hive member and not banned
     sender = database.get_member(proposer_peer_id)
     if not sender or database.is_banned(proposer_peer_id):
@@ -6774,6 +6854,15 @@ def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
         )
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "SETTLEMENT_READY", payload, voter_peer_id or peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: SETTLEMENT_READY duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.SETTLEMENT_READY, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
     # Verify original sender is a hive member and not banned
     sender = database.get_member(voter_peer_id)
     if not sender or database.is_banned(voter_peer_id):
@@ -6869,6 +6958,15 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
         )
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "SETTLEMENT_EXECUTED", payload, executor_peer_id or peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: SETTLEMENT_EXECUTED duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.SETTLEMENT_EXECUTED, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
     # Verify original sender is a hive member and not banned
     sender = database.get_member(executor_peer_id)
     if not sender or database.is_banned(executor_peer_id):
@@ -6946,6 +7044,14 @@ def handle_task_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: TASK_REQUEST from non-member {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "TASK_REQUEST", payload, peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: TASK_REQUEST duplicate event {event_id}, skipping", level='debug')
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
     # Delegate to task manager
     result = task_mgr.handle_task_request(peer_id, payload, safe_plugin.rpc)
 
@@ -6984,6 +7090,14 @@ def handle_task_response(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: TASK_RESPONSE from non-member {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "TASK_RESPONSE", payload, peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: TASK_RESPONSE duplicate event {event_id}, skipping", level='debug')
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
     # Delegate to task manager
     result = task_mgr.handle_task_response(peer_id, payload, safe_plugin.rpc)
 
@@ -7020,6 +7134,12 @@ def handle_splice_init_request(peer_id: str, payload: Dict, plugin: Plugin) -> D
     sender = database.get_member(peer_id)
     if not sender or database.is_banned(peer_id):
         plugin.log(f"cl-hive: SPLICE_INIT_REQUEST from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "SPLICE_INIT_REQUEST", payload, peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: SPLICE_INIT_REQUEST duplicate event {event_id}, skipping", level='debug')
         return {"result": "continue"}
 
     # Delegate to splice manager
@@ -7083,6 +7203,12 @@ def handle_splice_update(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not sender:
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "SPLICE_UPDATE", payload, peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: SPLICE_UPDATE duplicate event {event_id}, skipping", level='debug')
+        return {"result": "continue"}
+
     # Delegate to splice manager
     result = splice_mgr.handle_splice_update(peer_id, payload, safe_plugin.rpc)
 
@@ -7105,6 +7231,12 @@ def handle_splice_signed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Verify sender is a hive member
     sender = database.get_member(peer_id)
     if not sender:
+        return {"result": "continue"}
+
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "SPLICE_SIGNED", payload, peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: SPLICE_SIGNED duplicate event {event_id}, skipping", level='debug')
         return {"result": "continue"}
 
     # Delegate to splice manager
@@ -7134,6 +7266,12 @@ def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Verify sender is a hive member
     sender = database.get_member(peer_id)
     if not sender:
+        return {"result": "continue"}
+
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "SPLICE_ABORT", payload, peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: SPLICE_ABORT duplicate event {event_id}, skipping", level='debug')
         return {"result": "continue"}
 
     # Delegate to splice manager
@@ -7772,6 +7910,9 @@ def membership_maintenance_loop():
                 database.cleanup_expired_actions()  # Mark expired as 'expired'
                 database.prune_planner_logs(older_than_days=30)
                 database.prune_old_actions(older_than_days=7)
+
+                # Phase C: Proto events cleanup (30-day retention)
+                database.cleanup_proto_events(max_age_seconds=30 * 86400)
 
                 # Issue #38: Auto-connect to hive members we're not connected to
                 reconnected = _auto_connect_to_all_members()
