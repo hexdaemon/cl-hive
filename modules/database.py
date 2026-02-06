@@ -1128,6 +1128,37 @@ class HiveDatabase:
             ON proto_events(created_at)
         """)
 
+        # =====================================================================
+        # PROTO OUTBOX TABLE (Phase D - Reliable Delivery)
+        # =====================================================================
+        # Per-peer message delivery tracking with retry and backoff
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS proto_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                msg_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                msg_type INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                created_at INTEGER NOT NULL,
+                sent_at INTEGER,
+                next_retry_at INTEGER NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                expires_at INTEGER NOT NULL,
+                last_error TEXT,
+                acked_at INTEGER,
+                UNIQUE(msg_id, peer_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_proto_outbox_retry
+            ON proto_outbox(status, next_retry_at)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_proto_outbox_peer
+            ON proto_outbox(peer_id, status)
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -6049,3 +6080,245 @@ class HiveDatabase:
             (cutoff,)
         )
         return result.rowcount
+
+    # =========================================================================
+    # PROTO OUTBOX OPERATIONS (Phase D - Reliable Delivery)
+    # =========================================================================
+
+    def enqueue_outbox(self, msg_id: str, peer_id: str, msg_type: int,
+                       payload_json: str, expires_at: int) -> bool:
+        """
+        Enqueue a message for reliable delivery to a specific peer.
+
+        Uses INSERT OR IGNORE for idempotent enqueue (same msg_id+peer_id
+        is silently ignored).
+
+        Args:
+            msg_id: Unique message identifier
+            peer_id: Target peer pubkey
+            msg_type: HiveMessageType integer value
+            payload_json: JSON-serialized payload
+            expires_at: Unix timestamp when message expires
+
+        Returns:
+            True if inserted, False if duplicate or error.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        try:
+            result = conn.execute(
+                """INSERT OR IGNORE INTO proto_outbox
+                   (msg_id, peer_id, msg_type, payload_json, status,
+                    created_at, next_retry_at, expires_at)
+                   VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
+                (msg_id, peer_id, msg_type, payload_json, now, now, expires_at)
+            )
+            return result.rowcount > 0
+        except Exception as e:
+            self.plugin.log(f"enqueue_outbox error: {e}", level='warn')
+            return False
+
+    def get_outbox_pending(self, limit: int = 50) -> list:
+        """
+        Get outbox entries ready for sending or retry.
+
+        Returns entries where:
+        - status is 'queued' or 'sent' (pending ack)
+        - next_retry_at <= now (ready to retry)
+        - expires_at > now (not expired)
+
+        Args:
+            limit: Maximum entries to return (default 50)
+
+        Returns:
+            List of dicts with outbox entry fields.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        rows = conn.execute(
+            """SELECT id, msg_id, peer_id, msg_type, payload_json, status,
+                      created_at, sent_at, next_retry_at, retry_count,
+                      expires_at, last_error
+               FROM proto_outbox
+               WHERE status IN ('queued', 'sent')
+                 AND next_retry_at <= ?
+                 AND expires_at > ?
+               ORDER BY next_retry_at ASC
+               LIMIT ?""",
+            (now, now, limit)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_outbox_sent(self, msg_id: str, peer_id: str,
+                           next_retry_at: int) -> bool:
+        """
+        Mark an outbox entry as sent and schedule next retry.
+
+        Args:
+            msg_id: Message identifier
+            peer_id: Target peer pubkey
+            next_retry_at: Unix timestamp for next retry attempt
+
+        Returns:
+            True if updated, False otherwise.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET status = 'sent', sent_at = ?, retry_count = retry_count + 1,
+                   next_retry_at = ?
+               WHERE msg_id = ? AND peer_id = ?
+                 AND status IN ('queued', 'sent')""",
+            (now, next_retry_at, msg_id, peer_id)
+        )
+        return result.rowcount > 0
+
+    def ack_outbox(self, msg_id: str, peer_id: str) -> bool:
+        """
+        Mark an outbox entry as acknowledged.
+
+        Args:
+            msg_id: Message identifier (the _event_id)
+            peer_id: Peer that acknowledged
+
+        Returns:
+            True if updated, False otherwise.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET status = 'acked', acked_at = ?
+               WHERE msg_id = ? AND peer_id = ?
+                 AND status IN ('queued', 'sent')""",
+            (now, msg_id, peer_id)
+        )
+        return result.rowcount > 0
+
+    def ack_outbox_by_type(self, peer_id: str, msg_type: int,
+                           match_field: str, match_value: str) -> int:
+        """
+        Acknowledge outbox entries by type and payload field match.
+
+        Used for implicit acks: e.g. receiving SETTLEMENT_READY clears the
+        SETTLEMENT_PROPOSE outbox entries for that peer+proposal_id.
+
+        Args:
+            peer_id: Peer that implicitly acknowledged
+            msg_type: The original message type integer to match
+            match_field: JSON field name to match in payload
+            match_value: Expected value of the field
+
+        Returns:
+            Number of entries acknowledged.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        # Use json_extract for matching payload fields
+        # Fallback to LIKE for SQLite versions without json_extract
+        try:
+            result = conn.execute(
+                """UPDATE proto_outbox
+                   SET status = 'acked', acked_at = ?
+                   WHERE peer_id = ? AND msg_type = ?
+                     AND status IN ('queued', 'sent')
+                     AND json_extract(payload_json, ?) = ?""",
+                (now, peer_id, msg_type, f'$.{match_field}', match_value)
+            )
+            return result.rowcount
+        except Exception:
+            # Fallback: match using LIKE pattern for older SQLite
+            pattern = f'"{match_field}":"{match_value}"'
+            try:
+                result = conn.execute(
+                    """UPDATE proto_outbox
+                       SET status = 'acked', acked_at = ?
+                       WHERE peer_id = ? AND msg_type = ?
+                         AND status IN ('queued', 'sent')
+                         AND payload_json LIKE ?""",
+                    (now, peer_id, msg_type, f'%{pattern}%')
+                )
+                return result.rowcount
+            except Exception as e:
+                self.plugin.log(f"ack_outbox_by_type error: {e}", level='warn')
+                return 0
+
+    def fail_outbox(self, msg_id: str, peer_id: str, error: str) -> bool:
+        """
+        Mark an outbox entry as permanently failed.
+
+        Args:
+            msg_id: Message identifier
+            peer_id: Target peer pubkey
+            error: Error description
+
+        Returns:
+            True if updated, False otherwise.
+        """
+        conn = self._get_connection()
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET status = 'failed', last_error = ?
+               WHERE msg_id = ? AND peer_id = ?
+                 AND status IN ('queued', 'sent')""",
+            (error[:500], msg_id, peer_id)
+        )
+        return result.rowcount > 0
+
+    def expire_outbox(self) -> int:
+        """
+        Mark expired outbox entries.
+
+        Returns:
+            Number of entries expired.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET status = 'expired'
+               WHERE expires_at <= ? AND status IN ('queued', 'sent')""",
+            (now,)
+        )
+        return result.rowcount
+
+    def cleanup_outbox(self, max_age_seconds: int = 7 * 86400) -> int:
+        """
+        Delete terminal outbox entries (acked/failed/expired) older than threshold.
+
+        Args:
+            max_age_seconds: Maximum age in seconds (default 7 days)
+
+        Returns:
+            Number of entries cleaned up.
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        result = conn.execute(
+            """DELETE FROM proto_outbox
+               WHERE status IN ('acked', 'failed', 'expired')
+                 AND created_at < ?""",
+            (cutoff,)
+        )
+        return result.rowcount
+
+    def count_inflight_for_peer(self, peer_id: str) -> int:
+        """
+        Count active (queued or sent) outbox entries for a peer.
+
+        Used for backpressure: reject new enqueues when too many are inflight.
+
+        Args:
+            peer_id: Target peer pubkey
+
+        Returns:
+            Count of inflight entries.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            """SELECT COUNT(*) as cnt FROM proto_outbox
+               WHERE peer_id = ? AND status IN ('queued', 'sent')""",
+            (peer_id,)
+        ).fetchone()
+        return row['cnt'] if row else 0

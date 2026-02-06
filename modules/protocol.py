@@ -151,6 +151,59 @@ class HiveMessageType(IntEnum):
     MCF_ASSIGNMENT_ACK = 32877     # Acknowledge receipt of MCF assignment
     MCF_COMPLETION_REPORT = 32879  # Report completion of MCF assignment
 
+    # Phase D: Reliable Delivery
+    MSG_ACK = 32881  # Generic acknowledgment for reliable messages
+
+
+# =============================================================================
+# PHASE D: RELIABLE DELIVERY CONSTANTS
+# =============================================================================
+
+# Message types that require reliable delivery (Phase D)
+RELIABLE_MESSAGE_TYPES = frozenset({
+    HiveMessageType.SETTLEMENT_PROPOSE,
+    HiveMessageType.SETTLEMENT_READY,
+    HiveMessageType.SETTLEMENT_EXECUTED,
+    HiveMessageType.BAN_PROPOSAL,
+    HiveMessageType.BAN_VOTE,
+    HiveMessageType.PROMOTION_REQUEST,
+    HiveMessageType.VOUCH,
+    HiveMessageType.PROMOTION,
+    HiveMessageType.MEMBER_LEFT,
+    HiveMessageType.TASK_REQUEST,
+    HiveMessageType.TASK_RESPONSE,
+    HiveMessageType.SPLICE_INIT_REQUEST,
+    HiveMessageType.SPLICE_INIT_RESPONSE,
+    HiveMessageType.SPLICE_UPDATE,
+    HiveMessageType.SPLICE_SIGNED,
+    HiveMessageType.SPLICE_ABORT,
+})
+
+# Implicit ack mapping: response type -> request type it satisfies
+# When we receive a domain response, it implicitly acknowledges the request
+IMPLICIT_ACK_MAP = {
+    HiveMessageType.SETTLEMENT_READY: HiveMessageType.SETTLEMENT_PROPOSE,
+    HiveMessageType.TASK_RESPONSE: HiveMessageType.TASK_REQUEST,
+    HiveMessageType.SPLICE_INIT_RESPONSE: HiveMessageType.SPLICE_INIT_REQUEST,
+    HiveMessageType.BAN_VOTE: HiveMessageType.BAN_PROPOSAL,
+    HiveMessageType.VOUCH: HiveMessageType.PROMOTION_REQUEST,
+}
+
+# Field in the response payload that matches the request for implicit acks
+IMPLICIT_ACK_MATCH_FIELD = {
+    HiveMessageType.SETTLEMENT_READY: "proposal_id",
+    HiveMessageType.TASK_RESPONSE: "request_id",
+    HiveMessageType.SPLICE_INIT_RESPONSE: "session_id",
+    HiveMessageType.BAN_VOTE: "proposal_id",
+    HiveMessageType.VOUCH: "request_id",
+}
+
+# MSG_ACK valid status values
+VALID_ACK_STATUSES = {"ok", "invalid", "retry_later"}
+
+# Maximum length of ack_msg_id
+MAX_ACK_MSG_ID_LEN = 64
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -5845,3 +5898,59 @@ def create_mcf_completion_report(
         return None
 
     return serialize(HiveMessageType.MCF_COMPLETION_REPORT, payload)
+
+
+# =============================================================================
+# PHASE D: MSG_ACK HELPERS
+# =============================================================================
+
+def create_msg_ack(ack_msg_id: str, status: str, sender_id: str) -> bytes:
+    """
+    Create a MSG_ACK message for reliable delivery acknowledgment.
+
+    Args:
+        ack_msg_id: The _event_id of the message being acknowledged
+        status: Ack status - "ok", "invalid", or "retry_later"
+        sender_id: Our pubkey (the acknowledging node)
+
+    Returns:
+        Serialized MSG_ACK message bytes
+    """
+    payload = {
+        "ack_msg_id": ack_msg_id[:MAX_ACK_MSG_ID_LEN],
+        "status": status if status in VALID_ACK_STATUSES else "ok",
+        "sender_id": sender_id,
+        "timestamp": int(time.time()),
+    }
+    return serialize(HiveMessageType.MSG_ACK, payload)
+
+
+def validate_msg_ack(payload: Dict[str, Any]) -> bool:
+    """
+    Validate MSG_ACK payload schema.
+
+    Returns:
+        True if payload has valid structure, False otherwise.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    ack_msg_id = payload.get("ack_msg_id")
+    if not isinstance(ack_msg_id, str) or not ack_msg_id:
+        return False
+    if len(ack_msg_id) > MAX_ACK_MSG_ID_LEN:
+        return False
+
+    status = payload.get("status")
+    if status not in VALID_ACK_STATUSES:
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not sender_id:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    return True

@@ -69,6 +69,10 @@ from modules.protocol import (
     get_mcf_needs_batch_signing_payload, get_mcf_solution_signing_payload,
     get_mcf_assignment_ack_signing_payload, get_mcf_completion_signing_payload,
     create_mcf_needs_batch,
+    # Phase D: Reliable delivery
+    create_msg_ack, validate_msg_ack,
+    IMPLICIT_ACK_MAP, IMPLICIT_ACK_MATCH_FIELD,
+    RELIABLE_MESSAGE_TYPES,
 )
 from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager, HivePeerState
@@ -100,7 +104,8 @@ from modules.anticipatory_liquidity import AnticipatoryLiquidityManager
 from modules.task_manager import TaskManager
 from modules.splice_manager import SpliceManager
 from modules.relay import RelayManager
-from modules.idempotency import check_and_record
+from modules.idempotency import check_and_record, generate_event_id
+from modules.outbox import OutboxManager
 from modules import network_metrics
 from modules.rpc_commands import (
     HiveContext,
@@ -334,6 +339,7 @@ anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
 task_mgr: Optional[TaskManager] = None
 splice_mgr: Optional[SpliceManager] = None
 relay_mgr: Optional[RelayManager] = None
+outbox_mgr: Optional[OutboxManager] = None
 our_pubkey: Optional[str] = None
 
 # Fee tracking for real-time gossip (Settlement Phase)
@@ -1517,6 +1523,26 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Splice manager initialized (Phase 11)")
 
+    # Initialize Outbox Manager (Phase D - Reliable Delivery)
+    global outbox_mgr
+    outbox_mgr = OutboxManager(
+        database=database,
+        send_fn=_outbox_send_fn,
+        get_members_fn=_outbox_get_member_ids,
+        our_pubkey=our_pubkey,
+        log_fn=lambda msg, level='info': safe_plugin.log(msg, level=level),
+    )
+    plugin.log("cl-hive: Outbox manager initialized (Phase D)")
+
+    # Start outbox retry background thread
+    outbox_thread = threading.Thread(
+        target=outbox_retry_loop,
+        name="cl-hive-outbox-retry",
+        daemon=True
+    )
+    outbox_thread.start()
+    plugin.log("cl-hive: Outbox retry thread started (Phase D)")
+
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
@@ -1797,6 +1823,9 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_mcf_assignment_ack(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.MCF_COMPLETION_REPORT:
             return handle_mcf_completion_report(peer_id, msg_payload, plugin)
+        # Phase D: Reliable Delivery
+        elif msg_type == HiveMessageType.MSG_ACK:
+            return handle_msg_ack(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -3348,6 +3377,136 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
     return sent_count
 
 
+# =============================================================================
+# PHASE D: RELIABLE DELIVERY HELPERS
+# =============================================================================
+
+def _outbox_send_fn(peer_id: str, msg_bytes: bytes) -> bool:
+    """Send function for OutboxManager -- wraps sendcustommsg RPC."""
+    if not safe_plugin:
+        return False
+    try:
+        safe_plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": msg_bytes.hex()
+        })
+        return True
+    except Exception:
+        return False
+
+
+def _outbox_get_member_ids() -> List[str]:
+    """Get list of member peer_ids for OutboxManager broadcasts."""
+    if not database:
+        return []
+    return [
+        m["peer_id"] for m in database.get_all_members()
+        if m.get("tier") in (MembershipTier.MEMBER.value,)
+    ]
+
+
+def _reliable_broadcast(msg_type: HiveMessageType, payload: Dict,
+                         msg_id: Optional[str] = None) -> None:
+    """
+    Enqueue a critical message for reliable delivery to all members.
+
+    Falls back to fire-and-forget broadcast if outbox is unavailable.
+    """
+    if not msg_id:
+        msg_id = generate_event_id(msg_type.name, payload) or secrets.token_hex(16)
+
+    if outbox_mgr:
+        outbox_mgr.enqueue(msg_id, msg_type, payload)
+    else:
+        _broadcast_to_members(serialize(msg_type, payload))
+
+
+def _reliable_send(msg_type: HiveMessageType, payload: Dict,
+                    peer_id: str, msg_id: Optional[str] = None) -> None:
+    """
+    Enqueue a critical message for reliable delivery to a specific peer.
+
+    Falls back to fire-and-forget send if outbox is unavailable.
+    """
+    if not msg_id:
+        msg_id = generate_event_id(msg_type.name, payload) or secrets.token_hex(16)
+
+    if outbox_mgr:
+        outbox_mgr.enqueue(msg_id, msg_type, payload, peer_ids=[peer_id])
+    else:
+        try:
+            msg_bytes = serialize(msg_type, payload)
+            if safe_plugin:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": peer_id,
+                    "msg": msg_bytes.hex()
+                })
+        except Exception:
+            pass
+
+
+def _emit_ack(peer_id: str, msg_id: Optional[str]) -> None:
+    """
+    Send MSG_ACK to peer for a successfully processed message.
+
+    Best-effort: we don't retry acks.
+    """
+    if not msg_id or not safe_plugin or not our_pubkey:
+        return
+    try:
+        ack_msg = create_msg_ack(msg_id, "ok", our_pubkey)
+        safe_plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": ack_msg.hex()
+        })
+    except Exception:
+        pass  # Best-effort ack
+
+
+def handle_msg_ack(peer_id: str, payload: Dict, plugin) -> Dict:
+    """Handle incoming MSG_ACK from a peer."""
+    if not validate_msg_ack(payload):
+        plugin.log(f"cl-hive: MSG_ACK invalid payload from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    ack_msg_id = payload.get("ack_msg_id")
+    status = payload.get("status", "ok")
+
+    if outbox_mgr:
+        outbox_mgr.process_ack(peer_id, ack_msg_id, status)
+
+    return {"result": "continue"}
+
+
+def outbox_retry_loop():
+    """
+    Background thread for outbox message retry.
+
+    Runs every 30 seconds to retry pending messages.
+    Runs hourly cleanup of expired/terminal entries.
+    """
+    RETRY_INTERVAL = 30
+    CLEANUP_INTERVAL = 3600
+    last_cleanup = 0
+
+    # Startup delay
+    shutdown_event.wait(15)
+
+    while not shutdown_event.is_set():
+        try:
+            if outbox_mgr:
+                outbox_mgr.retry_pending()
+                # Hourly cleanup
+                now = time.time()
+                if now - last_cleanup > CLEANUP_INTERVAL:
+                    outbox_mgr.expire_and_cleanup()
+                    last_cleanup = now
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"Outbox retry error: {e}", level='warn')
+        shutdown_event.wait(RETRY_INTERVAL)
+
+
 def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
     """
     Broadcast a promotion vote as a VOUCH message for cross-node sync.
@@ -3651,6 +3810,9 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
 
     database.add_promotion_request(target_pubkey, request_id, status="pending")
 
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
+
     our_tier = membership_mgr.get_tier(our_pubkey) if our_pubkey else None
     if our_tier not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
@@ -3682,8 +3844,7 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
         "voucher_pubkey": our_pubkey,
         "sig": sig
     }
-    vouch_msg = serialize(HiveMessageType.VOUCH, vouch_payload)
-    _broadcast_to_members(vouch_msg)
+    _reliable_broadcast(HiveMessageType.VOUCH, vouch_payload)
     return {"result": "continue"}
 
 
@@ -3781,6 +3942,11 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not stored:
         return {"result": "continue"}
 
+    # Phase D: Acknowledge receipt + implicit ack (VOUCH implies PROMOTION_REQUEST received)
+    _emit_ack(peer_id, payload.get("_event_id"))
+    if outbox_mgr:
+        outbox_mgr.process_implicit_ack(peer_id, HiveMessageType.VOUCH, payload)
+
     # Only members and admins can trigger auto-promotion
     if local_tier not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
@@ -3807,8 +3973,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             } for v in vouches[:MAX_VOUCHES_IN_PROMOTION]
         ]
     }
-    promo_msg = serialize(HiveMessageType.PROMOTION, promotion_payload)
-    _broadcast_to_members(promo_msg)
+    _reliable_broadcast(HiveMessageType.PROMOTION, promotion_payload)
     return {"result": "continue"}
 
 
@@ -3904,6 +4069,9 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     database.update_promotion_request_status(target_pubkey, request_id, status="accepted")
     membership_mgr.set_tier(target_pubkey, MembershipTier.MEMBER.value)
 
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
+
     # Relay to other members
     _relay_message(HiveMessageType.PROMOTION, payload, peer_id)
 
@@ -3980,6 +4148,9 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     member_count = sum(1 for m in all_members if m.get("tier") == MembershipTier.MEMBER.value)
     if member_count == 0 and len(all_members) > 0:
         plugin.log("cl-hive: WARNING - Hive has no full members (only neophytes). Promote neophytes to restore governance.", level='warn')
+
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
 
     # Relay to other members
     _relay_message(HiveMessageType.MEMBER_LEFT, payload, peer_id)
@@ -4077,6 +4248,9 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                                  reason, timestamp, expires_at)
     plugin.log(f"cl-hive: Ban proposal {proposal_id[:16]}... for {target_peer_id[:16]}... by {proposer_peer_id[:16]}...")
 
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
+
     # Relay to other members
     _relay_message(HiveMessageType.BAN_PROPOSAL, payload, peer_id)
 
@@ -4147,6 +4321,11 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Check if quorum reached
     _check_ban_quorum(proposal_id, proposal, plugin)
+
+    # Phase D: Acknowledge receipt + implicit ack (BAN_VOTE implies BAN_PROPOSAL received)
+    _emit_ack(peer_id, payload.get("_event_id"))
+    if outbox_mgr:
+        outbox_mgr.process_implicit_ack(peer_id, HiveMessageType.BAN_VOTE, payload)
 
     # Relay to other members
     _relay_message(HiveMessageType.BAN_VOTE, payload, peer_id)
@@ -6805,16 +6984,19 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     )
 
     if vote:
-        # Broadcast our vote
-        vote_msg = create_settlement_ready(
-            proposal_id=vote['proposal_id'],
-            voter_peer_id=vote['voter_peer_id'],
-            data_hash=vote['data_hash'],
-            timestamp=vote['timestamp'],
-            signature=vote['signature']
-        )
-        _broadcast_to_members(vote_msg)
+        # Broadcast our vote via reliable delivery
+        vote_payload = {
+            'proposal_id': vote['proposal_id'],
+            'voter_peer_id': vote['voter_peer_id'],
+            'data_hash': vote['data_hash'],
+            'timestamp': vote['timestamp'],
+            'signature': vote['signature'],
+        }
+        _reliable_broadcast(HiveMessageType.SETTLEMENT_READY, vote_payload)
         plugin.log(f"SETTLEMENT: Voted on proposal {proposal_id[:16]}... (hash verified)")
+
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
 
     # Relay to other members
     _relay_message(HiveMessageType.SETTLEMENT_PROPOSE, payload, peer_id)
@@ -6919,6 +7101,11 @@ def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
             member_count=proposal.get("member_count", 0)
         )
 
+    # Phase D: Acknowledge receipt + implicit ack (SETTLEMENT_READY implies SETTLEMENT_PROPOSE received)
+    _emit_ack(peer_id, payload.get("_event_id"))
+    if outbox_mgr:
+        outbox_mgr.process_implicit_ack(peer_id, HiveMessageType.SETTLEMENT_READY, payload)
+
     # Relay to other members
     _relay_message(HiveMessageType.SETTLEMENT_READY, payload, peer_id)
 
@@ -7018,6 +7205,9 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
         # Check if settlement is complete
         settlement_mgr.check_and_complete_settlement(proposal_id)
 
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
+
     # Relay to other members
     _relay_message(HiveMessageType.SETTLEMENT_EXECUTED, payload, peer_id)
 
@@ -7071,6 +7261,9 @@ def handle_task_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             level='debug'
         )
 
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
+
     return {"result": "continue"}
 
 
@@ -7114,6 +7307,11 @@ def handle_task_response(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             level='debug'
         )
 
+    # Phase D: Acknowledge receipt + implicit ack (TASK_RESPONSE implies TASK_REQUEST received)
+    _emit_ack(peer_id, payload.get("_event_id"))
+    if outbox_mgr:
+        outbox_mgr.process_implicit_ack(peer_id, HiveMessageType.TASK_RESPONSE, payload)
+
     return {"result": "continue"}
 
 
@@ -7156,6 +7354,9 @@ def handle_splice_init_request(peer_id: str, payload: Dict, plugin: Plugin) -> D
             level='debug'
         )
 
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
+
     return {"result": "continue"}
 
 
@@ -7188,6 +7389,10 @@ def handle_splice_init_response(peer_id: str, payload: Dict, plugin: Plugin) -> 
             level='debug'
         )
 
+    # Phase D: Implicit ack (SPLICE_INIT_RESPONSE implies SPLICE_INIT_REQUEST received)
+    if outbox_mgr:
+        outbox_mgr.process_implicit_ack(peer_id, HiveMessageType.SPLICE_INIT_RESPONSE, payload)
+
     return {"result": "continue"}
 
 
@@ -7217,6 +7422,9 @@ def handle_splice_update(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             f"cl-hive: SPLICE_UPDATE error: {result.get('error')}",
             level='debug'
         )
+
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
 
     return {"result": "continue"}
 
@@ -7253,6 +7461,9 @@ def handle_splice_signed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             level='debug'
         )
 
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
+
     return {"result": "continue"}
 
 
@@ -7282,6 +7493,9 @@ def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             f"cl-hive: Splice aborted by {peer_id[:16]}...: {result.get('reason', 'unknown')}",
             level='info'
         )
+
+    # Phase D: Acknowledge receipt
+    _emit_ack(peer_id, payload.get("_event_id"))
 
     return {"result": "continue"}
 
@@ -8394,20 +8608,24 @@ def settlement_loop():
                                 signature = ''
 
                             if signature:
-                                # Create and broadcast message
-                                propose_msg = create_settlement_propose(
-                                    proposal_id=proposal['proposal_id'],
-                                    period=proposal['period'],
-                                    proposer_peer_id=proposal['proposer_peer_id'],
-                                    data_hash=proposal['data_hash'],
-                                    plan_hash=proposal['plan_hash'],
-                                    total_fees_sats=proposal['total_fees_sats'],
-                                    member_count=proposal['member_count'],
-                                    contributions=proposal['contributions'],
-                                    timestamp=proposal['timestamp'],
-                                    signature=signature
+                                # Create payload and broadcast via outbox for reliable delivery
+                                propose_payload = {
+                                    "proposal_id": proposal['proposal_id'],
+                                    "period": proposal['period'],
+                                    "proposer_peer_id": proposal['proposer_peer_id'],
+                                    "data_hash": proposal['data_hash'],
+                                    "plan_hash": proposal['plan_hash'],
+                                    "total_fees_sats": proposal['total_fees_sats'],
+                                    "member_count": proposal['member_count'],
+                                    "contributions": proposal['contributions'],
+                                    "timestamp": proposal['timestamp'],
+                                    "signature": signature
+                                }
+                                _reliable_broadcast(
+                                    HiveMessageType.SETTLEMENT_PROPOSE,
+                                    propose_payload,
+                                    msg_id=proposal['proposal_id']
                                 )
-                                _broadcast_to_members(propose_msg)
                                 safe_plugin.log(
                                     f"SETTLEMENT: Proposed settlement for {previous_period}"
                                 )
@@ -8432,83 +8650,10 @@ def settlement_loop():
             except Exception as e:
                 safe_plugin.log(f"SETTLEMENT: Error proposing settlement: {e}", level='warn')
 
-            # Step 2: Rebroadcast pending proposals that need it (Issue #49)
-            try:
-                proposals_to_rebroadcast = database.get_proposals_needing_rebroadcast(
-                    rebroadcast_interval_seconds=SETTLEMENT_REBROADCAST_INTERVAL,
-                    our_peer_id=our_pubkey
-                )
-                for proposal in proposals_to_rebroadcast:
-                    proposal_id = proposal.get('proposal_id')
-                    period = proposal.get('period')
-                    member_count = proposal.get('member_count', 0)
-                    plan_hash = proposal.get('plan_hash')
-
-                    # Check if quorum already reached
-                    vote_count = database.count_settlement_ready_votes(proposal_id)
-                    quorum_needed = (member_count // 2) + 1
-                    if vote_count >= quorum_needed:
-                        continue  # No need to rebroadcast
-
-                    # Load contributions from stored JSON
-                    contributions_json = proposal.get('contributions_json')
-                    if not contributions_json:
-                        safe_plugin.log(
-                            f"SETTLEMENT: Cannot rebroadcast {proposal_id[:16]}... - no stored contributions",
-                            level='debug'
-                        )
-                        continue
-
-                    try:
-                        contributions = json.loads(contributions_json)
-                    except Exception:
-                        safe_plugin.log(
-                            f"SETTLEMENT: Cannot rebroadcast {proposal_id[:16]}... - invalid contributions JSON",
-                            level='warn'
-                        )
-                        continue
-
-                    # Sign and create the proposal message
-                    rebroadcast_ts = int(time.time())
-                    outgoing = {
-                        "proposal_id": proposal_id,
-                        "period": period,
-                        "proposer_peer_id": proposal.get('proposer_peer_id'),
-                        "data_hash": proposal.get('data_hash'),
-                        "plan_hash": plan_hash or "",
-                        "total_fees_sats": proposal.get('total_fees_sats'),
-                        "member_count": member_count,
-                        "timestamp": rebroadcast_ts,
-                    }
-                    signing_payload = get_settlement_propose_signing_payload(outgoing)
-                    try:
-                        sig_result = safe_plugin.rpc.signmessage(signing_payload)
-                        signature = sig_result.get('zbase', '')
-                    except Exception as e:
-                        safe_plugin.log(f"SETTLEMENT: Failed to sign rebroadcast: {e}", level='warn')
-                        continue
-
-                    if signature:
-                        propose_msg = create_settlement_propose(
-                            proposal_id=proposal_id,
-                            period=period,
-                            proposer_peer_id=proposal.get('proposer_peer_id'),
-                            data_hash=proposal.get('data_hash'),
-                            plan_hash=plan_hash or "",
-                            total_fees_sats=proposal.get('total_fees_sats'),
-                            member_count=member_count,
-                            contributions=contributions,
-                            timestamp=rebroadcast_ts,
-                            signature=signature
-                        )
-                        sent = _broadcast_to_members(propose_msg)
-                        database.update_proposal_broadcast_time(proposal_id)
-                        safe_plugin.log(
-                            f"SETTLEMENT: Rebroadcast proposal {proposal_id[:16]}... for {period} "
-                            f"to {sent} member(s) (votes: {vote_count}/{quorum_needed} needed)"
-                        )
-            except Exception as e:
-                safe_plugin.log(f"SETTLEMENT: Error rebroadcasting: {e}", level='warn')
+            # Step 2: Settlement rebroadcast is now handled by the outbox retry loop
+            # (Phase D). The outbox entries created by _reliable_broadcast() in Step 1
+            # are retried with exponential backoff (30s -> 1h cap, 24h expiry).
+            # The old 4-hour rebroadcast block has been removed.
 
             # Step 3: Process pending proposals (vote if hash matches)
             try:
@@ -8577,18 +8722,21 @@ def settlement_loop():
                         loop.close()
 
                         if exec_result:
-                            # Broadcast execution confirmation
-                            exec_msg = create_settlement_executed(
-                                proposal_id=exec_result['proposal_id'],
-                                executor_peer_id=exec_result['executor_peer_id'],
-                                timestamp=exec_result['timestamp'],
-                                signature=exec_result['signature'],
-                                plan_hash=exec_result.get('plan_hash'),
-                                total_sent_sats=exec_result.get('total_sent_sats'),
-                                payment_hash=exec_result.get('payment_hash'),
-                                amount_paid_sats=exec_result.get('amount_paid_sats')
+                            # Broadcast execution confirmation via reliable delivery
+                            exec_payload = {
+                                'proposal_id': exec_result['proposal_id'],
+                                'executor_peer_id': exec_result['executor_peer_id'],
+                                'timestamp': exec_result['timestamp'],
+                                'signature': exec_result['signature'],
+                                'plan_hash': exec_result.get('plan_hash', ''),
+                                'total_sent_sats': exec_result.get('total_sent_sats', 0),
+                                'payment_hash': exec_result.get('payment_hash', ''),
+                                'amount_paid_sats': exec_result.get('amount_paid_sats', 0),
+                            }
+                            _reliable_broadcast(
+                                HiveMessageType.SETTLEMENT_EXECUTED,
+                                exec_payload
                             )
-                            _broadcast_to_members(exec_msg)
 
                             # Check if settlement is complete
                             settlement_mgr.check_and_complete_settlement(proposal_id)
@@ -8764,8 +8912,8 @@ def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
         "timestamp": timestamp,
         "signature": sig
     }
-    proposal_msg = serialize(HiveMessageType.BAN_PROPOSAL, proposal_payload)
-    _broadcast_to_members(proposal_msg)
+    _reliable_broadcast(HiveMessageType.BAN_PROPOSAL, proposal_payload,
+                        msg_id=proposal_id)
 
     # Also broadcast our vote
     vote_payload = {
@@ -8775,8 +8923,7 @@ def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
         "timestamp": timestamp,
         "signature": vote_sig
     }
-    vote_msg = serialize(HiveMessageType.BAN_VOTE, vote_payload)
-    _broadcast_to_members(vote_msg)
+    _reliable_broadcast(HiveMessageType.BAN_VOTE, vote_payload)
 
     safe_plugin.log(
         f"SETTLEMENT: Proposed ban for gaming member {target_peer_id[:16]}... "
@@ -13263,15 +13410,14 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
     except Exception as e:
         return {"error": f"Failed to sign leave message: {e}"}
 
-    # Broadcast to members before removing ourselves
+    # Broadcast to members before removing ourselves (reliable delivery)
     leave_payload = {
         "peer_id": our_pubkey,
         "timestamp": timestamp,
         "reason": reason,
         "signature": sig
     }
-    leave_msg = serialize(HiveMessageType.MEMBER_LEFT, leave_payload)
-    _broadcast_to_members(leave_msg)
+    _reliable_broadcast(HiveMessageType.MEMBER_LEFT, leave_payload)
 
     # Revert our fee policy to dynamic
     if bridge and bridge.status == BridgeStatus.ENABLED:
@@ -13421,8 +13567,8 @@ def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason give
         "timestamp": timestamp,
         "signature": sig
     }
-    proposal_msg = serialize(HiveMessageType.BAN_PROPOSAL, proposal_payload)
-    _broadcast_to_members(proposal_msg)
+    _reliable_broadcast(HiveMessageType.BAN_PROPOSAL, proposal_payload,
+                        msg_id=proposal_id)
 
     # Also broadcast our vote
     vote_payload = {
@@ -13432,8 +13578,7 @@ def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason give
         "timestamp": timestamp,
         "signature": vote_sig
     }
-    vote_msg = serialize(HiveMessageType.BAN_VOTE, vote_payload)
-    _broadcast_to_members(vote_msg)
+    _reliable_broadcast(HiveMessageType.BAN_VOTE, vote_payload)
 
     # Calculate quorum info
     all_members = database.get_all_members()
