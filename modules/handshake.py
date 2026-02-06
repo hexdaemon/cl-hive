@@ -52,7 +52,7 @@ MAX_PENDING_CHALLENGES = 1000
 CHALLENGE_RATE_LIMIT_SECONDS = 10  # Minimum seconds between challenges per peer
 
 # Plugin version for manifest
-PLUGIN_VERSION = "cl-hive v2.2.5"
+PLUGIN_VERSION = "cl-hive v2.2.6"
 
 
 # =============================================================================
