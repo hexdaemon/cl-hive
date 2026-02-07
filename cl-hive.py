@@ -1701,6 +1701,12 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             )
             return {"result": "continue"}
 
+    # Update last_seen for any valid Hive message from a member (Issue #59)
+    if database:
+        member = database.get_member(peer_id)
+        if member:
+            database.update_member(peer_id, last_seen=int(time.time()))
+
     # Dispatch based on message type
     try:
         if msg_type == HiveMessageType.HELLO:
@@ -2055,6 +2061,21 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Phase B: persist peer capabilities from manifest features
     manifest_features = manifest_data.get("features", [])
     database.save_peer_capabilities(peer_id, manifest_features)
+
+    # Capture addresses from listpeers for the new member (Issue #60)
+    if safe_plugin:
+        try:
+            peers_info = safe_plugin.rpc.listpeers(id=peer_id)
+            if peers_info and peers_info.get('peers'):
+                addrs = peers_info['peers'][0].get('netaddr', [])
+                if addrs:
+                    database.update_member(peer_id, addresses=json.dumps(addrs))
+        except Exception:
+            pass  # Non-critical, will be captured on next gossip or connect
+
+    # Initialize presence tracking so uptime_pct starts accumulating (Issue #59)
+    # The peer is connected (they just completed the handshake), so mark online
+    database.update_presence(peer_id, is_online=True, now_ts=int(time.time()), window_seconds=30 * 86400)
 
     handshake_mgr.clear_challenge(peer_id)
 
@@ -2790,14 +2811,20 @@ def on_peer_connected(**kwargs):
     database.update_member(peer_id, last_seen=now)
     database.update_presence(peer_id, is_online=True, now_ts=now, window_seconds=30 * 86400)
 
-    # Track VPN connection status
+    # Track VPN connection status + populate missing addresses (Issue #60)
     peer_address = None
-    if vpn_transport and safe_plugin:
+    if safe_plugin:
         try:
             peers = safe_plugin.rpc.listpeers(id=peer_id)
-            if peers and peers.get('peers') and peers['peers'][0].get('netaddr'):
-                peer_address = peers['peers'][0]['netaddr'][0]
-                vpn_transport.on_peer_connected(peer_id, peer_address)
+            if peers and peers.get('peers'):
+                netaddr = peers['peers'][0].get('netaddr', [])
+                if netaddr:
+                    peer_address = netaddr[0]
+                    if vpn_transport:
+                        vpn_transport.on_peer_connected(peer_id, peer_address)
+                    # Populate addresses if missing
+                    if not member.get('addresses'):
+                        database.update_member(peer_id, addresses=json.dumps(netaddr))
         except Exception:
             pass
 
@@ -8118,6 +8145,15 @@ def membership_maintenance_loop():
                 updated = database.sync_uptime_from_presence(window_seconds=PRESENCE_WINDOW_SECONDS)
                 if updated > 0 and safe_plugin:
                     safe_plugin.log(f"Synced uptime for {updated} member(s)", level='debug')
+
+                # Sync contribution ratios from ledger to hive_members (Issue #59)
+                if membership_mgr:
+                    members_list = database.get_all_members()
+                    for m in members_list:
+                        pid = m.get("peer_id")
+                        if pid:
+                            ratio = membership_mgr.calculate_contribution_ratio(pid)
+                            database.update_member(pid, contribution_ratio=ratio)
 
                 # Phase 9: Planner and governance data pruning
                 database.cleanup_expired_actions()  # Mark expired as 'expired'

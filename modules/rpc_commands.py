@@ -222,10 +222,18 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
     if ctx.our_pubkey:
         our_member = ctx.database.get_member(ctx.our_pubkey)
         if our_member:
+            uptime_raw = our_member.get("uptime_pct", 0.0)
+            contribution_ratio = our_member.get("contribution_ratio", 0.0)
+            # Enrich with live contribution ratio if available (Issue #59)
+            if ctx.membership_mgr:
+                contribution_ratio = ctx.membership_mgr.calculate_contribution_ratio(ctx.our_pubkey)
+                uptime_raw = round(uptime_raw * 100, 2)
             our_membership = {
                 "tier": our_member.get("tier"),
                 "joined_at": our_member.get("joined_at"),
                 "pubkey": ctx.our_pubkey,
+                "uptime_pct": uptime_raw,
+                "contribution_ratio": contribution_ratio,
             }
 
     return {
@@ -312,6 +320,16 @@ def members(ctx: HiveContext) -> Dict[str, Any]:
         return {"error": "Hive not initialized"}
 
     all_members = ctx.database.get_all_members()
+
+    # Enrich with live contribution ratio from ledger (Issue #59)
+    if ctx.membership_mgr:
+        for m in all_members:
+            peer_id = m.get("peer_id")
+            if peer_id:
+                m["contribution_ratio"] = ctx.membership_mgr.calculate_contribution_ratio(peer_id)
+                # Format uptime as percentage (stored as 0.0-1.0 decimal)
+                m["uptime_pct"] = round(m.get("uptime_pct", 0.0) * 100, 2)
+
     return {
         "count": len(all_members),
         "members": all_members,
