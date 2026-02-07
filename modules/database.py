@@ -89,6 +89,16 @@ class HiveDatabase:
             )
         return self._local.conn
 
+    def close_connection(self):
+        """Close the thread-local connection if it exists."""
+        conn = getattr(self._local, 'conn', None)
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
+
     @contextmanager
     def transaction(self) -> Generator[sqlite3.Connection, None, None]:
         """
@@ -112,7 +122,10 @@ class HiveDatabase:
             yield conn
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass  # Don't mask the original exception
             raise
 
     def initialize(self):
@@ -984,6 +997,7 @@ class HiveDatabase:
                 expires_at INTEGER NOT NULL,
                 status TEXT DEFAULT 'pending',
                 data_hash TEXT NOT NULL,
+                plan_hash TEXT,
                 total_fees_sats INTEGER NOT NULL,
                 member_count INTEGER NOT NULL
             )
@@ -996,6 +1010,27 @@ class HiveDatabase:
             "CREATE INDEX IF NOT EXISTS idx_settlement_proposals_status "
             "ON settlement_proposals(status)"
         )
+        # Add last_broadcast_at column if upgrading from older schema (Issue #49)
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_proposals ADD COLUMN last_broadcast_at INTEGER"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        # Add contributions_json column for rebroadcast support (Issue #49)
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_proposals ADD COLUMN contributions_json TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        # Add plan_hash column for deterministic payment plan binding (Phase 12 v2).
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_proposals ADD COLUMN plan_hash TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # Settlement ready votes - quorum tracking (51%)
         conn.execute("""
@@ -1029,6 +1064,13 @@ class HiveDatabase:
             "CREATE INDEX IF NOT EXISTS idx_settlement_exec_proposal "
             "ON settlement_executions(proposal_id)"
         )
+        # Add plan_hash column for deterministic plan completion validation (Phase 12 v2).
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_executions ADD COLUMN plan_hash TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # Settled periods - prevent double settlement (critical!)
         conn.execute("""
@@ -1066,6 +1108,69 @@ class HiveDatabase:
             )
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+        # =====================================================================
+        # PEER CAPABILITIES TABLE (Phase B - Version Tolerance)
+        # =====================================================================
+        # Stores peer feature sets and max supported protocol version
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_capabilities (
+                peer_id TEXT PRIMARY KEY,
+                features TEXT NOT NULL DEFAULT '[]',
+                max_protocol_version INTEGER NOT NULL DEFAULT 1,
+                plugin_version TEXT DEFAULT '',
+                updated_at INTEGER NOT NULL
+            )
+        """)
+
+        # =====================================================================
+        # PROTO EVENTS TABLE (Phase C - Deterministic Idempotency)
+        # =====================================================================
+        # Persistent dedup for state-changing protocol messages
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS proto_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                received_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_proto_events_created
+            ON proto_events(created_at)
+        """)
+
+        # =====================================================================
+        # PROTO OUTBOX TABLE (Phase D - Reliable Delivery)
+        # =====================================================================
+        # Per-peer message delivery tracking with retry and backoff
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS proto_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                msg_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                msg_type INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                created_at INTEGER NOT NULL,
+                sent_at INTEGER,
+                next_retry_at INTEGER NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                expires_at INTEGER NOT NULL,
+                last_error TEXT,
+                acked_at INTEGER,
+                UNIQUE(msg_id, peer_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_proto_outbox_retry
+            ON proto_outbox(status, next_retry_at)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_proto_outbox_peer
+            ON proto_outbox(peer_id, status)
+        """)
 
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
@@ -1114,7 +1219,7 @@ class HiveDatabase:
         """Get all Hive members."""
         conn = self._get_connection()
         rows = conn.execute(
-            "SELECT * FROM hive_members ORDER BY tier, joined_at"
+            "SELECT * FROM hive_members ORDER BY tier, joined_at LIMIT 1000"
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1352,7 +1457,7 @@ class HiveDatabase:
     def get_all_hive_states(self) -> List[Dict]:
         """Get cached state for all Hive peers."""
         conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM hive_state").fetchall()
+        rows = conn.execute("SELECT * FROM hive_state LIMIT 1000").fetchall()
         
         results = []
         for row in rows:
@@ -1702,11 +1807,11 @@ class HiveDatabase:
         """Update ban proposal status (pending, approved, rejected, expired)."""
         conn = self._get_connection()
         try:
-            conn.execute("""
+            cursor = conn.execute("""
                 UPDATE ban_proposals SET status = ? WHERE proposal_id = ?
             """, (status, proposal_id))
             conn.commit()
-            return conn.total_changes > 0
+            return cursor.rowcount > 0
         except Exception:
             return False
 
@@ -1746,13 +1851,13 @@ class HiveDatabase:
     def cleanup_expired_ban_proposals(self, now: int) -> int:
         """Mark expired ban proposals and return count."""
         conn = self._get_connection()
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE ban_proposals
             SET status = 'expired'
             WHERE status = 'pending' AND expires_at < ?
         """, (now,))
         conn.commit()
-        return conn.total_changes
+        return cursor.rowcount
 
     # =========================================================================
     # PEER PRESENCE
@@ -1979,8 +2084,9 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         rows = conn.execute("""
-            SELECT * FROM hive_bans 
+            SELECT * FROM hive_bans
             WHERE expires_at IS NULL OR expires_at > ?
+            LIMIT 1000
         """, (now,)).fetchall()
         return [dict(row) for row in rows]
     
@@ -3535,6 +3641,7 @@ class HiveDatabase:
             SELECT * FROM fee_intelligence
             WHERE timestamp >= ?
             ORDER BY target_peer_id, timestamp DESC
+            LIMIT 10000
         """, (cutoff,)).fetchall()
         return [dict(row) for row in rows]
 
@@ -3752,7 +3859,7 @@ class HiveDatabase:
         """
         conn = self._get_connection()
         rows = conn.execute("""
-            SELECT * FROM member_health ORDER BY overall_health ASC
+            SELECT * FROM member_health ORDER BY overall_health ASC LIMIT 1000
         """).fetchall()
         results = []
         for row in rows:
@@ -3906,7 +4013,7 @@ class HiveDatabase:
         conn = self._get_connection()
         rows = conn.execute("""
             SELECT * FROM member_liquidity_state
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC LIMIT 1000
         """).fetchall()
 
         results = []
@@ -4009,6 +4116,7 @@ class HiveDatabase:
                     ELSE 4
                 END,
                 timestamp DESC
+            LIMIT 10000
         """, (cutoff,)).fetchall()
         return [dict(row) for row in rows]
 
@@ -4195,6 +4303,7 @@ class HiveDatabase:
             SELECT * FROM route_probes
             WHERE timestamp >= ?
             ORDER BY timestamp DESC
+            LIMIT 10000
         """, (cutoff,)).fetchall()
 
         results = []
@@ -4381,6 +4490,7 @@ class HiveDatabase:
             SELECT * FROM peer_reputation
             WHERE timestamp > ?
             ORDER BY timestamp DESC
+            LIMIT 10000
         """, (cutoff,)).fetchall()
 
         reports = []
@@ -4701,11 +4811,15 @@ class HiveDatabase:
             # ISO week format: 2025-W03
             year, week = period.split("-W")
             # Monday of that week (use ISO week format: %G=ISO year, %V=ISO week, %u=ISO weekday)
-            start = datetime.datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u")
+            start = datetime.datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u").replace(
+                tzinfo=datetime.timezone.utc
+            )
             end = start + datetime.timedelta(days=7)
         elif len(period) == 7:
             # Month format: 2025-01
-            start = datetime.datetime.strptime(f"{period}-01", "%Y-%m-%d")
+            start = datetime.datetime.strptime(f"{period}-01", "%Y-%m-%d").replace(
+                tzinfo=datetime.timezone.utc
+            )
             # First of next month
             if start.month == 12:
                 end = start.replace(year=start.year + 1, month=1)
@@ -4713,7 +4827,9 @@ class HiveDatabase:
                 end = start.replace(month=start.month + 1)
         else:
             # Day format: 2025-01-15
-            start = datetime.datetime.strptime(period, "%Y-%m-%d")
+            start = datetime.datetime.strptime(period, "%Y-%m-%d").replace(
+                tzinfo=datetime.timezone.utc
+            )
             end = start + datetime.timedelta(days=1)
 
         return (int(start.timestamp()), int(end.timestamp()))
@@ -4810,6 +4926,7 @@ class HiveDatabase:
             SELECT * FROM flow_samples
             WHERE timestamp > ?
             ORDER BY timestamp DESC
+            LIMIT 50000
         """, (cutoff,)).fetchall()
 
         return [dict(row) for row in rows]
@@ -5443,7 +5560,7 @@ class HiveDatabase:
         import datetime
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         cutoff_date = now - datetime.timedelta(weeks=keep_periods)
-        cutoff_period = f"{cutoff_date.isocalendar()[0]}-{cutoff_date.isocalendar()[1]:02d}"
+        cutoff_period = f"{cutoff_date.isocalendar()[0]}-W{cutoff_date.isocalendar()[1]:02d}"
 
         result = conn.execute("""
             DELETE FROM fee_reports WHERE period < ?
@@ -5462,7 +5579,9 @@ class HiveDatabase:
         data_hash: str,
         total_fees_sats: int,
         member_count: int,
-        expires_in_seconds: int = 86400  # 24 hours
+        plan_hash: Optional[str] = None,
+        expires_in_seconds: int = 86400,  # 24 hours
+        contributions_json: Optional[str] = None
     ) -> bool:
         """
         Add a new settlement proposal.
@@ -5475,6 +5594,7 @@ class HiveDatabase:
             total_fees_sats: Total fees to distribute
             member_count: Number of participating members
             expires_in_seconds: Time until proposal expires
+            contributions_json: JSON-encoded contributions for rebroadcast (Issue #49)
 
         Returns:
             True if created, False if proposal for this period already exists
@@ -5487,10 +5607,11 @@ class HiveDatabase:
             conn.execute("""
                 INSERT INTO settlement_proposals
                 (proposal_id, period, proposer_peer_id, proposed_at, expires_at,
-                 status, data_hash, total_fees_sats, member_count)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                 status, data_hash, plan_hash, total_fees_sats, member_count, last_broadcast_at,
+                 contributions_json)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
             """, (proposal_id, period, proposer_peer_id, now, expires_at,
-                  data_hash, total_fees_sats, member_count))
+                  data_hash, plan_hash, total_fees_sats, member_count, now, contributions_json))
             return True
         except sqlite3.IntegrityError:
             # Period already has a proposal
@@ -5533,6 +5654,67 @@ class HiveDatabase:
             ORDER BY proposed_at ASC
         """).fetchall()
         return [dict(row) for row in rows]
+
+    def get_proposals_needing_rebroadcast(
+        self,
+        rebroadcast_interval_seconds: int,
+        our_peer_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Get pending proposals that need rebroadcast (Issue #49).
+
+        Returns proposals where:
+        - Status is 'pending' (not yet at quorum)
+        - Not expired
+        - We are the proposer
+        - Last broadcast was more than rebroadcast_interval_seconds ago
+
+        Args:
+            rebroadcast_interval_seconds: Minimum seconds between broadcasts
+            our_peer_id: Our node's public key (only proposer rebroadcasts)
+
+        Returns:
+            List of proposals needing rebroadcast
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        cutoff = now - rebroadcast_interval_seconds
+
+        rows = conn.execute("""
+            SELECT * FROM settlement_proposals
+            WHERE status = 'pending'
+            AND expires_at > ?
+            AND proposer_peer_id = ?
+            AND (last_broadcast_at IS NULL OR last_broadcast_at < ?)
+            ORDER BY proposed_at ASC
+        """, (now, our_peer_id, cutoff)).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_proposal_broadcast_time(
+        self,
+        proposal_id: str,
+        timestamp: Optional[int] = None
+    ) -> bool:
+        """
+        Update the last_broadcast_at timestamp for a proposal (Issue #49).
+
+        Args:
+            proposal_id: Proposal to update
+            timestamp: Broadcast timestamp (defaults to now)
+
+        Returns:
+            True if updated, False if proposal not found
+        """
+        conn = self._get_connection()
+        if timestamp is None:
+            timestamp = int(time.time())
+
+        result = conn.execute("""
+            UPDATE settlement_proposals
+            SET last_broadcast_at = ?
+            WHERE proposal_id = ?
+        """, (timestamp, proposal_id))
+        return result.rowcount > 0
 
     def update_settlement_proposal_status(
         self, proposal_id: str, status: str
@@ -5607,7 +5789,8 @@ class HiveDatabase:
         executor_peer_id: str,
         signature: str,
         payment_hash: Optional[str] = None,
-        amount_paid_sats: Optional[int] = None
+        amount_paid_sats: Optional[int] = None,
+        plan_hash: Optional[str] = None,
     ) -> bool:
         """
         Record a settlement execution by a member.
@@ -5629,10 +5812,10 @@ class HiveDatabase:
             conn.execute("""
                 INSERT INTO settlement_executions
                 (proposal_id, executor_peer_id, payment_hash, amount_paid_sats,
-                 executed_at, signature)
-                VALUES (?, ?, ?, ?, ?, ?)
+                 executed_at, signature, plan_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (proposal_id, executor_peer_id, payment_hash, amount_paid_sats,
-                  now, signature))
+                  now, signature, plan_hash))
             return True
         except sqlite3.IntegrityError:
             return False  # Already executed
@@ -5771,3 +5954,390 @@ class HiveDatabase:
             total += result.rowcount
 
         return total
+
+    # =========================================================================
+    # PEER CAPABILITIES (Phase B - Version Tolerance)
+    # =========================================================================
+
+    def save_peer_capabilities(self, peer_id: str, features: list) -> bool:
+        """
+        Save or update a peer's advertised capabilities.
+
+        Parses 'proto-vN' from the features list to populate max_protocol_version.
+
+        Args:
+            peer_id: Peer's public key
+            features: List of feature strings from ATTEST manifest
+
+        Returns:
+            True if saved successfully
+        """
+        if not isinstance(features, list):
+            return False
+
+        max_proto = 1
+        plugin_version = ''
+        for f in features:
+            if isinstance(f, str) and f.startswith('proto-v'):
+                try:
+                    v = int(f[7:])
+                    max_proto = max(max_proto, v)
+                except ValueError:
+                    pass
+            if isinstance(f, str) and f.startswith('cl-hive'):
+                plugin_version = f
+
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """INSERT INTO peer_capabilities
+                   (peer_id, features, max_protocol_version, plugin_version, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(peer_id) DO UPDATE SET
+                       features = excluded.features,
+                       max_protocol_version = excluded.max_protocol_version,
+                       plugin_version = excluded.plugin_version,
+                       updated_at = excluded.updated_at""",
+                (peer_id, json.dumps(features), max_proto, plugin_version, int(time.time()))
+            )
+            return True
+        except Exception as e:
+            self.plugin.log(f"HiveDatabase: save_peer_capabilities error: {e}", level='warn')
+            return False
+
+    def get_peer_capabilities(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a peer's capabilities record.
+
+        Returns:
+            Dict with features, max_protocol_version, plugin_version, updated_at
+            or None if not found.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM peer_capabilities WHERE peer_id = ?",
+            (peer_id,)
+        ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        try:
+            result['features'] = json.loads(result.get('features', '[]'))
+        except (json.JSONDecodeError, TypeError):
+            result['features'] = []
+        return result
+
+    def get_peer_max_protocol_version(self, peer_id: str) -> int:
+        """
+        Get the max protocol version a peer supports.
+
+        Returns:
+            Integer version (defaults to 1 if unknown).
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT max_protocol_version FROM peer_capabilities WHERE peer_id = ?",
+            (peer_id,)
+        ).fetchone()
+        return row['max_protocol_version'] if row else 1
+
+    # =========================================================================
+    # PROTO EVENTS (Phase C - Deterministic Idempotency)
+    # =========================================================================
+
+    def record_proto_event(self, event_id: str, event_type: str, actor_id: str) -> bool:
+        """
+        Record a protocol event for idempotency.
+
+        Uses INSERT OR IGNORE so duplicate event_ids are silently skipped.
+
+        Args:
+            event_id: SHA256-based unique event identifier
+            event_type: Message type name (e.g. 'MEMBER_LEFT')
+            actor_id: Peer that originated the event
+
+        Returns:
+            True if this is a new event (inserted), False if duplicate.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        try:
+            result = conn.execute(
+                """INSERT OR IGNORE INTO proto_events
+                   (event_id, event_type, actor_id, created_at, received_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (event_id, event_type, actor_id, now, now)
+            )
+            return result.rowcount > 0
+        except Exception as e:
+            self.plugin.log(f"HiveDatabase: record_proto_event error: {e}", level='warn')
+            return False
+
+    def has_proto_event(self, event_id: str) -> bool:
+        """Check if a protocol event has already been recorded."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT 1 FROM proto_events WHERE event_id = ?",
+            (event_id,)
+        ).fetchone()
+        return row is not None
+
+    def cleanup_proto_events(self, max_age_seconds: int = 30 * 86400) -> int:
+        """
+        Remove proto_events older than max_age_seconds.
+
+        Args:
+            max_age_seconds: Maximum age in seconds (default 30 days)
+
+        Returns:
+            Number of rows pruned.
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        result = conn.execute(
+            "DELETE FROM proto_events WHERE created_at < ?",
+            (cutoff,)
+        )
+        return result.rowcount
+
+    # =========================================================================
+    # PROTO OUTBOX OPERATIONS (Phase D - Reliable Delivery)
+    # =========================================================================
+
+    def enqueue_outbox(self, msg_id: str, peer_id: str, msg_type: int,
+                       payload_json: str, expires_at: int) -> bool:
+        """
+        Enqueue a message for reliable delivery to a specific peer.
+
+        Uses INSERT OR IGNORE for idempotent enqueue (same msg_id+peer_id
+        is silently ignored).
+
+        Args:
+            msg_id: Unique message identifier
+            peer_id: Target peer pubkey
+            msg_type: HiveMessageType integer value
+            payload_json: JSON-serialized payload
+            expires_at: Unix timestamp when message expires
+
+        Returns:
+            True if inserted, False if duplicate or error.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        try:
+            result = conn.execute(
+                """INSERT OR IGNORE INTO proto_outbox
+                   (msg_id, peer_id, msg_type, payload_json, status,
+                    created_at, next_retry_at, expires_at)
+                   VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
+                (msg_id, peer_id, msg_type, payload_json, now, now, expires_at)
+            )
+            return result.rowcount > 0
+        except Exception as e:
+            self.plugin.log(f"enqueue_outbox error: {e}", level='warn')
+            return False
+
+    def get_outbox_pending(self, limit: int = 50) -> list:
+        """
+        Get outbox entries ready for sending or retry.
+
+        Returns entries where:
+        - status is 'queued' or 'sent' (pending ack)
+        - next_retry_at <= now (ready to retry)
+        - expires_at > now (not expired)
+
+        Args:
+            limit: Maximum entries to return (default 50)
+
+        Returns:
+            List of dicts with outbox entry fields.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        rows = conn.execute(
+            """SELECT id, msg_id, peer_id, msg_type, payload_json, status,
+                      created_at, sent_at, next_retry_at, retry_count,
+                      expires_at, last_error
+               FROM proto_outbox
+               WHERE status IN ('queued', 'sent')
+                 AND next_retry_at <= ?
+                 AND expires_at > ?
+               ORDER BY next_retry_at ASC
+               LIMIT ?""",
+            (now, now, limit)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_outbox_sent(self, msg_id: str, peer_id: str,
+                           next_retry_at: int) -> bool:
+        """
+        Mark an outbox entry as sent and schedule next retry.
+
+        Args:
+            msg_id: Message identifier
+            peer_id: Target peer pubkey
+            next_retry_at: Unix timestamp for next retry attempt
+
+        Returns:
+            True if updated, False otherwise.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET status = 'sent', sent_at = ?, retry_count = retry_count + 1,
+                   next_retry_at = ?
+               WHERE msg_id = ? AND peer_id = ?
+                 AND status IN ('queued', 'sent')""",
+            (now, next_retry_at, msg_id, peer_id)
+        )
+        return result.rowcount > 0
+
+    def ack_outbox(self, msg_id: str, peer_id: str) -> bool:
+        """
+        Mark an outbox entry as acknowledged.
+
+        Args:
+            msg_id: Message identifier (the _event_id)
+            peer_id: Peer that acknowledged
+
+        Returns:
+            True if updated, False otherwise.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET status = 'acked', acked_at = ?
+               WHERE msg_id = ? AND peer_id = ?
+                 AND status IN ('queued', 'sent')""",
+            (now, msg_id, peer_id)
+        )
+        return result.rowcount > 0
+
+    def ack_outbox_by_type(self, peer_id: str, msg_type: int,
+                           match_field: str, match_value: str) -> int:
+        """
+        Acknowledge outbox entries by type and payload field match.
+
+        Used for implicit acks: e.g. receiving SETTLEMENT_READY clears the
+        SETTLEMENT_PROPOSE outbox entries for that peer+proposal_id.
+
+        Args:
+            peer_id: Peer that implicitly acknowledged
+            msg_type: The original message type integer to match
+            match_field: JSON field name to match in payload
+            match_value: Expected value of the field
+
+        Returns:
+            Number of entries acknowledged.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        # Use json_extract for matching payload fields
+        # Fallback to LIKE for SQLite versions without json_extract
+        try:
+            result = conn.execute(
+                """UPDATE proto_outbox
+                   SET status = 'acked', acked_at = ?
+                   WHERE peer_id = ? AND msg_type = ?
+                     AND status IN ('queued', 'sent')
+                     AND json_extract(payload_json, ?) = ?""",
+                (now, peer_id, msg_type, f'$.{match_field}', match_value)
+            )
+            return result.rowcount
+        except Exception:
+            # Fallback: match using LIKE pattern for older SQLite
+            pattern = f'"{match_field}":"{match_value}"'
+            try:
+                result = conn.execute(
+                    """UPDATE proto_outbox
+                       SET status = 'acked', acked_at = ?
+                       WHERE peer_id = ? AND msg_type = ?
+                         AND status IN ('queued', 'sent')
+                         AND payload_json LIKE ?""",
+                    (now, peer_id, msg_type, f'%{pattern}%')
+                )
+                return result.rowcount
+            except Exception as e:
+                self.plugin.log(f"ack_outbox_by_type error: {e}", level='warn')
+                return 0
+
+    def fail_outbox(self, msg_id: str, peer_id: str, error: str) -> bool:
+        """
+        Mark an outbox entry as permanently failed.
+
+        Args:
+            msg_id: Message identifier
+            peer_id: Target peer pubkey
+            error: Error description
+
+        Returns:
+            True if updated, False otherwise.
+        """
+        conn = self._get_connection()
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET status = 'failed', last_error = ?
+               WHERE msg_id = ? AND peer_id = ?
+                 AND status IN ('queued', 'sent')""",
+            (error[:500], msg_id, peer_id)
+        )
+        return result.rowcount > 0
+
+    def expire_outbox(self) -> int:
+        """
+        Mark expired outbox entries.
+
+        Returns:
+            Number of entries expired.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET status = 'expired'
+               WHERE expires_at <= ? AND status IN ('queued', 'sent')""",
+            (now,)
+        )
+        return result.rowcount
+
+    def cleanup_outbox(self, max_age_seconds: int = 7 * 86400) -> int:
+        """
+        Delete terminal outbox entries (acked/failed/expired) older than threshold.
+
+        Args:
+            max_age_seconds: Maximum age in seconds (default 7 days)
+
+        Returns:
+            Number of entries cleaned up.
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        result = conn.execute(
+            """DELETE FROM proto_outbox
+               WHERE status IN ('acked', 'failed', 'expired')
+                 AND created_at < ?""",
+            (cutoff,)
+        )
+        return result.rowcount
+
+    def count_inflight_for_peer(self, peer_id: str) -> int:
+        """
+        Count active (queued or sent) outbox entries for a peer.
+
+        Used for backpressure: reject new enqueues when too many are inflight.
+
+        Args:
+            peer_id: Target peer pubkey
+
+        Returns:
+            Count of inflight entries.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            """SELECT COUNT(*) as cnt FROM proto_outbox
+               WHERE peer_id = ? AND status IN ('queued', 'sent')""",
+            (peer_id,)
+        ).fetchone()
+        return row['cnt'] if row else 0

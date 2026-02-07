@@ -66,3 +66,5 @@ production/
 
 # Runtime-generated MCP config (created by run-advisor.sh)
 .mcp-config-runtime.json
+
+docker/plugins/

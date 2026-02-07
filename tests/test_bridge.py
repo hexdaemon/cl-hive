@@ -310,15 +310,15 @@ class TestSafeCall:
         
         assert bridge._revenue_ops_cb._failure_count == 1
 
-    def test_safe_call_logic_error_does_not_trip_circuit(self, bridge, mock_rpc):
-        """Logic errors do not increment failure count."""
+    def test_safe_call_generic_error_trips_circuit(self, bridge, mock_rpc):
+        """Generic exceptions record circuit breaker failures."""
         bridge._status = BridgeStatus.ENABLED
         mock_rpc.call.side_effect = ValueError("bad input")
 
         with pytest.raises(ValueError):
             bridge.safe_call("test-method")
 
-        assert bridge._revenue_ops_cb._failure_count == 0
+        assert bridge._revenue_ops_cb._failure_count == 1
 
     def test_safe_call_circuit_open_fail_fast(self, bridge, mock_rpc):
         """Circuit open causes fail-fast without RPC call."""

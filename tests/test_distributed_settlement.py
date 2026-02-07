@@ -256,7 +256,9 @@ class TestProposalCreation:
         assert proposal['period'] == period
         assert proposal['proposer_peer_id'] == our_peer_id
         assert 'data_hash' in proposal
+        assert 'plan_hash' in proposal
         assert len(proposal['data_hash']) == 64
+        assert len(proposal['plan_hash']) == 64
         assert 'contributions' in proposal
         mock_database.add_settlement_proposal.assert_called_once()
 
@@ -310,12 +312,15 @@ class TestVoting:
         contributions = settlement_manager.gather_contributions_from_gossip(
             mock_state_manager, "2024-05"
         )
-        data_hash = settlement_manager.calculate_settlement_hash("2024-05", contributions)
+        plan = settlement_manager.compute_settlement_plan("2024-05", contributions)
+        data_hash = plan["data_hash"]
+        plan_hash = plan["plan_hash"]
 
         proposal = {
             'proposal_id': 'test_proposal_123',
             'period': '2024-05',
             'data_hash': data_hash,
+            'plan_hash': plan_hash,
             'total_fees_sats': 18000,
             'member_count': 3,
         }
@@ -340,6 +345,7 @@ class TestVoting:
             'proposal_id': 'test_proposal_123',
             'period': '2024-05',
             'data_hash': 'wrong_hash_' + 'x' * 54,  # 64 chars
+            'plan_hash': 'y' * 64,
             'total_fees_sats': 18000,
             'member_count': 3,
         }
@@ -433,10 +439,12 @@ class TestProtocolValidation:
             "proposer_peer_id": "02" + "a" * 64,
             "timestamp": int(time.time()),
             "data_hash": "a" * 64,
+            "plan_hash": "b" * 64,
             "total_fees_sats": 10000,
             "member_count": 3,
             "contributions": [
-                {"peer_id": "02" + "a" * 64, "fees_earned": 5000, "capacity": 1000000}
+                {"peer_id": "02" + "a" * 64, "fees_earned": 5000, "rebalance_costs": 0,
+                 "capacity": 1000000, "uptime": 100, "forward_count": 10}
             ],
             "signature": "mock_signature_zbase_1234567890"
         }
@@ -451,6 +459,7 @@ class TestProtocolValidation:
             "proposer_peer_id": "02" + "a" * 64,
             "timestamp": int(time.time()),
             "data_hash": "tooshort",  # Should be 64 chars
+            "plan_hash": "b" * 64,
             "total_fees_sats": 10000,
             "member_count": 3,
             "contributions": [],
@@ -499,6 +508,7 @@ class TestMessageCreation:
             period="2024-05",
             proposer_peer_id="02" + "a" * 64,
             data_hash="a" * 64,
+            plan_hash="b" * 64,
             total_fees_sats=10000,
             member_count=3,
             contributions=[{"peer_id": "02" + "a" * 64, "fees_earned": 5000}],
@@ -538,6 +548,135 @@ class TestMessageCreation:
 
 
 # =============================================================================
+# PAYMENT PLAN + EXECUTION VALIDATION TESTS (Phase 12 v2)
+# =============================================================================
+
+class TestDeterministicPaymentPlan:
+    def test_plan_is_deterministic_and_sums(self, settlement_manager):
+        period = "2024-05"
+        # Four members, only A earns net profit. Equal contribution => A owes, others receive.
+        a = "02" + "a" * 64
+        b = "02" + "b" * 64
+        c = "02" + "c" * 64
+        d = "02" + "d" * 64
+        contributions = [
+            {"peer_id": a, "fees_earned": 1000, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": b, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": c, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": d, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+        ]
+
+        plan1 = settlement_manager.compute_settlement_plan(period, contributions)
+        plan2 = settlement_manager.compute_settlement_plan(period, list(reversed(contributions)))
+
+        assert plan1["data_hash"] == plan2["data_hash"]
+        assert plan1["plan_hash"] == plan2["plan_hash"]
+        assert plan1["expected_sent_sats"][a] == 750
+        assert sum(p["amount_sats"] for p in plan1["payments"]) == 750
+        # Deterministic receiver order tie-breaks by peer_id.
+        assert [p["to_peer"] for p in plan1["payments"]] == [b, c, d]
+
+
+class TestExecuteAssignedPayments:
+    def test_execute_our_settlement_executes_only_assigned_payments(
+        self, settlement_manager, mock_database, mock_rpc
+    ):
+        period = "2024-05"
+        a = "02" + "a" * 64
+        b = "02" + "b" * 64
+        c = "02" + "c" * 64
+        d = "02" + "d" * 64
+        contributions = [
+            {"peer_id": a, "fees_earned": 1000, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": b, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": c, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": d, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+        ]
+        plan = settlement_manager.compute_settlement_plan(period, contributions)
+
+        proposal = {"proposal_id": "p1", "period": period, "plan_hash": plan["plan_hash"]}
+
+        # Offers must exist for each receiver.
+        settlement_manager.get_offer = Mock(side_effect=lambda peer_id: "lno1offer" if peer_id in (b, c, d) else None)
+
+        async def _exec_payment(payment: SettlementPayment) -> SettlementPayment:
+            payment.status = "completed"
+            payment.payment_hash = f"h_{payment.to_peer[-4:]}_{payment.amount_sats}"
+            return payment
+
+        settlement_manager.execute_payment = AsyncMock(side_effect=_exec_payment)
+        mock_database.has_executed_settlement.return_value = False
+
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            exec_result = loop.run_until_complete(
+                settlement_manager.execute_our_settlement(
+                    proposal=proposal,
+                    contributions=contributions,
+                    our_peer_id=a,
+                    rpc=mock_rpc,
+                )
+            )
+        finally:
+            loop.close()
+
+        assert exec_result is not None
+        assert exec_result["total_sent_sats"] == 750
+        assert exec_result["plan_hash"] == plan["plan_hash"]
+        assert settlement_manager.execute_payment.call_count == 3
+
+        # Ensure the DB execution record binds to the plan hash and total.
+        assert mock_database.add_settlement_execution.called
+        kwargs = mock_database.add_settlement_execution.call_args.kwargs
+        assert kwargs["proposal_id"] == "p1"
+        assert kwargs["executor_peer_id"] == a
+        assert kwargs["amount_paid_sats"] == 750
+        assert kwargs["plan_hash"] == plan["plan_hash"]
+
+
+class TestCompletionValidation:
+    def test_completion_requires_matching_expected_totals(self, settlement_manager, mock_database):
+        period = "2024-05"
+        a = "02" + "a" * 64
+        b = "02" + "b" * 64
+        c = "02" + "c" * 64
+        d = "02" + "d" * 64
+        contributions = [
+            {"peer_id": a, "fees_earned": 1000, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": b, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": c, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": d, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+        ]
+        plan = settlement_manager.compute_settlement_plan(period, contributions)
+        proposal = {
+            "proposal_id": "p1",
+            "period": period,
+            "status": "ready",
+            "member_count": 4,
+            "plan_hash": plan["plan_hash"],
+            "contributions_json": json.dumps(contributions),
+        }
+
+        mock_database.get_settlement_proposal.return_value = proposal
+        mock_database.get_settlement_executions.return_value = [
+            {"executor_peer_id": a, "amount_paid_sats": 750, "plan_hash": plan["plan_hash"]},
+            {"executor_peer_id": b, "amount_paid_sats": 0, "plan_hash": plan["plan_hash"]},
+            {"executor_peer_id": c, "amount_paid_sats": 0, "plan_hash": plan["plan_hash"]},
+            {"executor_peer_id": d, "amount_paid_sats": 0, "plan_hash": plan["plan_hash"]},
+        ]
+
+        ok = settlement_manager.check_and_complete_settlement("p1")
+        assert ok is True
+        mock_database.update_settlement_proposal_status.assert_called_with("p1", "completed")
+        assert mock_database.mark_period_settled.called
+        mark_args = mock_database.mark_period_settled.call_args.args
+        assert mark_args[0] == period
+        assert mark_args[1] == "p1"
+        assert mark_args[2] == 750
+
+
+# =============================================================================
 # SIGNING PAYLOAD TESTS
 # =============================================================================
 
@@ -551,6 +690,7 @@ class TestSigningPayloads:
             "period": "2024-05",
             "proposer_peer_id": "02" + "a" * 64,
             "data_hash": "a" * 64,
+            "plan_hash": "b" * 64,
             "total_fees_sats": 10000,
             "member_count": 3,
             "timestamp": 1234567890,
@@ -838,3 +978,185 @@ class TestNetProfitSettlement:
         assert result.net_profit == 700
         assert result.fees_earned == 1000
         assert result.balance == 100  # fair_share - net_profit = 800 - 700 = 100
+
+
+# =============================================================================
+# SETTLEMENT REBROADCAST TESTS (Issue #49)
+# =============================================================================
+
+class TestSettlementRebroadcast:
+    """Tests for settlement proposal rebroadcast functionality (Issue #49)."""
+
+    def test_proposal_stores_contributions_json(self, mock_database, mock_plugin, mock_rpc, mock_state_manager):
+        """Verify proposals store contributions_json for rebroadcast."""
+        settlement_manager = SettlementManager(mock_database, mock_plugin, mock_rpc)
+
+        # Set up mock state manager
+        mock_state_manager.get_peer_fees.return_value = {
+            'fees_earned_sats': 1000,
+            'forward_count': 10,
+            'rebalance_costs_sats': 100
+        }
+        mock_state_manager.get_peer_state.return_value = MagicMock(capacity_sats=10_000_000)
+        mock_database.get_fee_reports_for_period.return_value = []
+
+        proposal = settlement_manager.create_proposal(
+            period="2025-01",
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        # Verify add_settlement_proposal was called with contributions_json
+        assert mock_database.add_settlement_proposal.called
+        call_kwargs = mock_database.add_settlement_proposal.call_args
+        # Check that contributions_json was passed
+        if call_kwargs.kwargs:
+            assert 'contributions_json' in call_kwargs.kwargs
+            contributions_json = call_kwargs.kwargs['contributions_json']
+            assert contributions_json is not None
+            # Verify it's valid JSON
+            contributions = json.loads(contributions_json)
+            assert isinstance(contributions, list)
+
+    def test_get_proposals_needing_rebroadcast_filters_correctly(self):
+        """Test database method filters proposals correctly for rebroadcast."""
+        import sqlite3
+        import tempfile
+        import os
+
+        # Create a real temporary database for this test
+        fd, db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            now = int(time.time())
+
+            # Create table with all columns
+            conn.execute("""
+                CREATE TABLE settlement_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    period TEXT NOT NULL UNIQUE,
+                    proposer_peer_id TEXT NOT NULL,
+                    proposed_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    data_hash TEXT NOT NULL,
+                    total_fees_sats INTEGER NOT NULL,
+                    member_count INTEGER NOT NULL,
+                    last_broadcast_at INTEGER,
+                    contributions_json TEXT
+                )
+            """)
+
+            our_peer_id = '02' + 'a' * 64
+            other_peer_id = '02' + 'b' * 64
+
+            # Insert test proposals
+            proposals = [
+                # Should be returned: pending, not expired, our proposal, broadcast long ago
+                ('prop1', '2025-01', our_peer_id, now - 7200, now + 86400, 'pending', 'hash1', 1000, 3, now - 20000, '[]'),
+                # Should NOT be: broadcast recently (within interval)
+                ('prop2', '2025-02', our_peer_id, now - 3600, now + 86400, 'pending', 'hash2', 1000, 3, now - 1000, '[]'),
+                # Should NOT be: different proposer
+                ('prop3', '2025-03', other_peer_id, now - 7200, now + 86400, 'pending', 'hash3', 1000, 3, now - 20000, '[]'),
+                # Should NOT be: expired
+                ('prop4', '2025-04', our_peer_id, now - 100000, now - 1000, 'pending', 'hash4', 1000, 3, now - 20000, '[]'),
+                # Should NOT be: status is 'ready' (already at quorum)
+                ('prop5', '2025-05', our_peer_id, now - 7200, now + 86400, 'ready', 'hash5', 1000, 3, now - 20000, '[]'),
+                # Should be returned: never broadcast (NULL last_broadcast_at)
+                ('prop6', '2025-06', our_peer_id, now - 7200, now + 86400, 'pending', 'hash6', 1000, 3, None, '[]'),
+            ]
+
+            for p in proposals:
+                conn.execute("""
+                    INSERT INTO settlement_proposals
+                    (proposal_id, period, proposer_peer_id, proposed_at, expires_at,
+                     status, data_hash, total_fees_sats, member_count, last_broadcast_at, contributions_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, p)
+            conn.commit()
+
+            # Query for proposals needing rebroadcast (4 hour interval = 14400 seconds)
+            rebroadcast_interval = 14400
+            cutoff = now - rebroadcast_interval
+
+            rows = conn.execute("""
+                SELECT * FROM settlement_proposals
+                WHERE status = 'pending'
+                AND expires_at > ?
+                AND proposer_peer_id = ?
+                AND (last_broadcast_at IS NULL OR last_broadcast_at < ?)
+                ORDER BY proposed_at ASC
+            """, (now, our_peer_id, cutoff)).fetchall()
+
+            # Should return prop1 and prop6
+            results = [dict(row) for row in rows]
+            assert len(results) == 2
+            proposal_ids = [r['proposal_id'] for r in results]
+            assert 'prop1' in proposal_ids  # Broadcast long ago
+            assert 'prop6' in proposal_ids  # Never broadcast
+
+        finally:
+            os.unlink(db_path)
+
+    def test_update_proposal_broadcast_time(self):
+        """Test database method updates broadcast timestamp."""
+        import sqlite3
+        import tempfile
+        import os
+
+        fd, db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            now = int(time.time())
+
+            conn.execute("""
+                CREATE TABLE settlement_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    period TEXT NOT NULL,
+                    proposer_peer_id TEXT NOT NULL,
+                    proposed_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    data_hash TEXT NOT NULL,
+                    total_fees_sats INTEGER NOT NULL,
+                    member_count INTEGER NOT NULL,
+                    last_broadcast_at INTEGER,
+                    contributions_json TEXT
+                )
+            """)
+
+            # Insert a proposal with old broadcast time
+            conn.execute("""
+                INSERT INTO settlement_proposals
+                (proposal_id, period, proposer_peer_id, proposed_at, expires_at,
+                 status, data_hash, total_fees_sats, member_count, last_broadcast_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+            """, ('prop1', '2025-01', '02' + 'a' * 64, now - 3600, now + 86400, 'hash1', 1000, 3, now - 20000))
+            conn.commit()
+
+            # Update broadcast time
+            new_time = now
+            conn.execute("""
+                UPDATE settlement_proposals
+                SET last_broadcast_at = ?
+                WHERE proposal_id = ?
+            """, (new_time, 'prop1'))
+            conn.commit()
+
+            # Verify update
+            row = conn.execute(
+                "SELECT last_broadcast_at FROM settlement_proposals WHERE proposal_id = ?",
+                ('prop1',)
+            ).fetchone()
+
+            assert row['last_broadcast_at'] == new_time
+
+        finally:
+            os.unlink(db_path)

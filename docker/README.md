@@ -186,6 +186,7 @@ BACKUP_RETENTION=30  # days
 | `NETWORK_MODE` | `tor` | Network mode: `tor`, `clearnet`, or `hybrid` |
 | `ANNOUNCE_ADDR` | - | Public address (required for clearnet/hybrid) |
 | `WIREGUARD_ENABLED` | `false` | Enable WireGuard VPN |
+| `TRUSTEDCOIN_ENABLED` | `false` | Use trustedcoin instead of bcli (see below) |
 
 **Network Modes:**
 - **tor** - Tor-only, anonymous, no clearnet exposure (default)
@@ -427,6 +428,79 @@ WG_PEER_ENDPOINT=vpn.example.com:51820
 BITCOIN_RPCHOST=10.8.0.1  # Bitcoin via VPN
 ```
 
+## Trustedcoin Configuration (Optional Bitcoin Backend)
+
+Trustedcoin is an alternative Bitcoin backend that can replace the default `bcli` plugin. It uses block explorers (mempool.space, blockstream.info, etc.) to get blockchain data.
+
+### When to Use Trustedcoin
+
+- **VPS deployments** without local bitcoind - run a Lightning node without a full Bitcoin node
+- **Lightweight setups** - reduce resource requirements
+- **Redundancy** - hybrid mode provides explorer fallback if bitcoind fails
+
+### Operating Modes
+
+#### Explorer-Only Mode (No bitcoind required)
+
+Perfect for VPS deployments where you don't want to run Bitcoin Core:
+
+```bash
+# .env configuration
+TRUSTEDCOIN_ENABLED=true
+
+# Leave Bitcoin RPC settings empty or commented out:
+# BITCOIN_RPCUSER=
+# BITCOIN_RPCPASSWORD=
+```
+
+In this mode, trustedcoin fetches all blockchain data from public explorers. No bitcoind needed.
+
+#### Hybrid Mode (bitcoind + explorer fallback)
+
+Best reliability for production - uses your bitcoind as primary, falls back to explorers if bitcoind is unavailable:
+
+```bash
+# .env configuration
+TRUSTEDCOIN_ENABLED=true
+
+# Configure Bitcoin RPC as normal:
+BITCOIN_RPCHOST=host.docker.internal
+BITCOIN_RPCPORT=8332
+BITCOIN_RPCUSER=your_rpc_username
+BITCOIN_RPCPASSWORD=your_rpc_password
+```
+
+Hybrid mode gives you the best of both worlds:
+- Primary: Fast, trusted data from your own bitcoind
+- Fallback: Explorer queries if bitcoind goes down
+
+### Security Considerations
+
+| Mode | Trust Model | Recommendation |
+|------|-------------|----------------|
+| **bcli (default)** | Trust only your bitcoind | Most secure, requires bitcoind |
+| **Hybrid** | Primarily your bitcoind, explorers as fallback | Good balance of security and reliability |
+| **Explorer-only** | Trust third-party explorers | Convenient but less secure |
+
+**Explorer-only mode security notes:**
+- You're trusting multiple public block explorers to provide accurate data
+- Explorers could theoretically lie about transaction confirmations
+- For high-value nodes, hybrid or bcli mode is recommended
+- Acceptable risk for testing, low-value nodes, or when bitcoind isn't available
+
+### Verify Trustedcoin is Working
+
+```bash
+# Check if trustedcoin is loaded
+docker-compose exec cln lightning-cli plugin list | grep trustedcoin
+
+# Check current block height (should match network)
+docker-compose exec cln lightning-cli getinfo | jq '.blockheight'
+
+# View trustedcoin logs
+docker-compose logs cln | grep -i trustedcoin
+```
+
 ## Hive Operations
 
 ### Initialize Genesis (First Node)
@@ -648,6 +722,7 @@ docker build -t cl-hive-node:local -f docker/Dockerfile ..
 | Core Lightning | v25.12.1 | Yes |
 | CLBOSS | latest (ksedgwic fork) | Yes |
 | Sling | v4.1.3 | Yes |
+| Trustedcoin | v0.8.6 | Optional |
 | c-lightning-REST | v0.10.7 | Yes |
 | cl-revenue-ops | latest (from GitHub) | Yes |
 | cl-hive | bundled | Yes |

@@ -36,11 +36,21 @@ HIVE_MAGIC_HEX = 0x48495645
 # Protocol version for compatibility checks
 PROTOCOL_VERSION = 1
 
+# Version tolerance: accept messages from this range of protocol versions.
+# Prevents fleet partition during rolling upgrades (Phase B hardening).
+MIN_SUPPORTED_VERSION = 1
+MAX_SUPPORTED_VERSION = 2
+SUPPORTED_VERSIONS = set(range(MIN_SUPPORTED_VERSION, MAX_SUPPORTED_VERSION + 1))
+
 # Maximum message size in bytes (post-hex decode)
 MAX_MESSAGE_BYTES = 65535
 
 # Maximum peer_id length (hex-encoded pubkey should be 66 chars, allow some margin)
 MAX_PEER_ID_LEN = 128
+
+# Maximum length for freeform string fields
+MAX_REASON_LEN = 512
+MAX_STRING_FIELD_LEN = 1024
 
 # =============================================================================
 # MESSAGE TYPES
@@ -144,6 +154,59 @@ class HiveMessageType(IntEnum):
     MCF_SOLUTION_BROADCAST = 32875 # Computed MCF solution from coordinator
     MCF_ASSIGNMENT_ACK = 32877     # Acknowledge receipt of MCF assignment
     MCF_COMPLETION_REPORT = 32879  # Report completion of MCF assignment
+
+    # Phase D: Reliable Delivery
+    MSG_ACK = 32881  # Generic acknowledgment for reliable messages
+
+
+# =============================================================================
+# PHASE D: RELIABLE DELIVERY CONSTANTS
+# =============================================================================
+
+# Message types that require reliable delivery (Phase D)
+RELIABLE_MESSAGE_TYPES = frozenset({
+    HiveMessageType.SETTLEMENT_PROPOSE,
+    HiveMessageType.SETTLEMENT_READY,
+    HiveMessageType.SETTLEMENT_EXECUTED,
+    HiveMessageType.BAN_PROPOSAL,
+    HiveMessageType.BAN_VOTE,
+    HiveMessageType.PROMOTION_REQUEST,
+    HiveMessageType.VOUCH,
+    HiveMessageType.PROMOTION,
+    HiveMessageType.MEMBER_LEFT,
+    HiveMessageType.TASK_REQUEST,
+    HiveMessageType.TASK_RESPONSE,
+    HiveMessageType.SPLICE_INIT_REQUEST,
+    HiveMessageType.SPLICE_INIT_RESPONSE,
+    HiveMessageType.SPLICE_UPDATE,
+    HiveMessageType.SPLICE_SIGNED,
+    HiveMessageType.SPLICE_ABORT,
+})
+
+# Implicit ack mapping: response type -> request type it satisfies
+# When we receive a domain response, it implicitly acknowledges the request
+IMPLICIT_ACK_MAP = {
+    HiveMessageType.SETTLEMENT_READY: HiveMessageType.SETTLEMENT_PROPOSE,
+    HiveMessageType.TASK_RESPONSE: HiveMessageType.TASK_REQUEST,
+    HiveMessageType.SPLICE_INIT_RESPONSE: HiveMessageType.SPLICE_INIT_REQUEST,
+    HiveMessageType.BAN_VOTE: HiveMessageType.BAN_PROPOSAL,
+    HiveMessageType.VOUCH: HiveMessageType.PROMOTION_REQUEST,
+}
+
+# Field in the response payload that matches the request for implicit acks
+IMPLICIT_ACK_MATCH_FIELD = {
+    HiveMessageType.SETTLEMENT_READY: "proposal_id",
+    HiveMessageType.TASK_RESPONSE: "request_id",
+    HiveMessageType.SPLICE_INIT_RESPONSE: "session_id",
+    HiveMessageType.BAN_VOTE: "proposal_id",
+    HiveMessageType.VOUCH: "request_id",
+}
+
+# MSG_ACK valid status values
+VALID_ACK_STATUSES = {"ok", "invalid", "retry_later"}
+
+# Maximum length of ack_msg_id
+MAX_ACK_MSG_ID_LEN = 64
 
 
 # =============================================================================
@@ -484,9 +547,19 @@ def serialize(msg_type: HiveMessageType, payload: Dict[str, Any]) -> bytes:
     
     # JSON encode
     json_bytes = json.dumps(envelope, separators=(',', ':')).encode('utf-8')
-    
+
     # Prepend magic
-    return HIVE_MAGIC + json_bytes
+    result = HIVE_MAGIC + json_bytes
+
+    # Size check: reject messages exceeding wire limit
+    if len(result) > MAX_MESSAGE_BYTES:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"serialize: message too large ({len(result)} bytes > {MAX_MESSAGE_BYTES}), dropping"
+        )
+        return None
+
+    return result
 
 
 def deserialize(data: bytes) -> Tuple[Optional[HiveMessageType], Optional[Dict[str, Any]]]:
@@ -519,14 +592,18 @@ def deserialize(data: bytes) -> Tuple[Optional[HiveMessageType], Optional[Dict[s
         json_data = data[4:].decode('utf-8')
         envelope = json.loads(json_data)
         
-        if envelope.get('version') != PROTOCOL_VERSION:
+        if envelope.get('version') not in SUPPORTED_VERSIONS:
             return (None, None)
 
         msg_type = HiveMessageType(envelope['type'])
         payload = envelope.get('payload', {})
         if not isinstance(payload, dict):
             return (None, None)
-        
+
+        # Inject envelope version so handlers can check it without
+        # changing the function signature (Phase B hardening).
+        payload['_envelope_version'] = envelope.get('version')
+
         return (msg_type, payload)
         
     except (json.JSONDecodeError, KeyError, ValueError) as e:
@@ -645,6 +722,8 @@ def validate_member_left(payload: Dict[str, Any]) -> bool:
     # reason must be a non-empty string
     if not isinstance(reason, str) or not reason:
         return False
+    if len(reason) > MAX_REASON_LEN:
+        return False
 
     # signature must be present (zbase encoded)
     if not isinstance(signature, str) or not signature:
@@ -654,8 +733,10 @@ def validate_member_left(payload: Dict[str, Any]) -> bool:
 
 
 def _valid_pubkey(pubkey: Any) -> bool:
-    """Check if value is a valid 66-char hex pubkey."""
+    """Check if value is a valid 66-char hex pubkey with 02/03 prefix."""
     if not isinstance(pubkey, str) or len(pubkey) != 66:
+        return False
+    if not (pubkey.startswith('02') or pubkey.startswith('03')):
         return False
     return all(c in "0123456789abcdef" for c in pubkey)
 
@@ -683,7 +764,7 @@ def validate_ban_proposal(payload: Dict[str, Any]) -> bool:
         return False
 
     # reason must be non-empty string
-    if not isinstance(reason, str) or not reason or len(reason) > 500:
+    if not isinstance(reason, str) or not reason or len(reason) > MAX_REASON_LEN:
         return False
 
     # timestamp must be positive integer
@@ -1171,7 +1252,8 @@ def create_hello(pubkey: str) -> bytes:
     """
     return serialize(HiveMessageType.HELLO, {
         "pubkey": pubkey,
-        "protocol_version": PROTOCOL_VERSION
+        "protocol_version": PROTOCOL_VERSION,
+        "supported_versions": sorted(SUPPORTED_VERSIONS)
     })
 
 
@@ -1622,7 +1704,7 @@ def validate_expansion_decline(payload: Dict[str, Any]) -> bool:
         return False
 
     # reason must be a non-empty string
-    if not isinstance(reason, str) or not reason:
+    if not isinstance(reason, str) or not reason or len(reason) > MAX_REASON_LEN:
         return False
 
     # Valid reasons
@@ -3207,6 +3289,8 @@ def validate_task_response_payload(payload: Dict[str, Any]) -> bool:
         reason = payload.get("reason", "")
         if not reason or not isinstance(reason, str):
             return False
+        if len(reason) > MAX_REASON_LEN:
+            return False
 
     # If completed, result should be present
     if payload["status"] == TASK_STATUS_COMPLETED:
@@ -3498,7 +3582,7 @@ def validate_splice_init_response_payload(payload: Dict[str, Any]) -> bool:
     # If rejected, reason should be present
     if not accepted:
         reason = payload.get("reason")
-        if reason is not None and (not isinstance(reason, str) or len(reason) > 200):
+        if reason is not None and (not isinstance(reason, str) or len(reason) > MAX_REASON_LEN):
             return False
 
     # timestamp must be positive integer
@@ -3664,7 +3748,7 @@ def validate_splice_abort_payload(payload: Dict[str, Any]) -> bool:
         return False
 
     # reason must be a string
-    if not isinstance(reason, str) or len(reason) > 500:
+    if not isinstance(reason, str) or len(reason) > MAX_REASON_LEN:
         return False
 
     # timestamp must be positive integer
@@ -3940,7 +4024,7 @@ def validate_settlement_propose(payload: Dict[str, Any]) -> bool:
         return False
 
     required = ["proposal_id", "period", "proposer_peer_id", "timestamp",
-                "data_hash", "total_fees_sats", "member_count",
+                "data_hash", "plan_hash", "total_fees_sats", "member_count",
                 "contributions", "signature"]
 
     for field in required:
@@ -3957,6 +4041,8 @@ def validate_settlement_propose(payload: Dict[str, Any]) -> bool:
     if not isinstance(payload["timestamp"], int) or payload["timestamp"] < 0:
         return False
     if not isinstance(payload["data_hash"], str) or len(payload["data_hash"]) != 64:
+        return False
+    if not isinstance(payload["plan_hash"], str) or len(payload["plan_hash"]) != 64:
         return False
     if not isinstance(payload["total_fees_sats"], int) or payload["total_fees_sats"] < 0:
         return False
@@ -3976,9 +4062,20 @@ def validate_settlement_propose(payload: Dict[str, Any]) -> bool:
             return False
         if not _valid_pubkey(contrib.get("peer_id", "")):
             return False
-        if not isinstance(contrib.get("fees_earned", 0), int):
+        fees_earned = contrib.get("fees_earned", 0)
+        if not isinstance(fees_earned, int) or fees_earned < 0:
             return False
-        if not isinstance(contrib.get("capacity", 0), int):
+        rebalance_costs = contrib.get("rebalance_costs", 0)
+        if not isinstance(rebalance_costs, int) or rebalance_costs < 0:
+            return False
+        forward_count = contrib.get("forward_count", 0)
+        if not isinstance(forward_count, int) or forward_count < 0:
+            return False
+        uptime = contrib.get("uptime", 100)
+        if not isinstance(uptime, int) or not (0 <= uptime <= 100):
+            return False
+        capacity = contrib.get("capacity", 0)
+        if not isinstance(capacity, int) or capacity < 0:
             return False
 
     return True
@@ -4046,6 +4143,12 @@ def validate_settlement_executed(payload: Dict[str, Any]) -> bool:
         return False
 
     # Optional fields
+    if "plan_hash" in payload:
+        if not isinstance(payload["plan_hash"], str) or (payload["plan_hash"] and len(payload["plan_hash"]) != 64):
+            return False
+    if "total_sent_sats" in payload:
+        if not isinstance(payload["total_sent_sats"], int) or payload["total_sent_sats"] < 0:
+            return False
     if "payment_hash" in payload:
         if not isinstance(payload["payment_hash"], str):
             return False
@@ -4067,6 +4170,7 @@ def get_settlement_propose_signing_payload(payload: Dict[str, Any]) -> str:
         "period": payload.get("period", ""),
         "proposer_peer_id": payload.get("proposer_peer_id", ""),
         "data_hash": payload.get("data_hash", ""),
+        "plan_hash": payload.get("plan_hash", ""),
         "total_fees_sats": payload.get("total_fees_sats", 0),
         "member_count": payload.get("member_count", 0),
         "timestamp": payload.get("timestamp", 0),
@@ -4098,6 +4202,8 @@ def get_settlement_executed_signing_payload(payload: Dict[str, Any]) -> str:
     signing_fields = {
         "proposal_id": payload.get("proposal_id", ""),
         "executor_peer_id": payload.get("executor_peer_id", ""),
+        "plan_hash": payload.get("plan_hash", ""),
+        "total_sent_sats": payload.get("total_sent_sats", 0),
         "payment_hash": payload.get("payment_hash", ""),
         "amount_paid_sats": payload.get("amount_paid_sats", 0),
         "timestamp": payload.get("timestamp", 0),
@@ -4110,6 +4216,7 @@ def create_settlement_propose(
     period: str,
     proposer_peer_id: str,
     data_hash: str,
+    plan_hash: str,
     total_fees_sats: int,
     member_count: int,
     contributions: List[Dict[str, Any]],
@@ -4141,6 +4248,7 @@ def create_settlement_propose(
         "period": period,
         "proposer_peer_id": proposer_peer_id,
         "data_hash": data_hash,
+        "plan_hash": plan_hash,
         "total_fees_sats": total_fees_sats,
         "member_count": member_count,
         "contributions": contributions,
@@ -4188,6 +4296,8 @@ def create_settlement_executed(
     executor_peer_id: str,
     timestamp: int,
     signature: str,
+    plan_hash: Optional[str] = None,
+    total_sent_sats: Optional[int] = None,
     payment_hash: Optional[str] = None,
     amount_paid_sats: Optional[int] = None
 ) -> bytes:
@@ -4214,6 +4324,10 @@ def create_settlement_executed(
         "timestamp": timestamp,
         "signature": signature
     }
+    if plan_hash is not None:
+        payload["plan_hash"] = plan_hash
+    if total_sent_sats is not None:
+        payload["total_sent_sats"] = total_sent_sats
     if payment_hash is not None:
         payload["payment_hash"] = payment_hash
     if amount_paid_sats is not None:
@@ -5804,3 +5918,59 @@ def create_mcf_completion_report(
         return None
 
     return serialize(HiveMessageType.MCF_COMPLETION_REPORT, payload)
+
+
+# =============================================================================
+# PHASE D: MSG_ACK HELPERS
+# =============================================================================
+
+def create_msg_ack(ack_msg_id: str, status: str, sender_id: str) -> bytes:
+    """
+    Create a MSG_ACK message for reliable delivery acknowledgment.
+
+    Args:
+        ack_msg_id: The _event_id of the message being acknowledged
+        status: Ack status - "ok", "invalid", or "retry_later"
+        sender_id: Our pubkey (the acknowledging node)
+
+    Returns:
+        Serialized MSG_ACK message bytes
+    """
+    payload = {
+        "ack_msg_id": ack_msg_id[:MAX_ACK_MSG_ID_LEN],
+        "status": status if status in VALID_ACK_STATUSES else "ok",
+        "sender_id": sender_id,
+        "timestamp": int(time.time()),
+    }
+    return serialize(HiveMessageType.MSG_ACK, payload)
+
+
+def validate_msg_ack(payload: Dict[str, Any]) -> bool:
+    """
+    Validate MSG_ACK payload schema.
+
+    Returns:
+        True if payload has valid structure, False otherwise.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    ack_msg_id = payload.get("ack_msg_id")
+    if not isinstance(ack_msg_id, str) or not ack_msg_id:
+        return False
+    if len(ack_msg_id) > MAX_ACK_MSG_ID_LEN:
+        return False
+
+    status = payload.get("status")
+    if status not in VALID_ACK_STATUSES:
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not sender_id:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    return True

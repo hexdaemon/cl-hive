@@ -460,7 +460,7 @@ class MCFNetwork:
         node_id: str,
         supply: int = 0,
         is_fleet_member: bool = False
-    ) -> None:
+    ) -> bool:
         """
         Add a node to the network.
 
@@ -468,9 +468,12 @@ class MCFNetwork:
             node_id: Node pubkey
             supply: Positive for source, negative for sink
             is_fleet_member: True if this is a hive member
+
+        Returns:
+            True if the node was added or already exists, False if at capacity
         """
         if len(self.nodes) >= MAX_MCF_NODES:
-            return  # Silently ignore to prevent unbounded growth
+            return node_id in self.nodes  # False if new node rejected, True if already present
 
         if node_id not in self.nodes:
             self.nodes[node_id] = MCFNode(
@@ -485,6 +488,8 @@ class MCFNetwork:
             self.nodes[node_id].supply += supply
             if is_fleet_member:
                 self.nodes[node_id].is_fleet_member = True
+
+        return True
 
     def add_edge(
         self,
@@ -516,9 +521,11 @@ class MCFNetwork:
 
         # Ensure nodes exist
         if from_node not in self.nodes:
-            self.add_node(from_node)
+            if not self.add_node(from_node):
+                return -1  # Node limit reached
         if to_node not in self.nodes:
-            self.add_node(to_node)
+            if not self.add_node(to_node):
+                return -1  # Node limit reached
 
         # Forward edge
         forward_idx = len(self.edges)

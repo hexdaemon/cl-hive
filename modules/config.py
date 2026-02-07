@@ -163,18 +163,36 @@ class HiveConfig:
     def validate(self) -> Optional[str]:
         """
         Validate configuration values.
-        
+
         Returns:
             Error message if invalid, None if valid
         """
-        if self.governance_mode not in VALID_GOVERNANCE_MODES:
-            return f"Invalid governance_mode: {self.governance_mode}. Valid: {VALID_GOVERNANCE_MODES}"
-        
+        valid_modes = ('advisor', 'failsafe')
+        if hasattr(self, 'governance_mode'):
+            mode = str(self.governance_mode).strip().lower()
+            if mode not in valid_modes:
+                return f"governance_mode must be one of {valid_modes}, got '{self.governance_mode}'"
+            self.governance_mode = mode
+
         for key, (min_val, max_val) in CONFIG_FIELD_RANGES.items():
+            if key == 'max_expansion_feerate_perkb':
+                value = getattr(self, key, None)
+                if value is not None and value != 0 and not (min_val <= value <= max_val):
+                    return f"max_expansion_feerate_perkb must be 0 (disabled) or between {min_val} and {max_val}"
+                continue
             value = getattr(self, key, None)
             if value is not None and not (min_val <= value <= max_val):
                 return f"Config {key}={value} out of range [{min_val}, {max_val}]"
-        
+
+        # Cross-field constraints
+        if self.planner_min_channel_sats > self.planner_max_channel_sats:
+            return (f"planner_min_channel_sats ({self.planner_min_channel_sats}) > "
+                    f"planner_max_channel_sats ({self.planner_max_channel_sats})")
+        if (self.planner_default_channel_sats < self.planner_min_channel_sats or
+                self.planner_default_channel_sats > self.planner_max_channel_sats):
+            return (f"planner_default_channel_sats ({self.planner_default_channel_sats}) "
+                    f"outside [{self.planner_min_channel_sats}, {self.planner_max_channel_sats}]")
+
         return None
 
 

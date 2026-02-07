@@ -34,6 +34,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # Default action expiry
 DEFAULT_ACTION_EXPIRY_HOURS = 24
 
+# Input validation bounds
+MAX_ACTION_TYPE_LEN = 64
+MAX_TARGET_LEN = 256
+
 
 # =============================================================================
 # ENUMS
@@ -164,6 +168,12 @@ class DecisionEngine:
         Returns:
             DecisionResponse with result and details
         """
+        if len(action_type) > MAX_ACTION_TYPE_LEN or len(str(target)) > MAX_TARGET_LEN:
+            return DecisionResponse(
+                result=DecisionResult.ERROR,
+                reason="action_type or target exceeds maximum length"
+            )
+
         # Create decision packet first (outside try block for better error messages)
         packet = DecisionPacket(
             action_type=action_type,
@@ -232,7 +242,7 @@ class DecisionEngine:
     # =========================================================================
 
     # Action types that can be auto-executed in failsafe mode
-    FAILSAFE_ACTION_TYPES = {'emergency_ban', 'rate_limit_peer'}
+    FAILSAFE_ACTION_TYPES = frozenset({'emergency_ban', 'rate_limit_peer'})
 
     def _handle_failsafe_mode(self, packet: DecisionPacket, cfg) -> DecisionResponse:
         """
@@ -267,6 +277,8 @@ class DecisionEngine:
 
         # Check daily budget
         amount_sats = packet.context.get('amount_sats', 0)
+        if isinstance(amount_sats, (int, float)) and amount_sats < 0:
+            amount_sats = 0
         if not self._check_budget(amount_sats, cfg):
             self._log(
                 f"Daily budget exceeded ({self._daily_spend_sats} + {amount_sats} > "

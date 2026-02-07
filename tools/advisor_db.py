@@ -22,7 +22,6 @@ Usage:
 import hashlib
 import json
 import sqlite3
-import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -453,7 +452,6 @@ class AdvisorDB:
             db_path = str(Path.home() / ".lightning" / "advisor.db")
 
         self.db_path = db_path
-        self._local = threading.local()
 
         # Ensure directory exists
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -463,19 +461,19 @@ class AdvisorDB:
 
     @contextmanager
     def _get_conn(self):
-        """Get thread-local database connection."""
-        if not hasattr(self._local, 'conn') or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self.db_path)
-            self._local.conn.row_factory = sqlite3.Row
-            # Enable WAL mode for better concurrency
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
-            self._local.conn.execute("PRAGMA synchronous=NORMAL")
-
+        """Get a fresh database connection per operation (async-safe)."""
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         try:
-            yield self._local.conn
+            yield conn
+            conn.commit()
         except Exception:
-            self._local.conn.rollback()
+            conn.rollback()
             raise
+        finally:
+            conn.close()
 
     def _init_schema(self):
         """Initialize database schema."""

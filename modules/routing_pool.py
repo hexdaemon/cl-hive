@@ -497,25 +497,36 @@ class RoutingPool:
             for c in self.db.get_pool_contributions(period)
         }
 
-        results = []
-        for member_id, amount in distributions.items():
-            share = contributions.get(member_id, 0)
+        def _record_all() -> List[PoolDistribution]:
+            results: List[PoolDistribution] = []
+            for member_id, amount in distributions.items():
+                share = contributions.get(member_id, 0)
 
-            self.db.record_pool_distribution(
-                period=period,
-                member_id=member_id,
-                contribution_share=share,
-                revenue_share_sats=amount,
-                total_pool_revenue_sats=total_revenue
-            )
+                ok = self.db.record_pool_distribution(
+                    period=period,
+                    member_id=member_id,
+                    contribution_share=share,
+                    revenue_share_sats=amount,
+                    total_pool_revenue_sats=total_revenue
+                )
+                if ok is False:
+                    raise RuntimeError(f"record_pool_distribution failed for {member_id}")
 
-            results.append(PoolDistribution(
-                member_id=member_id,
-                period=period,
-                contribution_share=share,
-                revenue_share_sats=amount,
-                total_pool_revenue_sats=total_revenue
-            ))
+                results.append(PoolDistribution(
+                    member_id=member_id,
+                    period=period,
+                    contribution_share=share,
+                    revenue_share_sats=amount,
+                    total_pool_revenue_sats=total_revenue
+                ))
+            return results
+
+        # Make the settlement atomic when using a real HiveDatabase.
+        if hasattr(self.db, "transaction"):
+            with self.db.transaction():
+                results = _record_all()
+        else:
+            results = _record_all()
 
         self._log(f"Settled {len(results)} distributions for {period}")
         return results
@@ -619,14 +630,14 @@ class RoutingPool:
     # =========================================================================
 
     def _current_period(self) -> str:
-        """Get current ISO week period string."""
-        now = datetime.datetime.now()
+        """Get current ISO week period string (UTC)."""
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         year, week, _ = now.isocalendar()
         return f"{year}-W{week:02d}"
 
     def _previous_period(self) -> str:
-        """Get previous ISO week period string."""
-        now = datetime.datetime.now()
+        """Get previous ISO week period string (UTC)."""
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         last_week = now - datetime.timedelta(days=7)
         year, week, _ = last_week.isocalendar()
         return f"{year}-W{week:02d}"

@@ -106,7 +106,7 @@ class TestRemoteIntentCacheBounds:
 
     def test_oldest_intent_evicted_on_overflow(self, intent_manager):
         """Oldest intent by timestamp should be evicted when cache is full."""
-        base_time = 1000000
+        base_time = int(time.time()) - 3600  # 1 hour ago (within 24h validation window)
 
         # Fill cache exactly to limit
         for i in range(MAX_REMOTE_INTENTS):
@@ -144,7 +144,7 @@ class TestRemoteIntentCacheBounds:
 
     def test_updating_existing_intent_does_not_evict(self, intent_manager):
         """Updating an existing intent should not trigger eviction."""
-        base_time = 1000000
+        base_time = int(time.time()) - 3600  # 1 hour ago (within 24h validation window)
 
         # Fill cache
         for i in range(MAX_REMOTE_INTENTS):
@@ -164,8 +164,8 @@ class TestRemoteIntentCacheBounds:
             intent_type='channel_open',
             target='target_00050',  # Already exists
             initiator=f'02{50:064x}'[:66],
-            timestamp=base_time + 50 + 1000,  # New timestamp
-            expires_at=base_time + 50 + 1060
+            timestamp=base_time + 50 + 100,  # New timestamp (still within validation window)
+            expires_at=base_time + 50 + 160
         )
         intent_manager.record_remote_intent(existing_intent)
 

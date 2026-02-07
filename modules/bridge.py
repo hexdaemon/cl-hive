@@ -18,6 +18,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -45,6 +46,7 @@ STARTUP_RETRY_BASE_DELAY = 1.0    # Base delay in seconds (doubles each retry)
 POLICY_RATE_LIMIT_SECONDS = 60       # Min seconds between policy changes per peer
 MAX_REBALANCE_SATS = 10_000_000      # 0.1 BTC max per single rebalance (safety cap)
 MAX_DAILY_REBALANCE_SATS = 50_000_000  # 0.5 BTC max per day (aggregate cap)
+MAX_POLICY_CACHE = 500                 # Max entries in policy rate-limit cache
 
 
 # =============================================================================
@@ -116,6 +118,7 @@ class CircuitBreaker:
         self.reset_timeout = reset_timeout
         self.half_open_success_threshold = half_open_success_threshold
 
+        self._lock = threading.RLock()
         self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._half_open_success_count = 0  # Track consecutive successes in HALF_OPEN
@@ -125,17 +128,17 @@ class CircuitBreaker:
     @property
     def state(self) -> CircuitState:
         """Get current state, checking for automatic transitions."""
-        if self._state == CircuitState.OPEN:
-            # Check if we should transition to HALF_OPEN
-            now = int(time.time())
-            if now - self._last_failure_time >= self.reset_timeout:
-                self._state = CircuitState.HALF_OPEN
-        return self._state
-    
+        with self._lock:
+            if self._state == CircuitState.OPEN:
+                now = int(time.time())
+                if now - self._last_failure_time >= self.reset_timeout:
+                    self._state = CircuitState.HALF_OPEN
+            return self._state
+
     def is_available(self) -> bool:
         """Check if requests can be made (not OPEN)."""
         return self.state != CircuitState.OPEN
-    
+
     def record_success(self) -> None:
         """
         Record a successful call.
@@ -144,50 +147,50 @@ class CircuitBreaker:
         successes before fully closing the circuit to prevent rapid flapping
         with unstable dependencies.
         """
-        self._failure_count = 0
-        self._last_success_time = int(time.time())
+        with self._lock:
+            self._failure_count = 0
+            self._last_success_time = int(time.time())
 
-        if self._state == CircuitState.HALF_OPEN:
-            self._half_open_success_count += 1
-            # Only close after multiple consecutive successes
-            if self._half_open_success_count >= self.half_open_success_threshold:
-                self._state = CircuitState.CLOSED
+            if self._state == CircuitState.HALF_OPEN:
+                self._half_open_success_count += 1
+                if self._half_open_success_count >= self.half_open_success_threshold:
+                    self._state = CircuitState.CLOSED
+                    self._half_open_success_count = 0
+            else:
                 self._half_open_success_count = 0
-        else:
-            # Reset counter when in CLOSED state
-            self._half_open_success_count = 0
-    
+
     def record_failure(self) -> None:
         """Record a failed call."""
-        self._failure_count += 1
-        self._last_failure_time = int(time.time())
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = int(time.time())
 
-        if self._state == CircuitState.HALF_OPEN:
-            # Probe failed, re-open the circuit and reset success counter
-            self._state = CircuitState.OPEN
-            self._half_open_success_count = 0
-        elif self._failure_count >= self.max_failures:
-            # Too many failures, open the circuit
-            self._state = CircuitState.OPEN
-    
+            if self._state == CircuitState.HALF_OPEN:
+                self._state = CircuitState.OPEN
+                self._half_open_success_count = 0
+            elif self._failure_count >= self.max_failures:
+                self._state = CircuitState.OPEN
+
     def reset(self) -> None:
         """Reset circuit breaker to initial state."""
-        self._state = CircuitState.CLOSED
-        self._failure_count = 0
-        self._half_open_success_count = 0
-        self._last_failure_time = 0
-    
+        with self._lock:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._half_open_success_count = 0
+            self._last_failure_time = 0
+
     def get_stats(self) -> Dict[str, Any]:
         """Get circuit breaker statistics."""
-        return {
-            "name": self.name,
-            "state": self.state.value,
-            "failure_count": self._failure_count,
-            "max_failures": self.max_failures,
-            "reset_timeout": self.reset_timeout,
-            "last_failure_ago": int(time.time()) - self._last_failure_time if self._last_failure_time else None,
-            "last_success_ago": int(time.time()) - self._last_success_time if self._last_success_time else None
-        }
+        with self._lock:
+            return {
+                "name": self.name,
+                "state": self.state.value,
+                "failure_count": self._failure_count,
+                "max_failures": self.max_failures,
+                "reset_timeout": self.reset_timeout,
+                "last_failure_ago": int(time.time()) - self._last_failure_time if self._last_failure_time else None,
+                "last_success_ago": int(time.time()) - self._last_success_time if self._last_success_time else None
+            }
 
 
 # =============================================================================
@@ -242,6 +245,7 @@ class Bridge:
         self._policy_last_change: Dict[str, float] = {}  # peer_id -> timestamp
         self._daily_rebalance_sats = 0  # Aggregate rebalance amount today
         self._daily_rebalance_reset = 0  # Timestamp of last daily reset
+        self._budget_lock = threading.Lock()
 
     def _resolve_rpc_socket(self) -> Optional[str]:
         """Resolve the Core Lightning RPC socket path if available."""
@@ -415,6 +419,7 @@ class Bridge:
             patch = int(match.group(3)) if match.group(3) else 0
             return (major, minor, patch)
         
+        self._log(f"Could not parse version string: {version_str}", level="debug")
         return (0, 0, 0)
     
     # =========================================================================
@@ -520,6 +525,7 @@ class Bridge:
             self._log(f"RPC call {method} timed out: {e}", level='warn')
             raise
         except Exception as e:
+            cb.record_failure()
             self._log(f"RPC call {method} failed: {e}", level='warn')
             raise
     
@@ -579,7 +585,10 @@ class Bridge:
 
             success = result.get("status") == "success"
             if success:
-                self._policy_last_change[peer_id] = now  # Update rate limit tracker
+                self._policy_last_change[peer_id] = now
+                if len(self._policy_last_change) > MAX_POLICY_CACHE:
+                    oldest_key = min(self._policy_last_change, key=self._policy_last_change.get)
+                    del self._policy_last_change[oldest_key]
                 self._log(f"Set {'hive' if is_member else 'dynamic'} policy for {peer_id[:16]}...")
             else:
                 self._log(f"Policy set returned: {result}", level='warn')
@@ -663,28 +672,38 @@ class Bridge:
             self._log(f"Failed to verify fees for {peer_id[:16]}...: {e}", level='debug')
             return (False, f"error: {e}")
 
-    def _check_daily_rebalance_budget(self, amount_sats: int) -> bool:
+    def _check_and_reserve_daily_rebalance_budget(self, amount_sats: int) -> bool:
         """
-        Check if rebalance fits within daily budget.
+        Atomically check and reserve rebalance budget within daily limit.
 
         Resets the daily counter if a new day has started (UTC).
+        Uses _budget_lock to prevent TOCTOU races.
 
         Args:
-            amount_sats: Amount to check
+            amount_sats: Amount to check and reserve
 
         Returns:
-            True if within budget, False if would exceed
+            True if within budget (amount reserved), False if would exceed
         """
-        now = time.time()
-        # Reset daily counter at midnight UTC
-        current_day = int(now // 86400)
-        last_reset_day = int(self._daily_rebalance_reset // 86400) if self._daily_rebalance_reset else 0
+        with self._budget_lock:
+            now = time.time()
+            current_day = int(now // 86400)
+            last_reset_day = int(self._daily_rebalance_reset // 86400) if self._daily_rebalance_reset else 0
 
-        if current_day > last_reset_day:
-            self._daily_rebalance_sats = 0
-            self._daily_rebalance_reset = now
+            if current_day > last_reset_day:
+                self._daily_rebalance_sats = 0
+                self._daily_rebalance_reset = now
 
-        return (self._daily_rebalance_sats + amount_sats) <= MAX_DAILY_REBALANCE_SATS
+            if (self._daily_rebalance_sats + amount_sats) > MAX_DAILY_REBALANCE_SATS:
+                return False
+
+            self._daily_rebalance_sats += amount_sats
+            return True
+
+    def _release_daily_rebalance_budget(self, amount_sats: int) -> None:
+        """Release previously reserved daily rebalance budget on failure."""
+        with self._budget_lock:
+            self._daily_rebalance_sats = max(0, self._daily_rebalance_sats - amount_sats)
 
     def trigger_rebalance(self, target_peer: str, amount_sats: int,
                           source_peer: str) -> bool:
@@ -726,7 +745,7 @@ class Bridge:
             )
             return False
 
-        if not self._check_daily_rebalance_budget(amount_sats):
+        if not self._check_and_reserve_daily_rebalance_budget(amount_sats):
             self._log(
                 f"Rebalance rejected: would exceed daily limit of "
                 f"{MAX_DAILY_REBALANCE_SATS} sats (current: {self._daily_rebalance_sats})",
@@ -738,12 +757,14 @@ class Bridge:
         target_scid = self._get_channel_scid(target_peer)
         if not target_scid:
             self._log(f"No active channel found for target peer {target_peer[:16]}...")
+            self._release_daily_rebalance_budget(amount_sats)
             return False
 
         # Look up source channel SCID (required)
         source_scid = self._get_channel_scid(source_peer)
         if not source_scid:
             self._log(f"No active channel found for source peer {source_peer[:16]}...")
+            self._release_daily_rebalance_budget(amount_sats)
             return False
 
         try:
@@ -755,14 +776,17 @@ class Bridge:
 
             success = result.get("status") in ("success", "initiated", "pending")
             if success:
-                self._daily_rebalance_sats += amount_sats  # Track for daily budget
                 self._log(f"Rebalance initiated: {amount_sats} sats {source_scid} -> {target_scid}")
+            else:
+                self._release_daily_rebalance_budget(amount_sats)
 
             return success
 
         except CircuitOpenError:
+            self._release_daily_rebalance_budget(amount_sats)
             return False
         except Exception as e:
+            self._release_daily_rebalance_budget(amount_sats)
             self._log(f"Rebalance failed: {e}", level='warn')
             return False
     

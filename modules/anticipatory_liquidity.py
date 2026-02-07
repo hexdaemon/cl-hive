@@ -18,6 +18,7 @@ Author: Lightning Goats Team
 """
 
 import math
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -63,6 +64,7 @@ SATURATION_PCT_THRESHOLD = 0.80       # >80% local = saturation risk
 # Fleet coordination
 MAX_PREDICTIONS_PER_CHANNEL = 5       # Max predictions cached per channel
 PREDICTION_STALE_HOURS = 1            # Refresh predictions hourly
+MAX_FLOW_HISTORY_CHANNELS = 500
 
 # =============================================================================
 # INTRA-DAY PATTERN DETECTION SETTINGS (Kalman-Enhanced)
@@ -531,6 +533,9 @@ class AnticipatoryLiquidityManager:
         self.state_manager = state_manager
         self.our_id = our_id
 
+        # Lock protecting in-memory caches
+        self._lock = threading.Lock()
+
         # In-memory caches
         self._pattern_cache: Dict[str, List[TemporalPattern]] = {}
         self._prediction_cache: Dict[str, LiquidityPrediction] = {}
@@ -585,7 +590,7 @@ class AnticipatoryLiquidityManager:
             timestamp: Observation timestamp (defaults to now)
         """
         ts = timestamp or int(time.time())
-        dt = datetime.fromtimestamp(ts)
+        dt = datetime.utcfromtimestamp(ts)
 
         sample = HourlyFlowSample(
             channel_id=channel_id,
@@ -599,6 +604,20 @@ class AnticipatoryLiquidityManager:
 
         # Add to in-memory history
         self._flow_history[channel_id].append(sample)
+
+        # Evict oldest channel if dict exceeds limit
+        if len(self._flow_history) > MAX_FLOW_HISTORY_CHANNELS:
+            oldest_cid = None
+            oldest_ts = float('inf')
+            for cid, samples_list in self._flow_history.items():
+                if cid == channel_id:
+                    continue
+                last_ts = samples_list[-1].timestamp if samples_list else 0
+                if last_ts < oldest_ts:
+                    oldest_ts = last_ts
+                    oldest_cid = cid
+            if oldest_cid:
+                del self._flow_history[oldest_cid]
 
         # Trim old samples (keep PATTERN_WINDOW_DAYS)
         cutoff = ts - (PATTERN_WINDOW_DAYS * 24 * 3600)
@@ -785,6 +804,7 @@ class AnticipatoryLiquidityManager:
                     sum(abs(f - avg_flow) for f in flows) /
                     (len(flows) * avg_magnitude)
                 )
+                consistency = max(0.0, consistency)
             else:
                 consistency = 0.0
 
@@ -856,6 +876,7 @@ class AnticipatoryLiquidityManager:
                     sum(abs(f - avg_flow) for f in flows) /
                     (len(flows) * avg_magnitude)
                 )
+                consistency = max(0.0, consistency)
             else:
                 consistency = 0.0
 
@@ -967,7 +988,7 @@ class AnticipatoryLiquidityManager:
         # Group by day of month
         monthly_flows: Dict[int, List[int]] = defaultdict(list)
         for sample in samples:
-            dt = datetime.fromtimestamp(sample.timestamp)
+            dt = datetime.utcfromtimestamp(sample.timestamp)
             day_of_month = dt.day
             monthly_flows[day_of_month].append(sample.net_flow_sats)
 
@@ -1005,6 +1026,7 @@ class AnticipatoryLiquidityManager:
                     sum(abs(f - avg_flow) for f in flows) /
                     (len(flows) * avg_magnitude)
                 )
+                consistency = max(0.0, consistency)
             else:
                 consistency = 0.0
 
@@ -1074,6 +1096,7 @@ class AnticipatoryLiquidityManager:
             sum(abs(f - avg_flow) for f in eom_flows) /
             (len(eom_flows) * avg_magnitude)
         )
+        consistency = max(0.0, consistency)
         confidence = min(0.75, max(0.0, consistency * (len(eom_flows) / 10)))
 
         if confidence < 0.45:
@@ -1314,7 +1337,7 @@ class AnticipatoryLiquidityManager:
             return None
 
         # Determine current phase
-        now = datetime.now()
+        now = datetime.utcnow()
         current_hour = now.hour
         current_phase = self._get_phase_for_hour(current_hour)
         next_phase = self._get_next_phase(current_phase)
@@ -1560,7 +1583,7 @@ class AnticipatoryLiquidityManager:
         patterns = self.detect_patterns(channel_id)
 
         # Find matching pattern for prediction window
-        target_time = datetime.fromtimestamp(time.time() + hours_ahead * 3600)
+        target_time = datetime.utcfromtimestamp(time.time() + hours_ahead * 3600)
         target_hour = target_time.hour
         target_day = target_time.weekday()
 
@@ -2401,6 +2424,7 @@ class AnticipatoryLiquidityManager:
         # Convert inputs to proper types (RPC may pass strings)
         try:
             velocity_pct_per_hour = float(velocity_pct_per_hour)
+            velocity_pct_per_hour = max(-1.0, min(1.0, velocity_pct_per_hour))
             uncertainty = float(uncertainty)
             flow_ratio = float(flow_ratio)
             confidence = float(confidence)

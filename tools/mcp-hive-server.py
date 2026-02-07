@@ -49,6 +49,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import ssl
 import sys
 import threading
@@ -58,6 +59,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+from urllib.parse import urlparse
 
 # Add tools directory to path for advisor_db import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -79,14 +81,46 @@ logger = logging.getLogger("mcp-hive")
 # Goat Feeder configuration
 # Revenue is tracked via LNbits API - payments with "⚡CyberHerd Treats⚡" in memo
 GOAT_FEEDER_PATTERN = "⚡CyberHerd Treats⚡"
-LNBITS_URL = "http://127.0.0.1:3002"
-LNBITS_INVOICE_KEY = "ac0dcb0cdab94f72b757d0f3aa85d08a"
+LNBITS_URL = os.environ.get("LNBITS_URL", "http://127.0.0.1:3002")
+LNBITS_INVOICE_KEY = os.environ.get("LNBITS_INVOICE_KEY", "")
+LNBITS_ALLOW_INSECURE = os.environ.get("LNBITS_ALLOW_INSECURE", "false").lower() == "true"
+LNBITS_TIMEOUT_SECS = float(os.environ.get("LNBITS_TIMEOUT_SECS", "10"))
 
 # =============================================================================
 # Strategy Prompt Loading
 # =============================================================================
 
 STRATEGY_DIR = os.environ.get('HIVE_STRATEGY_DIR', '')
+STRATEGY_MAX_CHARS = int(os.environ.get("HIVE_STRATEGY_MAX_CHARS", "4000"))
+
+# TLS safety controls
+HIVE_ALLOW_INSECURE_TLS = os.environ.get("HIVE_ALLOW_INSECURE_TLS", "false").lower() == "true"
+# Allow cleartext REST to non-local hosts (not recommended)
+HIVE_ALLOW_INSECURE_HTTP = os.environ.get("HIVE_ALLOW_INSECURE_HTTP", "false").lower() == "true"
+# Normalize tool responses (wrap in ok/data or ok/error)
+HIVE_NORMALIZE_RESPONSES = os.environ.get("HIVE_NORMALIZE_RESPONSES", "true").lower() == "true"
+
+# Configurable timeouts
+HIVE_HTTP_TIMEOUT = float(os.environ.get("HIVE_HTTP_TIMEOUT", "30"))
+HIVE_DOCKER_TIMEOUT = float(os.environ.get("HIVE_DOCKER_TIMEOUT", "30"))
+
+# Optional RPC method allowlist (path to JSON file with list of allowed methods)
+HIVE_ALLOWED_METHODS_FILE = os.environ.get("HIVE_ALLOWED_METHODS")
+_allowed_methods: Optional[set] = None
+
+
+def _check_method_allowed(method: str) -> bool:
+    """Check if an RPC method is allowed by the optional allowlist."""
+    global _allowed_methods
+    if _allowed_methods is None:
+        if not HIVE_ALLOWED_METHODS_FILE:
+            return True  # No allowlist = allow all
+        try:
+            with open(HIVE_ALLOWED_METHODS_FILE) as f:
+                _allowed_methods = set(json.load(f))
+        except Exception:
+            return False
+    return method in _allowed_methods
 
 
 def load_strategy(name: str) -> str:
@@ -103,15 +137,28 @@ def load_strategy(name: str) -> str:
         Content of the strategy file, or empty string
     """
     if not STRATEGY_DIR:
+        logger.debug(f"Strategy dir not set; skipping strategy load for {name}")
+        return ""
+    # Reject names with path traversal characters
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        logger.warning(f"Strategy name rejected (invalid chars): {name!r}")
         return ""
     path = os.path.join(STRATEGY_DIR, f"{name}.md")
+    # Resolve and enforce directory boundary
+    resolved = os.path.realpath(path)
+    strategy_root = os.path.realpath(STRATEGY_DIR)
+    if not resolved.startswith(strategy_root + os.sep) and resolved != strategy_root:
+        logger.warning(f"Strategy path escaped directory: {name!r}")
+        return ""
     try:
-        with open(path, 'r') as f:
+        with open(resolved, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read().strip()
+            if len(content) > STRATEGY_MAX_CHARS:
+                content = content[:STRATEGY_MAX_CHARS].rstrip() + "\n\n[truncated]"
             logger.debug(f"Loaded strategy prompt: {name}")
             return "\n\n" + content
     except FileNotFoundError:
-        logger.debug(f"Strategy file not found: {path}")
+        logger.debug(f"Strategy file not found: {resolved}")
         return ""
     except Exception as e:
         logger.warning(f"Error loading strategy {name}: {e}")
@@ -121,6 +168,50 @@ def load_strategy(name: str) -> str:
 # =============================================================================
 # Node Connection
 # =============================================================================
+
+def _is_local_host(hostname: str) -> bool:
+    return hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def _validate_lnbits_config() -> Optional[str]:
+    parsed = urlparse(LNBITS_URL)
+    if not parsed.scheme or not parsed.netloc:
+        return "LNBITS_URL is invalid or missing a scheme/host."
+    if parsed.scheme != "https" and not _is_local_host(parsed.hostname or ""):
+        if not LNBITS_ALLOW_INSECURE:
+            return "LNBITS_URL must use https for non-localhost targets."
+    return None
+
+
+def _validate_node_config(node_config: Dict, node_mode: str) -> Optional[str]:
+    name = node_config.get("name")
+    if not name:
+        return "Node missing required 'name' field."
+
+    if node_mode == "docker":
+        if not node_config.get("docker_container"):
+            return f"Node '{name}' is docker mode but missing docker_container."
+        return None
+
+    rest_url = node_config.get("rest_url")
+    rune = node_config.get("rune")
+    if not rest_url:
+        return f"Node '{name}' is rest mode but missing rest_url."
+    if not rune:
+        return f"Node '{name}' is rest mode but missing rune."
+    parsed = urlparse(rest_url)
+    if not parsed.scheme or not parsed.netloc:
+        return f"Node '{name}' has invalid rest_url."
+    if parsed.scheme == "http" and not _is_local_host(parsed.hostname or "") and not HIVE_ALLOW_INSECURE_HTTP:
+        return f"Node '{name}' uses http for non-local host. Set HIVE_ALLOW_INSECURE_HTTP=true to override."
+    return None
+
+
+def _normalize_response(result: Any) -> Dict[str, Any]:
+    if isinstance(result, dict) and "error" in result:
+        return {"ok": False, "error": result.get("error"), "details": result}
+    return {"ok": True, "data": result}
+
 
 @dataclass
 class NodeConnection:
@@ -146,11 +237,28 @@ class NodeConnection:
             ssl_context = ssl.create_default_context()
             ssl_context.load_verify_locations(self.ca_cert)
 
+        verify: Any
+        if ssl_context:
+            verify = ssl_context
+        else:
+            if self.rest_url.startswith("https://"):
+                if not HIVE_ALLOW_INSECURE_TLS:
+                    raise ValueError(
+                        f"TLS verification required for {self.name} but no ca_cert configured. "
+                        "Set HIVE_ALLOW_INSECURE_TLS=true to override (not recommended)."
+                    )
+                logger.warning(
+                    "TLS verification disabled for %s (no ca_cert configured).",
+                    self.name
+                )
+            verify = False
+
+        # SECURITY: Never log self.rune or request headers containing it
         self.client = httpx.AsyncClient(
             base_url=self.rest_url,
             headers={"Rune": self.rune},
-            verify=ssl_context if ssl_context else False,
-            timeout=30.0
+            verify=verify,
+            timeout=HIVE_HTTP_TIMEOUT
         )
         logger.info(f"Connected to {self.name} at {self.rest_url}")
 
@@ -161,6 +269,9 @@ class NodeConnection:
 
     async def call(self, method: str, params: Dict = None) -> Dict:
         """Call a CLN RPC method via REST or docker exec."""
+        if not _check_method_allowed(method):
+            return {"error": f"Method '{method}' not in allowlist"}
+
         # Docker exec mode (for Polar)
         if self.docker_container:
             return await self._call_docker(method, params)
@@ -176,14 +287,20 @@ class NodeConnection:
             )
             response.raise_for_status()
             return response.json()
+        except httpx.HTTPStatusError as e:
+            body = {}
+            try:
+                body = e.response.json()
+            except Exception:
+                body = {"error": e.response.text.strip()} if e.response.text else {}
+            logger.error(f"RPC error on {self.name}: {e}")
+            return {"error": str(e), "details": body}
         except httpx.HTTPError as e:
             logger.error(f"RPC error on {self.name}: {e}")
             return {"error": str(e)}
 
     async def _call_docker(self, method: str, params: Dict = None) -> Dict:
         """Call CLN via docker exec (for Polar testing)."""
-        import subprocess
-
         # Build command
         cmd = [
             "docker", "exec", self.docker_container,
@@ -206,16 +323,22 @@ class NodeConnection:
                     cmd.append(f"{key}={json.dumps(value)}")
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if result.returncode != 0:
-                return {"error": result.stderr.strip()}
-            return json.loads(result.stdout) if result.stdout.strip() else {}
-        except subprocess.TimeoutExpired:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=HIVE_DOCKER_TIMEOUT
+            )
+            if proc.returncode != 0:
+                return {"error": stderr.decode().strip()[:500]}
+            return json.loads(stdout.decode()) if stdout.strip() else {}
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
             return {"error": "Command timed out"}
         except json.JSONDecodeError as e:
             return {"error": f"Invalid JSON response: {e}"}
@@ -228,6 +351,8 @@ class HiveFleet:
 
     def __init__(self):
         self.nodes: Dict[str, NodeConnection] = {}
+        self._node_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._max_concurrent_per_node = 5
 
     def load_config(self, config_path: str):
         """Load node configuration from JSON file.
@@ -252,9 +377,17 @@ class HiveFleet:
         global_network = config.get("network", "regtest")
         global_lightning_dir = config.get("lightning_dir", "/home/clightning/.lightning")
 
+        seen_names = set()
         for node_config in config.get("nodes", []):
             # Per-node mode overrides global mode
             node_mode = node_config.get("mode", global_mode)
+            error = _validate_node_config(node_config, node_mode)
+            if error:
+                raise ValueError(error)
+            name = node_config.get("name")
+            if name in seen_names:
+                raise ValueError(f"Duplicate node name '{name}' in config.")
+            seen_names.add(name)
 
             if node_mode == "docker":
                 # Docker exec mode
@@ -273,6 +406,7 @@ class HiveFleet:
                     ca_cert=node_config.get("ca_cert")
                 )
             self.nodes[node.name] = node
+            self._node_semaphores[node.name] = asyncio.Semaphore(self._max_concurrent_per_node)
 
         logger.info(f"Loaded {len(self.nodes)} nodes from config (global_mode={global_mode})")
 
@@ -293,12 +427,51 @@ class HiveFleet:
         """Get a node by name."""
         return self.nodes.get(name)
 
-    async def call_all(self, method: str, params: Dict = None) -> Dict[str, Any]:
-        """Call an RPC method on all nodes."""
-        results = {}
-        for name, node in self.nodes.items():
-            results[name] = await node.call(method, params)
-        return results
+    async def call_all(self, method: str, params: Dict = None, timeout: float = 30.0) -> Dict[str, Any]:
+        """Call an RPC method on all nodes in parallel."""
+        async def call_with_timeout(name: str, node: NodeConnection) -> tuple:
+            sem = self._node_semaphores.get(name)
+            try:
+                if sem:
+                    async with sem:
+                        result = await asyncio.wait_for(node.call(method, params), timeout=timeout)
+                else:
+                    result = await asyncio.wait_for(node.call(method, params), timeout=timeout)
+                return (name, result)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout calling {method} on {name}")
+                return (name, {"error": f"Timeout after {timeout}s"})
+            except Exception as e:
+                logger.error(f"Error calling {method} on {name}: {e}")
+                return (name, {"error": str(e)})
+
+        tasks = [call_with_timeout(name, node) for name, node in self.nodes.items()]
+        results_list = await asyncio.gather(*tasks)
+        return dict(results_list)
+    
+    async def health_check(self, timeout: float = 5.0) -> Dict[str, Any]:
+        """Quick health check on all nodes - returns status without heavy operations."""
+        async def check_node(name: str, node: NodeConnection) -> tuple:
+            try:
+                start = asyncio.get_running_loop().time()
+                result = await asyncio.wait_for(node.call("getinfo"), timeout=timeout)
+                latency = asyncio.get_running_loop().time() - start
+                if "error" in result:
+                    return (name, {"status": "error", "error": result["error"]})
+                return (name, {
+                    "status": "healthy",
+                    "latency_ms": round(latency * 1000),
+                    "alias": result.get("alias", "unknown"),
+                    "blockheight": result.get("blockheight", 0)
+                })
+            except asyncio.TimeoutError:
+                return (name, {"status": "timeout", "error": f"No response in {timeout}s"})
+            except Exception as e:
+                return (name, {"status": "error", "error": str(e)})
+        
+        tasks = [check_node(name, node) for name, node in self.nodes.items()]
+        results_list = await asyncio.gather(*tasks)
+        return dict(results_list)
 
 
 # Global fleet instance
@@ -320,6 +493,128 @@ server = Server("hive-fleet-manager")
 async def list_tools() -> List[Tool]:
     """List available tools for Hive management."""
     return [
+        Tool(
+            name="hive_health",
+            description="Quick health check on all nodes. Returns status, latency, and basic info without heavy operations. Use this for fast connectivity checks.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "timeout": {
+                        "type": "number",
+                        "description": "Timeout in seconds per node (default: 5)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="hive_fleet_snapshot",
+            description="Consolidated fleet snapshot for quick monitoring. Returns node health, channel stats, 24h routing stats, pending actions, and top issues.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Specific node name (optional, defaults to all nodes)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="hive_anomalies",
+            description="Detect anomalies outside normal ranges (revenue drops, drain patterns, peer disconnects).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Specific node name (optional, defaults to all nodes)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="hive_compare_periods",
+            description="Compare routing performance across two periods with channel-level improvements/degradations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (required)"
+                    },
+                    "period1_days": {
+                        "type": "integer",
+                        "description": "Days for period 1 (default: 7)"
+                    },
+                    "period2_days": {
+                        "type": "integer",
+                        "description": "Days for period 2 (default: 7)"
+                    },
+                    "offset_days": {
+                        "type": "integer",
+                        "description": "Days offset for period 2 end (default: 7)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_channel_deep_dive",
+            description="Get comprehensive context for a channel or peer (balances, profitability, flow, fees, forwards, issues).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel short ID"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Peer pubkey"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_recommended_actions",
+            description="Return prioritized recommended actions with reasoning and estimated effort.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, defaults to all nodes)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max actions to return (default: 10)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="hive_peer_search",
+            description="Search peers by alias substring (case-insensitive).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Alias substring to search for"
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, defaults to all nodes)"
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
         Tool(
             name="hive_status",
             description="Get status of all Hive nodes in the fleet. Shows membership, health, and pending actions.",
@@ -1376,7 +1671,7 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                         "description": "Configuration key (for get/set/reset)"
                     },
                     "value": {
-                        "type": "string",
+                        "type": ["string", "number", "boolean"],
                         "description": "New value (for set action)"
                     }
                 },
@@ -3282,307 +3577,21 @@ Provides comprehensive view of MCF optimizer health including:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
-    """Handle tool calls."""
-
+    """Handle tool calls via registry dispatch."""
     try:
-        if name == "hive_status":
-            result = await handle_hive_status(arguments)
-        elif name == "hive_pending_actions":
-            result = await handle_pending_actions(arguments)
-        elif name == "hive_approve_action":
-            result = await handle_approve_action(arguments)
-        elif name == "hive_reject_action":
-            result = await handle_reject_action(arguments)
-        elif name == "hive_members":
-            result = await handle_members(arguments)
-        elif name == "hive_onboard_new_members":
-            result = await handle_onboard_new_members(arguments)
-        elif name == "hive_propose_promotion":
-            result = await handle_propose_promotion(arguments)
-        elif name == "hive_vote_promotion":
-            result = await handle_vote_promotion(arguments)
-        elif name == "hive_pending_promotions":
-            result = await handle_pending_promotions(arguments)
-        elif name == "hive_execute_promotion":
-            result = await handle_execute_promotion(arguments)
-        elif name == "hive_node_info":
-            result = await handle_node_info(arguments)
-        elif name == "hive_channels":
-            result = await handle_channels(arguments)
-        elif name == "hive_set_fees":
-            result = await handle_set_fees(arguments)
-        elif name == "hive_topology_analysis":
-            result = await handle_topology_analysis(arguments)
-        elif name == "hive_planner_ignore":
-            result = await handle_planner_ignore(arguments)
-        elif name == "hive_planner_unignore":
-            result = await handle_planner_unignore(arguments)
-        elif name == "hive_planner_ignored_peers":
-            result = await handle_planner_ignored_peers(arguments)
-        elif name == "hive_governance_mode":
-            result = await handle_governance_mode(arguments)
-        elif name == "hive_expansion_mode":
-            result = await handle_expansion_mode(arguments)
-        elif name == "hive_bump_version":
-            result = await handle_bump_version(arguments)
-        elif name == "hive_gossip_stats":
-            result = await handle_gossip_stats(arguments)
-        # Splice coordination tools
-        elif name == "hive_splice_check":
-            result = await handle_splice_check(arguments)
-        elif name == "hive_splice_recommendations":
-            result = await handle_splice_recommendations(arguments)
-        elif name == "hive_splice":
-            result = await handle_splice(arguments)
-        elif name == "hive_splice_status":
-            result = await handle_splice_status(arguments)
-        elif name == "hive_splice_abort":
-            result = await handle_splice_abort(arguments)
-        elif name == "hive_liquidity_intelligence":
-            result = await handle_liquidity_intelligence(arguments)
-        # Anticipatory Liquidity tools (Phase 7.1)
-        elif name == "hive_anticipatory_status":
-            result = await handle_anticipatory_status(arguments)
-        elif name == "hive_detect_patterns":
-            result = await handle_detect_patterns(arguments)
-        elif name == "hive_predict_liquidity":
-            result = await handle_predict_liquidity(arguments)
-        elif name == "hive_anticipatory_predictions":
-            result = await handle_anticipatory_predictions(arguments)
-        # Time-Based Fee tools (Phase 7.4)
-        elif name == "hive_time_fee_status":
-            result = await handle_time_fee_status(arguments)
-        elif name == "hive_time_fee_adjustment":
-            result = await handle_time_fee_adjustment(arguments)
-        elif name == "hive_time_peak_hours":
-            result = await handle_time_peak_hours(arguments)
-        elif name == "hive_time_low_hours":
-            result = await handle_time_low_hours(arguments)
-        # Routing Intelligence tools (Pheromones + Stigmergic Markers)
-        elif name == "hive_backfill_routing_intelligence":
-            result = await handle_backfill_routing_intelligence(arguments)
-        elif name == "hive_routing_intelligence_status":
-            result = await handle_routing_intelligence_status(arguments)
-        # cl-revenue-ops tools
-        elif name == "revenue_status":
-            result = await handle_revenue_status(arguments)
-        elif name == "revenue_profitability":
-            result = await handle_revenue_profitability(arguments)
-        elif name == "revenue_dashboard":
-            result = await handle_revenue_dashboard(arguments)
-        elif name == "revenue_portfolio":
-            result = await handle_revenue_portfolio(arguments)
-        elif name == "revenue_portfolio_summary":
-            result = await handle_revenue_portfolio_summary(arguments)
-        elif name == "revenue_portfolio_rebalance":
-            result = await handle_revenue_portfolio_rebalance(arguments)
-        elif name == "revenue_portfolio_correlations":
-            result = await handle_revenue_portfolio_correlations(arguments)
-        elif name == "revenue_policy":
-            result = await handle_revenue_policy(arguments)
-        elif name == "revenue_set_fee":
-            result = await handle_revenue_set_fee(arguments)
-        elif name == "revenue_rebalance":
-            result = await handle_revenue_rebalance(arguments)
-        elif name == "revenue_report":
-            result = await handle_revenue_report(arguments)
-        elif name == "revenue_config":
-            result = await handle_revenue_config(arguments)
-        elif name == "revenue_debug":
-            result = await handle_revenue_debug(arguments)
-        elif name == "revenue_history":
-            result = await handle_revenue_history(arguments)
-        elif name == "revenue_outgoing":
-            result = await handle_revenue_outgoing(arguments)
-        elif name == "revenue_competitor_analysis":
-            result = await handle_revenue_competitor_analysis(arguments)
-        elif name == "goat_feeder_history":
-            result = await handle_goat_feeder_history(arguments)
-        elif name == "goat_feeder_trends":
-            result = await handle_goat_feeder_trends(arguments)
-        # Advisor database tools
-        elif name == "advisor_record_snapshot":
-            result = await handle_advisor_record_snapshot(arguments)
-        elif name == "advisor_get_trends":
-            result = await handle_advisor_get_trends(arguments)
-        elif name == "advisor_get_velocities":
-            result = await handle_advisor_get_velocities(arguments)
-        elif name == "advisor_get_channel_history":
-            result = await handle_advisor_get_channel_history(arguments)
-        elif name == "advisor_record_decision":
-            result = await handle_advisor_record_decision(arguments)
-        elif name == "advisor_get_recent_decisions":
-            result = await handle_advisor_get_recent_decisions(arguments)
-        elif name == "advisor_db_stats":
-            result = await handle_advisor_db_stats(arguments)
-        # New advisor intelligence tools
-        elif name == "advisor_get_context_brief":
-            result = await handle_advisor_get_context_brief(arguments)
-        elif name == "advisor_check_alert":
-            result = await handle_advisor_check_alert(arguments)
-        elif name == "advisor_record_alert":
-            result = await handle_advisor_record_alert(arguments)
-        elif name == "advisor_resolve_alert":
-            result = await handle_advisor_resolve_alert(arguments)
-        elif name == "advisor_get_peer_intel":
-            result = await handle_advisor_get_peer_intel(arguments)
-        elif name == "advisor_measure_outcomes":
-            result = await handle_advisor_measure_outcomes(arguments)
-        # Proactive Advisor tools
-        elif name == "advisor_run_cycle":
-            result = await handle_advisor_run_cycle(arguments)
-        elif name == "advisor_run_cycle_all":
-            result = await handle_advisor_run_cycle_all(arguments)
-        elif name == "advisor_get_goals":
-            result = await handle_advisor_get_goals(arguments)
-        elif name == "advisor_set_goal":
-            result = await handle_advisor_set_goal(arguments)
-        elif name == "advisor_get_learning":
-            result = await handle_advisor_get_learning(arguments)
-        elif name == "advisor_get_status":
-            result = await handle_advisor_get_status(arguments)
-        elif name == "advisor_get_cycle_history":
-            result = await handle_advisor_get_cycle_history(arguments)
-        elif name == "advisor_scan_opportunities":
-            result = await handle_advisor_scan_opportunities(arguments)
-        # Routing Pool tools
-        elif name == "pool_status":
-            result = await handle_pool_status(arguments)
-        elif name == "pool_member_status":
-            result = await handle_pool_member_status(arguments)
-        elif name == "pool_distribution":
-            result = await handle_pool_distribution(arguments)
-        elif name == "pool_snapshot":
-            result = await handle_pool_snapshot(arguments)
-        elif name == "pool_settle":
-            result = await handle_pool_settle(arguments)
-        # Phase 1: Yield Metrics tools
-        elif name == "yield_metrics":
-            result = await handle_yield_metrics(arguments)
-        elif name == "yield_summary":
-            result = await handle_yield_summary(arguments)
-        elif name == "velocity_prediction":
-            result = await handle_velocity_prediction(arguments)
-        elif name == "critical_velocity":
-            result = await handle_critical_velocity(arguments)
-        elif name == "internal_competition":
-            result = await handle_internal_competition(arguments)
-        # Kalman Velocity Integration tools
-        elif name == "kalman_velocity_query":
-            result = await handle_kalman_velocity_query(arguments)
-        # Phase 2: Fee Coordination tools
-        elif name == "coord_fee_recommendation":
-            result = await handle_coord_fee_recommendation(arguments)
-        elif name == "corridor_assignments":
-            result = await handle_corridor_assignments(arguments)
-        elif name == "stigmergic_markers":
-            result = await handle_stigmergic_markers(arguments)
-        elif name == "defense_status":
-            result = await handle_defense_status(arguments)
-        elif name == "ban_candidates":
-            result = await handle_ban_candidates(arguments)
-        elif name == "accumulated_warnings":
-            result = await handle_accumulated_warnings(arguments)
-        elif name == "pheromone_levels":
-            result = await handle_pheromone_levels(arguments)
-        elif name == "fee_coordination_status":
-            result = await handle_fee_coordination_status(arguments)
-        # Phase 3: Cost Reduction tools
-        elif name == "rebalance_recommendations":
-            result = await handle_rebalance_recommendations(arguments)
-        elif name == "fleet_rebalance_path":
-            result = await handle_fleet_rebalance_path(arguments)
-        elif name == "circular_flow_status":
-            result = await handle_circular_flow_status(arguments)
-        elif name == "execute_hive_circular_rebalance":
-            result = await handle_execute_hive_circular_rebalance(arguments)
-        elif name == "cost_reduction_status":
-            result = await handle_cost_reduction_status(arguments)
-        # Routing Intelligence tools
-        elif name == "routing_stats":
-            result = await handle_routing_stats(arguments)
-        elif name == "route_suggest":
-            result = await handle_route_suggest(arguments)
-        # Channel Rationalization tools
-        elif name == "coverage_analysis":
-            result = await handle_coverage_analysis(arguments)
-        elif name == "close_recommendations":
-            result = await handle_close_recommendations(arguments)
-        elif name == "rationalization_summary":
-            result = await handle_rationalization_summary(arguments)
-        elif name == "rationalization_status":
-            result = await handle_rationalization_status(arguments)
-        # Phase 5: Strategic Positioning
-        elif name == "valuable_corridors":
-            result = await handle_valuable_corridors(arguments)
-        elif name == "exchange_coverage":
-            result = await handle_exchange_coverage(arguments)
-        elif name == "positioning_recommendations":
-            result = await handle_positioning_recommendations(arguments)
-        elif name == "flow_recommendations":
-            result = await handle_flow_recommendations(arguments)
-        elif name == "positioning_summary":
-            result = await handle_positioning_summary(arguments)
-        elif name == "positioning_status":
-            result = await handle_positioning_status(arguments)
-        # Physarum Auto-Trigger tools (Phase 7.2)
-        elif name == "physarum_cycle":
-            result = await handle_physarum_cycle(arguments)
-        elif name == "physarum_status":
-            result = await handle_physarum_status(arguments)
-        # Settlement tools (BOLT12 Revenue Distribution)
-        elif name == "settlement_register_offer":
-            result = await handle_settlement_register_offer(arguments)
-        elif name == "settlement_generate_offer":
-            result = await handle_settlement_generate_offer(arguments)
-        elif name == "settlement_list_offers":
-            result = await handle_settlement_list_offers(arguments)
-        elif name == "settlement_calculate":
-            result = await handle_settlement_calculate(arguments)
-        elif name == "settlement_execute":
-            result = await handle_settlement_execute(arguments)
-        elif name == "settlement_history":
-            result = await handle_settlement_history(arguments)
-        elif name == "settlement_period_details":
-            result = await handle_settlement_period_details(arguments)
-        # Phase 12: Distributed Settlement
-        elif name == "distributed_settlement_status":
-            result = await handle_distributed_settlement_status(arguments)
-        elif name == "distributed_settlement_proposals":
-            result = await handle_distributed_settlement_proposals(arguments)
-        elif name == "distributed_settlement_participation":
-            result = await handle_distributed_settlement_participation(arguments)
-        # Network Metrics
-        elif name == "hive_network_metrics":
-            result = await handle_network_metrics(arguments)
-        elif name == "hive_rebalance_hubs":
-            result = await handle_rebalance_hubs(arguments)
-        elif name == "hive_rebalance_path":
-            result = await handle_rebalance_path(arguments)
-        # Fleet Health Monitoring
-        elif name == "hive_fleet_health":
-            result = await handle_fleet_health(arguments)
-        elif name == "hive_connectivity_alerts":
-            result = await handle_connectivity_alerts(arguments)
-        elif name == "hive_member_connectivity":
-            result = await handle_member_connectivity(arguments)
-        # Promotion Criteria
-        elif name == "hive_neophyte_rankings":
-            result = await handle_neophyte_rankings(arguments)
-        # MCF (Min-Cost Max-Flow) Optimization tools (Phase 15)
-        elif name == "hive_mcf_status":
-            result = await handle_mcf_status(arguments)
-        elif name == "hive_mcf_solve":
-            result = await handle_mcf_solve(arguments)
-        elif name == "hive_mcf_assignments":
-            result = await handle_mcf_assignments(arguments)
-        elif name == "hive_mcf_optimized_path":
-            result = await handle_mcf_optimized_path(arguments)
-        elif name == "hive_mcf_health":
-            result = await handle_mcf_health(arguments)
+        if name == "hive_health":
+            # Special case: inline handler with custom argument extraction
+            timeout = arguments.get("timeout", 5.0)
+            result = await fleet.health_check(timeout=timeout)
         else:
-            result = {"error": f"Unknown tool: {name}"}
+            handler = TOOL_HANDLERS.get(name)
+            if handler is None:
+                result = {"error": f"Unknown tool: {name}"}
+            else:
+                result = await handler(arguments)
 
+        if HIVE_NORMALIZE_RESPONSES:
+            result = _normalize_response(result)
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     except Exception as e:
@@ -3608,6 +3617,741 @@ async def handle_hive_status(args: Dict) -> Dict:
         return await fleet.call_all("hive-status")
 
 
+def _extract_msat(value: Any) -> int:
+    if isinstance(value, dict) and "msat" in value:
+        return int(value.get("msat", 0))
+    if isinstance(value, str) and value.endswith("msat"):
+        try:
+            return int(value[:-4])
+        except ValueError:
+            return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
+
+
+def _channel_totals(channel: Dict) -> Dict[str, int]:
+    total_msat = _extract_msat(
+        channel.get("total_msat")
+        or channel.get("channel_total_msat")
+        or channel.get("amount_msat")
+    )
+    local_msat = _extract_msat(
+        channel.get("to_us_msat")
+        or channel.get("our_amount_msat")
+        or channel.get("our_msat")
+    )
+    return {"total_msat": total_msat, "local_msat": local_msat}
+
+
+def _coerce_ts(value: Any) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _forward_stats(forwards: List[Dict], start_ts: int, end_ts: int) -> Dict[str, Any]:
+    forward_count = 0
+    total_volume_msat = 0
+    total_revenue_msat = 0
+    per_channel: Dict[str, Dict[str, int]] = {}
+
+    for fwd in forwards:
+        resolved = _coerce_ts(fwd.get("resolved_time") or fwd.get("resolved_at") or 0)
+        if resolved <= 0 or resolved < start_ts or resolved > end_ts:
+            continue
+
+        forward_count += 1
+        in_msat = _extract_msat(fwd.get("in_msat"))
+        out_msat = _extract_msat(fwd.get("out_msat"))
+        volume_msat = out_msat if out_msat else in_msat
+        revenue_msat = max(0, in_msat - out_msat) if in_msat and out_msat else 0
+
+        total_volume_msat += volume_msat
+        total_revenue_msat += revenue_msat
+
+        out_channel = fwd.get("out_channel") or fwd.get("out_channel_id") or fwd.get("out_scid")
+        if out_channel:
+            entry = per_channel.setdefault(out_channel, {"revenue_msat": 0, "volume_msat": 0, "count": 0})
+            entry["revenue_msat"] += revenue_msat
+            entry["volume_msat"] += volume_msat
+            entry["count"] += 1
+
+    avg_fee_ppm = int((total_revenue_msat * 1_000_000) / total_volume_msat) if total_volume_msat else 0
+
+    return {
+        "forward_count": forward_count,
+        "total_volume_msat": total_volume_msat,
+        "total_revenue_msat": total_revenue_msat,
+        "avg_fee_ppm": avg_fee_ppm,
+        "per_channel": per_channel
+    }
+
+
+def _flow_profile(channel: Dict) -> Dict[str, Any]:
+    in_fulfilled = channel.get("in_payments_fulfilled", 0)
+    out_fulfilled = channel.get("out_payments_fulfilled", 0)
+    in_msat = channel.get("in_fulfilled_msat", 0)
+    out_msat = channel.get("out_fulfilled_msat", 0)
+
+    total = in_fulfilled + out_fulfilled
+    if total == 0:
+        flow_profile = "inactive"
+        ratio = 0.0
+    elif out_fulfilled == 0:
+        flow_profile = "inbound_only"
+        ratio = float("inf")
+    elif in_fulfilled == 0:
+        flow_profile = "outbound_only"
+        ratio = 0.0
+    else:
+        ratio = round(in_fulfilled / out_fulfilled, 2)
+        if ratio > 3.0:
+            flow_profile = "inbound_dominant"
+        elif ratio < 0.33:
+            flow_profile = "outbound_dominant"
+        else:
+            flow_profile = "balanced"
+
+    return {
+        "flow_profile": flow_profile,
+        "inbound_outbound_ratio": ratio if ratio != float("inf") else "infinite",
+        "inbound_payments": in_fulfilled,
+        "outbound_payments": out_fulfilled,
+        "inbound_volume_sats": _extract_msat(in_msat) // 1000,
+        "outbound_volume_sats": _extract_msat(out_msat) // 1000
+    }
+
+
+async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
+    import time
+
+    now = int(time.time())
+    since_24h = now - 86400
+
+    info = await node.call("getinfo")
+    peers = await node.call("listpeers")
+    channels_result = await node.call("listpeerchannels")
+    pending = await node.call("hive-pending-actions")
+
+    # Routing stats (24h) from listforwards
+    forwards = await node.call("listforwards", {"status": "settled"})
+    forward_count = 0
+    total_volume_msat = 0
+    total_revenue_msat = 0
+    stats_24h = _forward_stats(forwards.get("forwards", []), since_24h, now)
+    forward_count = stats_24h["forward_count"]
+    total_volume_msat = stats_24h["total_volume_msat"]
+    total_revenue_msat = stats_24h["total_revenue_msat"]
+
+    # Channel stats
+    channels = channels_result.get("channels", [])
+    channel_count = len(channels)
+    total_capacity_msat = 0
+    total_local_msat = 0
+    low_balance_channels = []
+
+    for ch in channels:
+        totals = _channel_totals(ch)
+        total_msat = totals["total_msat"]
+        local_msat = totals["local_msat"]
+        if total_msat <= 0:
+            continue
+        total_capacity_msat += total_msat
+        total_local_msat += local_msat
+        local_pct = local_msat / total_msat if total_msat else 0.0
+        if local_pct < 0.2:
+            low_balance_channels.append({
+                "channel_id": ch.get("short_channel_id"),
+                "peer_id": ch.get("peer_id"),
+                "local_pct": round(local_pct * 100, 2)
+            })
+
+    local_balance_pct = round((total_local_msat / total_capacity_msat) * 100, 2) if total_capacity_msat else 0.0
+
+    # Issues (bleeders, zombies) from revenue-profitability if available
+    issues = []
+    try:
+        profitability = await node.call("revenue-profitability")
+        channels_by_class = profitability.get("channels_by_class", {})
+        for class_name in ("bleeder", "zombie"):
+            for ch in channels_by_class.get(class_name, [])[:3]:
+                issues.append({
+                    "type": class_name,
+                    "severity": "warning" if class_name == "bleeder" else "info",
+                    "channel_id": ch.get("channel_id"),
+                    "peer_id": ch.get("peer_id"),
+                    "details": {
+                        "net_profit_sats": ch.get("net_profit_sats"),
+                        "roi_percentage": ch.get("roi_percentage")
+                    }
+                })
+    except Exception:
+        pass
+
+    for ch in low_balance_channels:
+        issues.append({
+            "type": "critical_low_balance",
+            "severity": "critical",
+            "channel_id": ch.get("channel_id"),
+            "peer_id": ch.get("peer_id"),
+            "details": {"local_pct": ch.get("local_pct")}
+        })
+
+    # Sort issues: critical first, then warning, then info
+    severity_rank = {"critical": 0, "warning": 1, "info": 2}
+    issues_sorted = sorted(issues, key=lambda x: severity_rank.get(x.get("severity", "info"), 3))
+    top_issues = issues_sorted[:3]
+
+    return {
+        "node": node.name,
+        "health": {
+            "alias": info.get("alias", "unknown"),
+            "pubkey": info.get("id", "unknown"),
+            "blockheight": info.get("blockheight", 0),
+            "peers": len(peers.get("peers", [])),
+            "sync_status": info.get("warning_bitcoind_sync", "") or info.get("warning_lightningd_sync", "")
+        },
+        "channels": {
+            "count": channel_count,
+            "total_capacity_msat": total_capacity_msat,
+            "total_local_msat": total_local_msat,
+            "local_balance_pct": local_balance_pct
+        },
+        "routing_24h": {
+            "forward_count": forward_count,
+            "total_volume_msat": total_volume_msat,
+            "total_revenue_msat": total_revenue_msat
+        },
+        "pending_actions": len(pending.get("actions", [])),
+        "top_issues": top_issues
+    }
+
+
+async def handle_fleet_snapshot(args: Dict) -> Dict:
+    """Get consolidated fleet snapshot."""
+    node_name = args.get("node")
+
+    if node_name:
+        node = fleet.get_node(node_name)
+        if not node:
+            return {"error": f"Unknown node: {node_name}"}
+        return await _node_fleet_snapshot(node)
+
+    tasks = []
+    for node in fleet.nodes.values():
+        tasks.append(_node_fleet_snapshot(node))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    snapshots = {}
+    for idx, result in enumerate(results):
+        node = list(fleet.nodes.values())[idx]
+        if isinstance(result, Exception):
+            snapshots[node.name] = {"error": str(result)}
+        else:
+            snapshots[node.name] = result
+    return snapshots
+
+
+async def _node_anomalies(node: NodeConnection) -> Dict[str, Any]:
+    import time
+
+    anomalies: List[Dict[str, Any]] = []
+    now = int(time.time())
+
+    # Revenue velocity drop: last 24h vs 7-day daily average
+    forwards = await node.call("listforwards", {"status": "settled"})
+    forwards_list = forwards.get("forwards", [])
+    last_24h = _forward_stats(forwards_list, now - 86400, now)
+    last_7d = _forward_stats(forwards_list, now - (7 * 86400), now)
+    avg_daily_revenue = last_7d["total_revenue_msat"] / 7 if last_7d["total_revenue_msat"] else 0
+
+    if avg_daily_revenue > 0 and last_24h["total_revenue_msat"] < avg_daily_revenue * 0.5:
+        anomalies.append({
+            "type": "revenue_velocity_drop",
+            "severity": "warning",
+            "channel": None,
+            "peer": None,
+            "details": {
+                "last_24h_revenue_msat": last_24h["total_revenue_msat"],
+                "avg_daily_revenue_msat": int(avg_daily_revenue)
+            },
+            "recommendation": "Investigate fee changes, liquidity imbalance, or peer connectivity issues."
+        })
+
+    # Drain patterns: channels losing >10% balance per day (requires advisor DB velocity)
+    try:
+        db = ensure_advisor_db()
+        channels = await node.call("listpeerchannels")
+        for ch in channels.get("channels", []):
+            scid = ch.get("short_channel_id")
+            if not scid:
+                continue
+            velocity = db.get_channel_velocity(node.name, scid)
+            if not velocity:
+                continue
+            # 10% per day ~= 0.4167% per hour
+            if velocity.velocity_pct_per_hour <= -0.4167:
+                anomalies.append({
+                    "type": "drain_pattern",
+                    "severity": "critical" if velocity.velocity_pct_per_hour <= -1.0 else "warning",
+                    "channel": scid,
+                    "peer": ch.get("peer_id"),
+                    "details": {
+                        "velocity_pct_per_hour": round(velocity.velocity_pct_per_hour, 3),
+                        "trend": velocity.trend,
+                        "hours_until_depleted": velocity.hours_until_depleted
+                    },
+                    "recommendation": "Consider rebalancing or adjusting fees to slow depletion."
+                })
+    except Exception:
+        pass
+
+    # Peer connectivity: frequent disconnects (best-effort heuristics)
+    peers = await node.call("listpeers")
+    for peer in peers.get("peers", []):
+        peer_id = peer.get("id")
+        num_disconnects = peer.get("num_disconnects") or peer.get("disconnects")
+        num_connects = peer.get("num_connects") or peer.get("connects")
+        if num_disconnects is None:
+            continue
+        if num_disconnects >= 5 and (num_connects is None or num_disconnects > num_connects):
+            anomalies.append({
+                "type": "peer_disconnects",
+                "severity": "warning",
+                "channel": None,
+                "peer": peer_id,
+                "details": {
+                    "num_disconnects": num_disconnects,
+                    "num_connects": num_connects
+                },
+                "recommendation": "Monitor peer reliability and consider defensive fee policy."
+            })
+
+    return {
+        "node": node.name,
+        "anomalies": anomalies
+    }
+
+
+async def handle_anomalies(args: Dict) -> Dict:
+    """Detect anomalies outside normal ranges."""
+    node_name = args.get("node")
+
+    if node_name:
+        node = fleet.get_node(node_name)
+        if not node:
+            return {"error": f"Unknown node: {node_name}"}
+        return await _node_anomalies(node)
+
+    tasks = [ _node_anomalies(node) for node in fleet.nodes.values() ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    output = {}
+    for idx, result in enumerate(results):
+        node = list(fleet.nodes.values())[idx]
+        if isinstance(result, Exception):
+            output[node.name] = {"error": str(result)}
+        else:
+            output[node.name] = result
+    return output
+
+
+async def handle_compare_periods(args: Dict) -> Dict:
+    """Compare two routing periods for a node."""
+    import time
+
+    node_name = args.get("node")
+    period1_days = int(args.get("period1_days", 7))
+    period2_days = int(args.get("period2_days", 7))
+    offset_days = int(args.get("offset_days", 7))
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    now = int(time.time())
+    p1_start = now - (period1_days * 86400)
+    p1_end = now
+    p2_end = now - (offset_days * 86400)
+    p2_start = p2_end - (period2_days * 86400)
+
+    forwards = await node.call("listforwards", {"status": "settled"})
+    forwards_list = forwards.get("forwards", [])
+
+    p1 = _forward_stats(forwards_list, p1_start, p1_end)
+    p2 = _forward_stats(forwards_list, p2_start, p2_end)
+
+    def metric_compare(key: str) -> Dict[str, Any]:
+        v1 = p1.get(key, 0)
+        v2 = p2.get(key, 0)
+        delta = v1 - v2
+        pct = round((delta / v2) * 100, 2) if v2 else None
+        return {"period1": v1, "period2": v2, "delta": delta, "percent_change": pct}
+
+    metrics = {
+        "total_revenue_msat": metric_compare("total_revenue_msat"),
+        "total_volume_msat": metric_compare("total_volume_msat"),
+        "forward_count": metric_compare("forward_count"),
+        "avg_fee_ppm": metric_compare("avg_fee_ppm")
+    }
+
+    # Channel improvements/degradations based on revenue delta
+    channel_deltas: List[Dict[str, Any]] = []
+    all_channels = set(p1["per_channel"].keys()) | set(p2["per_channel"].keys())
+    for ch_id in all_channels:
+        rev1 = p1["per_channel"].get(ch_id, {}).get("revenue_msat", 0)
+        rev2 = p2["per_channel"].get(ch_id, {}).get("revenue_msat", 0)
+        delta = rev1 - rev2
+        pct = round((delta / rev2) * 100, 2) if rev2 else None
+        channel_deltas.append({
+            "channel_id": ch_id,
+            "period1_revenue_msat": rev1,
+            "period2_revenue_msat": rev2,
+            "delta_revenue_msat": delta,
+            "percent_change": pct
+        })
+
+    improved = sorted(channel_deltas, key=lambda x: x["delta_revenue_msat"], reverse=True)[:5]
+    degraded = sorted(channel_deltas, key=lambda x: x["delta_revenue_msat"])[:5]
+
+    return {
+        "node": node_name,
+        "periods": {
+            "period1": {"start_ts": p1_start, "end_ts": p1_end, "days": period1_days},
+            "period2": {"start_ts": p2_start, "end_ts": p2_end, "days": period2_days, "offset_days": offset_days}
+        },
+        "metrics": metrics,
+        "improved_channels": improved,
+        "degraded_channels": degraded
+    }
+
+
+async def handle_channel_deep_dive(args: Dict) -> Dict:
+    """Get comprehensive context for a channel or peer."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    peer_id = args.get("peer_id")
+
+    if not node_name:
+        return {"error": "node is required"}
+    if not channel_id and not peer_id:
+        return {"error": "channel_id or peer_id is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Resolve channel and peer from listpeerchannels
+    channels_result = await node.call("listpeerchannels")
+    channels = channels_result.get("channels", [])
+    target_channel = None
+    if channel_id:
+        for ch in channels:
+            if ch.get("short_channel_id") == channel_id:
+                target_channel = ch
+                peer_id = ch.get("peer_id")
+                break
+    elif peer_id:
+        for ch in channels:
+            if ch.get("peer_id") == peer_id:
+                target_channel = ch
+                channel_id = ch.get("short_channel_id")
+                break
+
+    if not target_channel:
+        return {"error": "Channel not found for given channel_id/peer_id"}
+
+    # Basic info
+    totals = _channel_totals(target_channel)
+    total_msat = totals["total_msat"]
+    local_msat = totals["local_msat"]
+    remote_msat = max(0, total_msat - local_msat)
+    local_pct = round((local_msat / total_msat) * 100, 2) if total_msat else 0.0
+
+    peers = await node.call("listpeers")
+    peer_info = next((p for p in peers.get("peers", []) if p.get("id") == peer_id), {})
+    peer_alias = peer_info.get("alias") or peer_info.get("alias_or_local", "") or ""
+    connected = bool(peer_info.get("connected", False))
+
+    # Profitability
+    profitability = {}
+    try:
+        prof = await node.call("revenue-profitability", {"channel_id": channel_id})
+        for ch in prof.get("channels", []):
+            if ch.get("channel_id") == channel_id:
+                profitability = {
+                    "lifetime_revenue_sats": ch.get("revenue_sats"),
+                    "lifetime_cost_sats": ch.get("cost_sats"),
+                    "net_profit_sats": ch.get("net_profit_sats"),
+                    "roi_percentage": ch.get("roi_percentage"),
+                    "classification": ch.get("classification")
+                }
+                break
+    except Exception:
+        profitability = {}
+
+    # Flow analysis + velocity
+    flow = _flow_profile(target_channel)
+    velocity = None
+    try:
+        db = ensure_advisor_db()
+        velocity = db.get_channel_velocity(node_name, channel_id)
+    except Exception:
+        velocity = None
+
+    flow_analysis = {
+        "classification": flow.get("flow_profile"),
+        "inbound_outbound_ratio": flow.get("inbound_outbound_ratio"),
+        "recent_volumes_sats": {
+            "inbound": flow.get("inbound_volume_sats"),
+            "outbound": flow.get("outbound_volume_sats")
+        },
+        "velocity": {
+            "sats_per_hour": getattr(velocity, "velocity_sats_per_hour", None),
+            "pct_per_hour": getattr(velocity, "velocity_pct_per_hour", None),
+            "trend": getattr(velocity, "trend", None),
+            "hours_until_depleted": getattr(velocity, "hours_until_depleted", None),
+            "hours_until_full": getattr(velocity, "hours_until_full", None)
+        } if velocity else None
+    }
+
+    # Fee history (best-effort)
+    fee_history = {
+        "current_fee_ppm": target_channel.get("fee_proportional_millionths"),
+        "current_base_fee_msat": target_channel.get("fee_base_msat"),
+        "recent_changes": None
+    }
+    try:
+        debug = await node.call("revenue-fee-debug")
+        fee_history["recent_changes"] = debug.get("recent_fee_changes")
+    except Exception:
+        pass
+
+    # Recent forwards through channel
+    forwards = await node.call("listforwards", {"status": "settled"})
+    recent = []
+    for fwd in sorted(
+        forwards.get("forwards", []),
+        key=lambda f: _coerce_ts(f.get("resolved_time") or f.get("resolved_at") or 0),
+        reverse=True
+    ):
+        if fwd.get("out_channel") == channel_id or fwd.get("in_channel") == channel_id:
+            in_msat = _extract_msat(fwd.get("in_msat"))
+            out_msat = _extract_msat(fwd.get("out_msat"))
+            recent.append({
+                "resolved_time": _coerce_ts(fwd.get("resolved_time") or fwd.get("resolved_at") or 0),
+                "in_msat": in_msat,
+                "out_msat": out_msat,
+                "fee_msat": max(0, in_msat - out_msat)
+            })
+        if len(recent) >= 10:
+            break
+
+    # Issues
+    issues = []
+    if local_pct < 20:
+        issues.append({"type": "critical_low_balance", "severity": "critical", "details": {"local_pct": local_pct}})
+    if profitability.get("classification") in {"bleeder", "zombie"}:
+        issues.append({
+            "type": profitability.get("classification"),
+            "severity": "warning" if profitability.get("classification") == "bleeder" else "info"
+        })
+
+    return {
+        "node": node_name,
+        "channel_id": channel_id,
+        "peer_id": peer_id,
+        "basic": {
+            "capacity_msat": total_msat,
+            "local_msat": local_msat,
+            "remote_msat": remote_msat,
+            "local_balance_pct": local_pct,
+            "peer_alias": peer_alias,
+            "connected": connected
+        },
+        "profitability": profitability,
+        "flow_analysis": flow_analysis,
+        "fee_history": fee_history,
+        "recent_forwards": recent,
+        "issues": issues
+    }
+
+
+def _action_priority(action: Dict[str, Any]) -> Dict[str, Any]:
+    action_type = action.get("action_type", "")
+    base = 5
+    effort = "medium"
+    impact = "moderate"
+
+    if action_type in {"channel_open", "channel_close"}:
+        base = 7
+        effort = "involved"
+        impact = "high"
+    elif action_type in {"fee_change", "set_fee"}:
+        base = 6
+        effort = "quick"
+        impact = "moderate"
+    elif action_type in {"rebalance", "circular_rebalance"}:
+        base = 6
+        effort = "medium"
+        impact = "moderate"
+
+    return {"priority": base, "effort": effort, "impact": impact}
+
+
+async def _node_recommended_actions(node: NodeConnection, limit: int) -> Dict[str, Any]:
+    actions: List[Dict[str, Any]] = []
+
+    pending = await node.call("hive-pending-actions")
+    for action in pending.get("actions", []):
+        meta = _action_priority(action)
+        actions.append({
+            "source": "pending_action",
+            "node": node.name,
+            "action": action,
+            "priority": meta["priority"],
+            "reasoning": action.get("reasoning") or action.get("reason") or "Pending action requires review.",
+            "expected_impact": meta["impact"],
+            "effort": meta["effort"]
+        })
+
+    # Add anomaly-driven recommendations
+    anomalies = await _node_anomalies(node)
+    for a in anomalies.get("anomalies", []):
+        priority = 7 if a.get("severity") == "critical" else 5
+        effort = "quick" if a.get("type") in {"revenue_velocity_drop", "peer_disconnects"} else "medium"
+        actions.append({
+            "source": "anomaly",
+            "node": node.name,
+            "action": {
+                "type": a.get("type"),
+                "channel": a.get("channel"),
+                "peer": a.get("peer")
+            },
+            "priority": priority,
+            "reasoning": a.get("recommendation"),
+            "expected_impact": "moderate" if priority <= 6 else "high",
+            "effort": effort
+        })
+
+    actions_sorted = sorted(actions, key=lambda x: x.get("priority", 0), reverse=True)
+    return {"node": node.name, "actions": actions_sorted[:limit]}
+
+
+async def handle_recommended_actions(args: Dict) -> Dict:
+    """Return prioritized list of recommended actions."""
+    node_name = args.get("node")
+    limit = int(args.get("limit", 10))
+
+    if node_name:
+        node = fleet.get_node(node_name)
+        if not node:
+            return {"error": f"Unknown node: {node_name}"}
+        return await _node_recommended_actions(node, limit)
+
+    tasks = [_node_recommended_actions(node, limit) for node in fleet.nodes.values()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    output = {}
+    for idx, result in enumerate(results):
+        node = list(fleet.nodes.values())[idx]
+        if isinstance(result, Exception):
+            output[node.name] = {"error": str(result)}
+        else:
+            output[node.name] = result
+    return output
+
+
+async def _node_peer_search(node: NodeConnection, query: str) -> Dict[str, Any]:
+    query_lower = query.lower()
+
+    peers = await node.call("listpeers")
+    channels_result = await node.call("listpeerchannels")
+    channels = channels_result.get("channels", [])
+
+    # Build pubkey -> alias map from listnodes (best-effort)
+    alias_map = {}
+    try:
+        nodes = await node.call("listnodes")
+        for n in nodes.get("nodes", []):
+            pubkey = n.get("nodeid")
+            alias = n.get("alias")
+            if pubkey and alias:
+                alias_map[pubkey] = alias
+    except Exception:
+        pass
+
+    channel_by_peer = {}
+    for ch in channels:
+        peer_id = ch.get("peer_id")
+        if not peer_id:
+            continue
+        channel_by_peer.setdefault(peer_id, []).append(ch)
+
+    matches = []
+    for peer in peers.get("peers", []):
+        peer_id = peer.get("id")
+        alias = alias_map.get(peer_id) or peer.get("alias") or peer.get("alias_or_local") or ""
+        if query_lower not in alias.lower():
+            continue
+
+        # Use first channel if multiple
+        ch = None
+        if peer_id in channel_by_peer:
+            ch = channel_by_peer[peer_id][0]
+
+        capacity_sats = 0
+        local_balance_pct = None
+        channel_id = None
+        if ch:
+            totals = _channel_totals(ch)
+            total_msat = totals["total_msat"]
+            local_msat = totals["local_msat"]
+            capacity_sats = total_msat // 1000 if total_msat else 0
+            local_balance_pct = round((local_msat / total_msat) * 100, 2) if total_msat else None
+            channel_id = ch.get("short_channel_id")
+
+        matches.append({
+            "pubkey": peer_id,
+            "alias": alias,
+            "channel_id": channel_id,
+            "capacity_sats": capacity_sats,
+            "local_balance_pct": local_balance_pct,
+            "connected": bool(peer.get("connected", False))
+        })
+
+    return {"node": node.name, "matches": matches}
+
+
+async def handle_peer_search(args: Dict) -> Dict:
+    """Search peers by alias substring."""
+    query = args.get("query", "")
+    node_name = args.get("node")
+
+    if not query:
+        return {"error": "query is required"}
+
+    if node_name:
+        node = fleet.get_node(node_name)
+        if not node:
+            return {"error": f"Unknown node: {node_name}"}
+        return await _node_peer_search(node, query)
+
+    tasks = [_node_peer_search(node, query) for node in fleet.nodes.values()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    output = {}
+    for idx, result in enumerate(results):
+        node = list(fleet.nodes.values())[idx]
+        if isinstance(result, Exception):
+            output[node.name] = {"error": str(result)}
+        else:
+            output[node.name] = result
+    return output
+
+
 async def handle_pending_actions(args: Dict) -> Dict:
     """Get pending actions from nodes."""
     node_name = args.get("node")
@@ -3619,10 +4363,7 @@ async def handle_pending_actions(args: Dict) -> Dict:
         result = await node.call("hive-pending-actions")
         return {node_name: result}
     else:
-        results = {}
-        for name, node in fleet.nodes.items():
-            results[name] = await node.call("hive-pending-actions")
-        return results
+        return await fleet.call_all("hive-pending-actions")
 
 
 async def handle_approve_action(args: Dict) -> Dict:
@@ -5123,8 +5864,11 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
     import time
     since_timestamp = int(time.time()) - (window_days * 86400)
 
-    # Fetch goat feeder revenue from LNbits
-    goat_feeder = await get_goat_feeder_revenue(since_timestamp)
+    # Fetch goat feeder revenue from LNbits (only for hive-nexus-01)
+    if node_name == "hive-nexus-01":
+        goat_feeder = await get_goat_feeder_revenue(since_timestamp)
+    else:
+        goat_feeder = {"total_sats": 0, "payment_count": 0}
 
     # Extract routing P&L data from cl-revenue-ops dashboard structure
     # Data is in "period" and "financial_health", not "pnl_summary"
@@ -5420,16 +6164,27 @@ async def get_goat_feeder_revenue(since_timestamp: int) -> Dict[str, Any]:
     import urllib.request
     import json
 
+    validation_error = _validate_lnbits_config()
+    if validation_error:
+        return {"total_sats": 0, "payment_count": 0, "error": validation_error}
+    if not LNBITS_INVOICE_KEY:
+        return {"total_sats": 0, "payment_count": 0, "error": "LNBITS_INVOICE_KEY not configured."}
+
     try:
         # Query LNbits payments API using urllib (no external dependencies)
         req = urllib.request.Request(
             f"{LNBITS_URL}/api/v1/payments",
             headers={"X-Api-Key": LNBITS_INVOICE_KEY}
         )
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=LNBITS_TIMEOUT_SECS) as response:
             if response.status != 200:
                 return {"total_sats": 0, "payment_count": 0, "error": f"API error: {response.status}"}
-            payments = json.loads(response.read())
+            raw = json.loads(response.read())
+
+        if isinstance(raw, dict) and "data" in raw:
+            payments = raw.get("data", [])
+        else:
+            payments = raw if isinstance(raw, list) else []
 
         total_sats = 0
         payment_count = 0
@@ -8197,6 +8952,180 @@ async def handle_mcf_health(args: Dict) -> Dict:
 
 
 # =============================================================================
+# Tool Dispatch Registry
+# =============================================================================
+
+TOOL_HANDLERS: Dict[str, Any] = {
+    # Hive core tools
+    "hive_fleet_snapshot": handle_fleet_snapshot,
+    "hive_anomalies": handle_anomalies,
+    "hive_compare_periods": handle_compare_periods,
+    "hive_channel_deep_dive": handle_channel_deep_dive,
+    "hive_recommended_actions": handle_recommended_actions,
+    "hive_peer_search": handle_peer_search,
+    "hive_status": handle_hive_status,
+    "hive_pending_actions": handle_pending_actions,
+    "hive_approve_action": handle_approve_action,
+    "hive_reject_action": handle_reject_action,
+    "hive_members": handle_members,
+    "hive_onboard_new_members": handle_onboard_new_members,
+    "hive_propose_promotion": handle_propose_promotion,
+    "hive_vote_promotion": handle_vote_promotion,
+    "hive_pending_promotions": handle_pending_promotions,
+    "hive_execute_promotion": handle_execute_promotion,
+    "hive_node_info": handle_node_info,
+    "hive_channels": handle_channels,
+    "hive_set_fees": handle_set_fees,
+    "hive_topology_analysis": handle_topology_analysis,
+    "hive_planner_ignore": handle_planner_ignore,
+    "hive_planner_unignore": handle_planner_unignore,
+    "hive_planner_ignored_peers": handle_planner_ignored_peers,
+    "hive_governance_mode": handle_governance_mode,
+    "hive_expansion_mode": handle_expansion_mode,
+    "hive_bump_version": handle_bump_version,
+    "hive_gossip_stats": handle_gossip_stats,
+    # Splice coordination
+    "hive_splice_check": handle_splice_check,
+    "hive_splice_recommendations": handle_splice_recommendations,
+    "hive_splice": handle_splice,
+    "hive_splice_status": handle_splice_status,
+    "hive_splice_abort": handle_splice_abort,
+    "hive_liquidity_intelligence": handle_liquidity_intelligence,
+    # Anticipatory Liquidity (Phase 7.1)
+    "hive_anticipatory_status": handle_anticipatory_status,
+    "hive_detect_patterns": handle_detect_patterns,
+    "hive_predict_liquidity": handle_predict_liquidity,
+    "hive_anticipatory_predictions": handle_anticipatory_predictions,
+    # Time-Based Fee (Phase 7.4)
+    "hive_time_fee_status": handle_time_fee_status,
+    "hive_time_fee_adjustment": handle_time_fee_adjustment,
+    "hive_time_peak_hours": handle_time_peak_hours,
+    "hive_time_low_hours": handle_time_low_hours,
+    # Routing Intelligence (Pheromones + Stigmergic Markers)
+    "hive_backfill_routing_intelligence": handle_backfill_routing_intelligence,
+    "hive_routing_intelligence_status": handle_routing_intelligence_status,
+    # cl-revenue-ops
+    "revenue_status": handle_revenue_status,
+    "revenue_profitability": handle_revenue_profitability,
+    "revenue_dashboard": handle_revenue_dashboard,
+    "revenue_portfolio": handle_revenue_portfolio,
+    "revenue_portfolio_summary": handle_revenue_portfolio_summary,
+    "revenue_portfolio_rebalance": handle_revenue_portfolio_rebalance,
+    "revenue_portfolio_correlations": handle_revenue_portfolio_correlations,
+    "revenue_policy": handle_revenue_policy,
+    "revenue_set_fee": handle_revenue_set_fee,
+    "revenue_rebalance": handle_revenue_rebalance,
+    "revenue_report": handle_revenue_report,
+    "revenue_config": handle_revenue_config,
+    "revenue_debug": handle_revenue_debug,
+    "revenue_history": handle_revenue_history,
+    "revenue_outgoing": handle_revenue_outgoing,
+    "revenue_competitor_analysis": handle_revenue_competitor_analysis,
+    "goat_feeder_history": handle_goat_feeder_history,
+    "goat_feeder_trends": handle_goat_feeder_trends,
+    # Advisor database
+    "advisor_record_snapshot": handle_advisor_record_snapshot,
+    "advisor_get_trends": handle_advisor_get_trends,
+    "advisor_get_velocities": handle_advisor_get_velocities,
+    "advisor_get_channel_history": handle_advisor_get_channel_history,
+    "advisor_record_decision": handle_advisor_record_decision,
+    "advisor_get_recent_decisions": handle_advisor_get_recent_decisions,
+    "advisor_db_stats": handle_advisor_db_stats,
+    # Advisor intelligence
+    "advisor_get_context_brief": handle_advisor_get_context_brief,
+    "advisor_check_alert": handle_advisor_check_alert,
+    "advisor_record_alert": handle_advisor_record_alert,
+    "advisor_resolve_alert": handle_advisor_resolve_alert,
+    "advisor_get_peer_intel": handle_advisor_get_peer_intel,
+    "advisor_measure_outcomes": handle_advisor_measure_outcomes,
+    # Proactive Advisor
+    "advisor_run_cycle": handle_advisor_run_cycle,
+    "advisor_run_cycle_all": handle_advisor_run_cycle_all,
+    "advisor_get_goals": handle_advisor_get_goals,
+    "advisor_set_goal": handle_advisor_set_goal,
+    "advisor_get_learning": handle_advisor_get_learning,
+    "advisor_get_status": handle_advisor_get_status,
+    "advisor_get_cycle_history": handle_advisor_get_cycle_history,
+    "advisor_scan_opportunities": handle_advisor_scan_opportunities,
+    # Routing Pool
+    "pool_status": handle_pool_status,
+    "pool_member_status": handle_pool_member_status,
+    "pool_distribution": handle_pool_distribution,
+    "pool_snapshot": handle_pool_snapshot,
+    "pool_settle": handle_pool_settle,
+    # Phase 1: Yield Metrics
+    "yield_metrics": handle_yield_metrics,
+    "yield_summary": handle_yield_summary,
+    "velocity_prediction": handle_velocity_prediction,
+    "critical_velocity": handle_critical_velocity,
+    "internal_competition": handle_internal_competition,
+    # Kalman Velocity Integration
+    "kalman_velocity_query": handle_kalman_velocity_query,
+    # Phase 2: Fee Coordination
+    "coord_fee_recommendation": handle_coord_fee_recommendation,
+    "corridor_assignments": handle_corridor_assignments,
+    "stigmergic_markers": handle_stigmergic_markers,
+    "defense_status": handle_defense_status,
+    "ban_candidates": handle_ban_candidates,
+    "accumulated_warnings": handle_accumulated_warnings,
+    "pheromone_levels": handle_pheromone_levels,
+    "fee_coordination_status": handle_fee_coordination_status,
+    # Phase 3: Cost Reduction
+    "rebalance_recommendations": handle_rebalance_recommendations,
+    "fleet_rebalance_path": handle_fleet_rebalance_path,
+    "circular_flow_status": handle_circular_flow_status,
+    "execute_hive_circular_rebalance": handle_execute_hive_circular_rebalance,
+    "cost_reduction_status": handle_cost_reduction_status,
+    # Routing Intelligence
+    "routing_stats": handle_routing_stats,
+    "route_suggest": handle_route_suggest,
+    # Channel Rationalization
+    "coverage_analysis": handle_coverage_analysis,
+    "close_recommendations": handle_close_recommendations,
+    "rationalization_summary": handle_rationalization_summary,
+    "rationalization_status": handle_rationalization_status,
+    # Phase 5: Strategic Positioning
+    "valuable_corridors": handle_valuable_corridors,
+    "exchange_coverage": handle_exchange_coverage,
+    "positioning_recommendations": handle_positioning_recommendations,
+    "flow_recommendations": handle_flow_recommendations,
+    "positioning_summary": handle_positioning_summary,
+    "positioning_status": handle_positioning_status,
+    # Physarum Auto-Trigger (Phase 7.2)
+    "physarum_cycle": handle_physarum_cycle,
+    "physarum_status": handle_physarum_status,
+    # Settlement (BOLT12 Revenue Distribution)
+    "settlement_register_offer": handle_settlement_register_offer,
+    "settlement_generate_offer": handle_settlement_generate_offer,
+    "settlement_list_offers": handle_settlement_list_offers,
+    "settlement_calculate": handle_settlement_calculate,
+    "settlement_execute": handle_settlement_execute,
+    "settlement_history": handle_settlement_history,
+    "settlement_period_details": handle_settlement_period_details,
+    # Phase 12: Distributed Settlement
+    "distributed_settlement_status": handle_distributed_settlement_status,
+    "distributed_settlement_proposals": handle_distributed_settlement_proposals,
+    "distributed_settlement_participation": handle_distributed_settlement_participation,
+    # Network Metrics
+    "hive_network_metrics": handle_network_metrics,
+    "hive_rebalance_hubs": handle_rebalance_hubs,
+    "hive_rebalance_path": handle_rebalance_path,
+    # Fleet Health Monitoring
+    "hive_fleet_health": handle_fleet_health,
+    "hive_connectivity_alerts": handle_connectivity_alerts,
+    "hive_member_connectivity": handle_member_connectivity,
+    # Promotion Criteria
+    "hive_neophyte_rankings": handle_neophyte_rankings,
+    # MCF (Min-Cost Max-Flow) Optimization (Phase 15)
+    "hive_mcf_status": handle_mcf_status,
+    "hive_mcf_solve": handle_mcf_solve,
+    "hive_mcf_assignments": handle_mcf_assignments,
+    "hive_mcf_optimized_path": handle_mcf_optimized_path,
+    "hive_mcf_health": handle_mcf_health,
+}
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -8205,8 +9134,12 @@ async def main():
     # Load node configuration
     config_path = os.environ.get("HIVE_NODES_CONFIG")
     if config_path and os.path.exists(config_path):
-        fleet.load_config(config_path)
-        await fleet.connect_all()
+        try:
+            fleet.load_config(config_path)
+            await fleet.connect_all()
+        except Exception as e:
+            logger.error(f"Failed to load/connect nodes: {e}")
+            sys.exit(1)
     else:
         logger.warning("No HIVE_NODES_CONFIG set - running without nodes")
         logger.info("Set HIVE_NODES_CONFIG=/path/to/nodes.json to connect to nodes")

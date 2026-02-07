@@ -241,7 +241,7 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
             "max_members": ctx.config.max_members if ctx.config else 50,
             "market_share_cap": ctx.config.market_share_cap_pct if ctx.config else 0.20,
         },
-        "version": "2.2.3",
+        "version": "2.2.6",
     }
 
 
@@ -1725,7 +1725,7 @@ def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
         import datetime
         # Get period if not specified
         if period is None:
-            now = datetime.datetime.now()
+            now = datetime.datetime.now(tz=datetime.timezone.utc)
             year, week, _ = now.isocalendar()
             period = f"{year}-W{week:02d}"
 
@@ -1781,7 +1781,7 @@ def pool_distribution(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
 
         # Get current period if not specified
         if period is None:
-            now = datetime.datetime.now()
+            now = datetime.datetime.now(tz=datetime.timezone.utc)
             year, week, _ = now.isocalendar()
             period = f"{year}-W{week:02d}"
 
@@ -1839,7 +1839,7 @@ def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> D
 
         # Get period (default to previous week for settlement)
         if period is None:
-            now = datetime.datetime.now()
+            now = datetime.datetime.now(tz=datetime.timezone.utc)
             last_week = now - datetime.timedelta(days=7)
             year, week, _ = last_week.isocalendar()
             period = f"{year}-W{week:02d}"
@@ -1864,13 +1864,28 @@ def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> D
             }
         else:
             # Actually settle
-            result = ctx.routing_pool.settle_period(period)
+            results = ctx.routing_pool.settle_period(period)
+            # settle_period() returns a list of PoolDistribution objects.
+            # Convert to a stable JSON shape for RPC callers.
+            revenue_info = ctx.routing_pool.db.get_pool_revenue(period=period)
+            total_revenue = revenue_info.get("total_sats", 0)
+            settled_at = int(time.time())
+
+            distributions = [
+                {
+                    "member_id": r.member_id,
+                    "amount_sats": r.revenue_share_sats,
+                    "contribution_share": r.contribution_share,
+                }
+                for r in results
+            ]
             return {
                 "status": "settled",
-                "period": result.get("period"),
-                "total_revenue_sats": result.get("total_revenue_sats", 0),
-                "distributions": result.get("distributions", []),
-                "settled_at": result.get("settled_at")
+                "period": period,
+                "total_revenue_sats": total_revenue,
+                "distributions": distributions,
+                "settled_at": settled_at,
+                "distribution_count": len(distributions),
             }
     except Exception as e:
         return {"error": f"Failed to settle period: {e}"}

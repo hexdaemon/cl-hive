@@ -36,6 +36,10 @@ SETTLEMENT_PERIOD_SECONDS = 7 * 24 * 60 * 60  # 1 week
 # Minimum payment threshold floor (absolute minimum to avoid dust)
 MIN_PAYMENT_FLOOR_SATS = 100
 
+# Distributed settlement plan version. Bump when the deterministic payment-plan
+# algorithm changes in a way that affects plan hashes.
+DISTRIBUTED_SETTLEMENT_PLAN_VERSION = 2
+
 
 def calculate_min_payment(total_fees: int, member_count: int) -> int:
     """
@@ -449,70 +453,79 @@ class SettlementManager:
         # Calculate total network score for normalization
         total_network_score = sum(c.hive_centrality for c in contributions)
 
-        results = []
-
+        # Step 1: compute unnormalized weighted contribution scores per member.
+        raw_scores: Dict[str, float] = {}
+        raw_network_component: Dict[str, float] = {}
         for member in contributions:
-            # Calculate member's net profit (capped at 0)
-            member_net_profit = member.net_profit_sats
-
-            # Calculate contribution scores (0.0 to 1.0)
-            capacity_score = (
-                member.capacity_sats / total_capacity
-                if total_capacity > 0 else 0
-            )
-            forwards_score = (
-                member.forwards_sats / total_forwards
-                if total_forwards > 0 else 0
-            )
-            uptime_score = (
-                member.uptime_pct / total_uptime
-                if total_uptime > 0 else 0
-            )
-
-            # Network position score (Use Case 6)
-            network_score = 0.0
-            network_bonus_sats = 0
+            capacity_score = (member.capacity_sats / total_capacity) if total_capacity > 0 else 0.0
+            forwards_score = (member.forwards_sats / total_forwards) if total_forwards > 0 else 0.0
+            uptime_score = (member.uptime_pct / total_uptime) if total_uptime > 0 else 0.0
 
             if network_optimized:
-                # Normalize network score relative to fleet
                 network_score = (
-                    member.hive_centrality / total_network_score
-                    if total_network_score > 0 else 0
+                    (member.hive_centrality / total_network_score) if total_network_score > 0 else 0.0
                 )
-
-                # Apply threshold - only give bonus if above minimum
                 if member.hive_centrality < MIN_CENTRALITY_FOR_BONUS:
                     network_score = 0.0
 
-                # Use network-optimized weights
-                weighted_score = (
-                    WEIGHT_CAPACITY_NETWORK * capacity_score +
-                    WEIGHT_FORWARDS_NETWORK * forwards_score +
-                    WEIGHT_UPTIME_NETWORK * uptime_score +
-                    WEIGHT_NETWORK_POSITION * network_score
-                )
-
-                # Calculate the network bonus portion
-                base_fair_share = int(total_net_profit * (
+                base_component = (
                     WEIGHT_CAPACITY_NETWORK * capacity_score +
                     WEIGHT_FORWARDS_NETWORK * forwards_score +
                     WEIGHT_UPTIME_NETWORK * uptime_score
-                ))
-                network_bonus_sats = int(total_net_profit * WEIGHT_NETWORK_POSITION * network_score)
+                )
+                network_component = WEIGHT_NETWORK_POSITION * network_score
+                score = base_component + network_component
+
+                raw_scores[member.peer_id] = score
+                raw_network_component[member.peer_id] = network_component
             else:
-                # Standard weights
-                weighted_score = (
+                score = (
                     WEIGHT_CAPACITY * capacity_score +
                     WEIGHT_FORWARDS * forwards_score +
                     WEIGHT_UPTIME * uptime_score
                 )
+                raw_scores[member.peer_id] = score
+                raw_network_component[member.peer_id] = 0.0
 
-            # Fair share of total net profit (not gross fees)
-            fair_share = int(total_net_profit * weighted_score)
+        total_score = sum(raw_scores.values())
+        if total_score <= 0:
+            # Extremely defensive fallback: equal split.
+            raw_scores = {m.peer_id: 1.0 for m in contributions}
+            raw_network_component = {m.peer_id: 0.0 for m in contributions}
+            total_score = float(len(contributions))
 
-            # Balance: positive = owed money, negative = owes money
-            # Based on net profit, not gross fees
+        # Step 2: normalize scores so they sum to 1.0 across the fleet.
+        norm_scores: Dict[str, float] = {pid: (s / total_score) for pid, s in raw_scores.items()}
+
+        # Step 3: allocate integer fair_shares that sum exactly to total_net_profit
+        # using a largest-remainder method (deterministic tie-break by peer_id).
+        ideals: Dict[str, float] = {pid: (total_net_profit * w) for pid, w in norm_scores.items()}
+        floors: Dict[str, int] = {pid: int(v) for pid, v in ideals.items()}
+        allocated = sum(floors.values())
+        remainder = total_net_profit - allocated
+
+        # Sort by fractional remainder desc, then peer_id asc for determinism.
+        frac_order = sorted(
+            ideals.keys(),
+            key=lambda pid: (-(ideals[pid] - floors[pid]), pid)
+        )
+        for i in range(max(0, remainder)):
+            floors[frac_order[i % len(frac_order)]] += 1
+
+        # Step 4: build SettlementResult list
+        results: List[SettlementResult] = []
+        for member in sorted(contributions, key=lambda m: m.peer_id):
+            fair_share = floors.get(member.peer_id, 0)
+            member_net_profit = member.net_profit_sats
             balance = fair_share - member_net_profit
+
+            network_component = raw_network_component.get(member.peer_id, 0.0)
+            network_score = 0.0
+            network_bonus_sats = 0
+            if network_optimized and total_net_profit > 0 and total_score > 0:
+                # Report network contribution as a proportion of total normalized score.
+                network_score = round(network_component / total_score, 6)
+                network_bonus_sats = int(total_net_profit * (network_component / total_score))
 
             results.append(SettlementResult(
                 peer_id=member.peer_id,
@@ -522,19 +535,151 @@ class SettlementManager:
                 fair_share=fair_share,
                 balance=balance,
                 bolt12_offer=member.bolt12_offer,
-                network_score=round(network_score, 4),
+                network_score=network_score,
                 network_bonus_sats=network_bonus_sats
             ))
 
-        # Verify settlement balances sum to zero (accounting identity)
+        # Accounting identity should now hold exactly.
         total_balance = sum(r.balance for r in results)
-        if abs(total_balance) > len(results):  # Allow small rounding errors
+        if total_balance != 0:
             self.plugin.log(
                 f"Warning: Settlement balance mismatch of {total_balance} sats",
                 level='warn'
             )
 
         return results
+
+    @staticmethod
+    def _plan_hash(
+        plan_version: int,
+        period: str,
+        data_hash: str,
+        min_payment_sats: int,
+        payments: List[Dict[str, Any]],
+    ) -> str:
+        import hashlib
+
+        # Canonicalize payments ordering.
+        canon_payments = sorted(
+            payments,
+            key=lambda p: (p.get("from_peer", ""), p.get("to_peer", ""), int(p.get("amount_sats", 0)))
+        )
+        payload = {
+            "v": plan_version,
+            "period": period,
+            "data_hash": data_hash,
+            "min_payment_sats": int(min_payment_sats),
+            "payments": canon_payments,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def generate_payment_plan(
+        self,
+        results: List[SettlementResult],
+        total_fees: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        Deterministically generate a full settlement payment plan.
+
+        Unlike generate_payments(), this does NOT filter based on BOLT12 offer
+        availability. The plan is the authoritative expected transfers; offer
+        availability is an execution-time concern.
+
+        Returns:
+            (payments, min_payment_sats)
+        """
+        member_count = len(results)
+        min_payment = calculate_min_payment(total_fees, member_count)
+
+        # Deterministic ordering, including tie-break by peer_id.
+        payers = [r for r in results if r.balance < -min_payment]
+        receivers = [r for r in results if r.balance > min_payment]
+        payers.sort(key=lambda r: (r.balance, r.peer_id))
+        receivers.sort(key=lambda r: (-r.balance, r.peer_id))
+
+        payer_remaining = {p.peer_id: -p.balance for p in payers}
+        receiver_remaining = {r.peer_id: r.balance for r in receivers}
+
+        payments: List[Dict[str, Any]] = []
+        for payer in payers:
+            owing = payer_remaining.get(payer.peer_id, 0)
+            if owing <= 0:
+                continue
+            for receiver in receivers:
+                owed = receiver_remaining.get(receiver.peer_id, 0)
+                if owed <= 0:
+                    continue
+                amount = min(owing, owed)
+                if amount < min_payment:
+                    continue
+                payments.append(
+                    {"from_peer": payer.peer_id, "to_peer": receiver.peer_id, "amount_sats": int(amount)}
+                )
+                owing -= amount
+                owed -= amount
+                payer_remaining[payer.peer_id] = owing
+                receiver_remaining[receiver.peer_id] = owed
+                if owing <= 0:
+                    break
+
+        return payments, min_payment
+
+    def compute_settlement_plan(
+        self,
+        period: str,
+        contributions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Compute a deterministic settlement plan (payments + hashes) from a canonical
+        contributions snapshot.
+        """
+        member_contributions: List[MemberContribution] = []
+        for c in contributions:
+            uptime = c.get("uptime", 100)
+            try:
+                uptime_pct = float(uptime) / 100.0
+            except Exception:
+                uptime_pct = 1.0
+
+            member_contributions.append(
+                MemberContribution(
+                    peer_id=c["peer_id"],
+                    capacity_sats=int(c.get("capacity", 0)),
+                    forwards_sats=int(c.get("forward_count", 0)),
+                    fees_earned_sats=int(c.get("fees_earned", 0)),
+                    rebalance_costs_sats=int(c.get("rebalance_costs", 0)),
+                    uptime_pct=uptime_pct,
+                )
+            )
+
+        data_hash = self.calculate_settlement_hash(period, contributions)
+        results = self.calculate_fair_shares(member_contributions)
+        total_fees = sum(int(c.get("fees_earned", 0)) for c in contributions)
+        payments, min_payment = self.generate_payment_plan(results, total_fees=total_fees)
+        plan_hash = self._plan_hash(
+            plan_version=DISTRIBUTED_SETTLEMENT_PLAN_VERSION,
+            period=period,
+            data_hash=data_hash,
+            min_payment_sats=min_payment,
+            payments=payments,
+        )
+
+        expected_sent: Dict[str, int] = {}
+        for p in payments:
+            expected_sent[p["from_peer"]] = expected_sent.get(p["from_peer"], 0) + int(p["amount_sats"])
+
+        return {
+            "plan_version": DISTRIBUTED_SETTLEMENT_PLAN_VERSION,
+            "period": period,
+            "data_hash": data_hash,
+            "plan_hash": plan_hash,
+            "min_payment_sats": min_payment,
+            "payments": payments,
+            "expected_sent_sats": expected_sent,
+            "total_fees_sats": total_fees,
+        }
 
     def _enrich_with_network_metrics(
         self,
@@ -963,12 +1108,25 @@ class SettlementManager:
             # Get capacity from state
             peer_state = state_manager.get_peer_state(peer_id)
 
+            # Canonicalize uptime for hashing/settlement math.
+            # hive_members.uptime_pct is stored as a fraction (0-1) by
+            # HiveDatabase.sync_uptime_from_presence(); some older code paths
+            # may store a percentage (0-100). Normalize to an integer percent.
+            uptime_val = member.get('uptime_pct', 1.0)
+            try:
+                uptime_f = float(uptime_val)
+                if uptime_f <= 1.0:
+                    uptime_f *= 100.0
+                uptime = int(round(max(0.0, min(100.0, uptime_f))))
+            except Exception:
+                uptime = 100
+
             contributions.append({
                 'peer_id': peer_id,
                 'fees_earned': fees_earned,
                 'rebalance_costs': rebalance_costs,
                 'capacity': peer_state.capacity_sats if peer_state else 0,
-                'uptime': int(member.get('uptime_pct', 100)),
+                'uptime': uptime,
                 'forward_count': forward_count,
             })
 
@@ -1022,25 +1180,30 @@ class SettlementManager:
             self.plugin.log("No contributions to settle", level='debug')
             return None
 
-        # Calculate canonical hash
-        data_hash = self.calculate_settlement_hash(period, contributions)
+        # Calculate canonical hash + deterministic payment plan hash.
+        plan = self.compute_settlement_plan(period, contributions)
+        data_hash = plan["data_hash"]
+        plan_hash = plan["plan_hash"]
 
         # Calculate totals
-        total_fees = sum(c.get('fees_earned', 0) for c in contributions)
+        total_fees = plan["total_fees_sats"]
         member_count = len(contributions)
 
         # Generate proposal ID
         proposal_id = secrets.token_hex(16)
         timestamp = int(time.time())
 
-        # Create proposal in database
+        # Create proposal in database (store contributions for rebroadcast - Issue #49)
+        contributions_json = json.dumps(contributions)
         if not self.db.add_settlement_proposal(
             proposal_id=proposal_id,
             period=period,
             proposer_peer_id=our_peer_id,
             data_hash=data_hash,
+            plan_hash=plan_hash,
             total_fees_sats=total_fees,
-            member_count=member_count
+            member_count=member_count,
+            contributions_json=contributions_json
         ):
             return None
 
@@ -1054,6 +1217,7 @@ class SettlementManager:
             'period': period,
             'proposer_peer_id': our_peer_id,
             'data_hash': data_hash,
+            'plan_hash': plan_hash,
             'total_fees_sats': total_fees,
             'member_count': member_count,
             'contributions': contributions,
@@ -1085,6 +1249,7 @@ class SettlementManager:
         proposal_id = proposal.get('proposal_id')
         period = proposal.get('period')
         proposed_hash = proposal.get('data_hash')
+        proposed_plan_hash = proposal.get('plan_hash')
 
         # Check if we already voted
         if self.db.has_voted_settlement(proposal_id, our_peer_id):
@@ -1102,15 +1267,33 @@ class SettlementManager:
             )
             return None
 
-        # Gather our own contribution data and calculate hash
+        # Gather our own contribution data and calculate hashes.
+        # We verify both the canonical data hash and the derived deterministic plan hash.
         our_contributions = self.gather_contributions_from_gossip(state_manager, period)
-        our_hash = self.calculate_settlement_hash(period, our_contributions)
+        our_plan = self.compute_settlement_plan(period, our_contributions)
+        our_hash = our_plan["data_hash"]
+        our_plan_hash = our_plan["plan_hash"]
 
         # Verify hash matches
         if our_hash != proposed_hash:
             self.plugin.log(
                 f"Hash mismatch for proposal {proposal_id[:16]}...: "
                 f"ours={our_hash[:16]}... theirs={proposed_hash[:16]}...",
+                level='warn'
+            )
+            return None
+
+        if not isinstance(proposed_plan_hash, str) or len(proposed_plan_hash) != 64:
+            self.plugin.log(
+                f"Missing/invalid plan_hash for proposal {proposal_id[:16]}...",
+                level='warn'
+            )
+            return None
+
+        if our_plan_hash != proposed_plan_hash:
+            self.plugin.log(
+                f"Plan hash mismatch for proposal {proposal_id[:16]}...: "
+                f"ours={our_plan_hash[:16]}... theirs={proposed_plan_hash[:16]}...",
                 level='warn'
             )
             return None
@@ -1262,6 +1445,9 @@ class SettlementManager:
             Execution result dict if payment made, None otherwise
         """
         proposal_id = proposal.get('proposal_id')
+        period = proposal.get('period')
+        if not proposal_id or not period:
+            return None
 
         # Check if already executed
         if self.db.has_executed_settlement(proposal_id, our_peer_id):
@@ -1271,112 +1457,99 @@ class SettlementManager:
             )
             return None
 
-        # Calculate our balance (returns balance, creditor, min_payment)
-        balance, creditor_peer_id, min_payment = self.calculate_our_balance(
-            proposal, contributions, our_peer_id
-        )
+        # Compute the authoritative plan from the proposal's canonical contributions snapshot.
+        plan = self.compute_settlement_plan(period, contributions)
+        expected_plan_hash = proposal.get("plan_hash")
+        if isinstance(expected_plan_hash, str) and len(expected_plan_hash) == 64:
+            if plan["plan_hash"] != expected_plan_hash:
+                self.plugin.log(
+                    f"SETTLEMENT: Refusing to execute {proposal_id[:16]}... "
+                    f"(plan hash mismatch ours={plan['plan_hash'][:16]}... "
+                    f"theirs={expected_plan_hash[:16]}...)",
+                    level="warn"
+                )
+                return None
+
+        expected_sent = int(plan["expected_sent_sats"].get(our_peer_id, 0))
+        our_payments = [p for p in plan["payments"] if p.get("from_peer") == our_peer_id]
+
+        total_sent = 0
+        payment_hashes: List[str] = []
+
+        for p in our_payments:
+            to_peer = p["to_peer"]
+            amount = int(p["amount_sats"])
+            offer = self.get_offer(to_peer)
+            if not offer:
+                self.plugin.log(
+                    f"SETTLEMENT: Missing BOLT12 offer for receiver {to_peer[:16]}... "
+                    f"(proposal {proposal_id[:16]}...)",
+                    level="warn"
+                )
+                return None
+
+            pay = SettlementPayment(
+                from_peer=our_peer_id,
+                to_peer=to_peer,
+                amount_sats=amount,
+                bolt12_offer=offer,
+            )
+            pay = await self.execute_payment(pay)
+            if pay.status != "completed":
+                self.plugin.log(
+                    f"SETTLEMENT: Payment failed to {to_peer[:16]}... for {amount} sats: {pay.error}",
+                    level="warn"
+                )
+                return None
+
+            total_sent += amount
+            if pay.payment_hash:
+                payment_hashes.append(pay.payment_hash)
+
+        if total_sent != expected_sent:
+            self.plugin.log(
+                f"SETTLEMENT: Refusing to confirm execution for {proposal_id[:16]}... "
+                f"(sent {total_sent} sats, expected {expected_sent} sats)",
+                level="warn"
+            )
+            return None
 
         timestamp = int(time.time())
+        from modules.protocol import get_settlement_executed_signing_payload
+        exec_payload = {
+            'proposal_id': proposal_id,
+            'executor_peer_id': our_peer_id,
+            'plan_hash': plan["plan_hash"],
+            # total_sent is the authoritative value for completion checks.
+            'total_sent_sats': total_sent,
+            # Keep legacy fields for older listeners; these are informational only.
+            'payment_hash': payment_hashes[0] if len(payment_hashes) == 1 else '',
+            'amount_paid_sats': total_sent,
+            'timestamp': timestamp,
+        }
+        signing_payload = get_settlement_executed_signing_payload(exec_payload)
+        sig_result = rpc.signmessage(signing_payload)
+        signature = sig_result.get('zbase', '')
 
-        if balance >= -min_payment:
-            # We don't owe money (or owe less than dust)
-            # Still record execution to confirm participation
-            from modules.protocol import get_settlement_executed_signing_payload
-            exec_payload = {
-                'proposal_id': proposal_id,
-                'executor_peer_id': our_peer_id,
-                'payment_hash': '',
-                'amount_paid_sats': 0,
-                'timestamp': timestamp,
-            }
-            signing_payload = get_settlement_executed_signing_payload(exec_payload)
-            sig_result = rpc.signmessage(signing_payload)
-            signature = sig_result.get('zbase', '')
-
-            self.db.add_settlement_execution(
-                proposal_id=proposal_id,
-                executor_peer_id=our_peer_id,
-                signature=signature,
-                payment_hash=None,
-                amount_paid_sats=0
-            )
-
-            self.plugin.log(
-                f"Confirmed settlement execution (no payment needed, balance={balance})"
-            )
-
-            return {
-                'proposal_id': proposal_id,
-                'executor_peer_id': our_peer_id,
-                'payment_hash': None,
-                'amount_paid_sats': 0,
-                'timestamp': timestamp,
-                'signature': signature,
-            }
-
-        # We owe money - get creditor's BOLT12 offer
-        creditor_offer = self.get_offer(creditor_peer_id)
-        if not creditor_offer:
-            self.plugin.log(
-                f"No BOLT12 offer for creditor {creditor_peer_id[:16]}...",
-                level='warn'
-            )
-            return None
-
-        # Amount to pay (absolute value of negative balance)
-        amount_to_pay = abs(balance)
-
-        # Create and execute payment
-        payment = SettlementPayment(
-            from_peer=our_peer_id,
-            to_peer=creditor_peer_id,
-            amount_sats=amount_to_pay,
-            bolt12_offer=creditor_offer
+        self.db.add_settlement_execution(
+            proposal_id=proposal_id,
+            executor_peer_id=our_peer_id,
+            signature=signature,
+            payment_hash=exec_payload.get("payment_hash") or None,
+            amount_paid_sats=total_sent,
+            plan_hash=plan["plan_hash"],
         )
 
-        payment = await self.execute_payment(payment)
-
-        if payment.status == 'completed':
-            from modules.protocol import get_settlement_executed_signing_payload
-            exec_payload = {
-                'proposal_id': proposal_id,
-                'executor_peer_id': our_peer_id,
-                'payment_hash': payment.payment_hash or '',
-                'amount_paid_sats': amount_to_pay,
-                'timestamp': timestamp,
-            }
-            signing_payload = get_settlement_executed_signing_payload(exec_payload)
-            sig_result = rpc.signmessage(signing_payload)
-            signature = sig_result.get('zbase', '')
-
-            self.db.add_settlement_execution(
-                proposal_id=proposal_id,
-                executor_peer_id=our_peer_id,
-                signature=signature,
-                payment_hash=payment.payment_hash,
-                amount_paid_sats=amount_to_pay
-            )
-
-            self.plugin.log(
-                f"Executed settlement payment: {amount_to_pay} sats to "
-                f"{creditor_peer_id[:16]}... (hash={payment.payment_hash[:16]}...)"
-            )
-
-            return {
-                'proposal_id': proposal_id,
-                'executor_peer_id': our_peer_id,
-                'payment_hash': payment.payment_hash,
-                'amount_paid_sats': amount_to_pay,
-                'timestamp': timestamp,
-                'signature': signature,
-            }
-
-        else:
-            self.plugin.log(
-                f"Settlement payment failed: {payment.error}",
-                level='warn'
-            )
-            return None
+        return {
+            'proposal_id': proposal_id,
+            'executor_peer_id': our_peer_id,
+            'plan_hash': plan["plan_hash"],
+            'total_sent_sats': total_sent,
+            'payment_hash': exec_payload.get("payment_hash") or None,
+            'amount_paid_sats': total_sent,
+            'timestamp': timestamp,
+            'signature': signature,
+        }
 
     def check_and_complete_settlement(self, proposal_id: str) -> bool:
         """
@@ -1403,12 +1576,53 @@ class SettlementManager:
         executions = self.db.get_settlement_executions(proposal_id)
         exec_count = len(executions)
 
+        # Require a canonical contributions snapshot to validate the plan.
+        contributions_json = proposal.get("contributions_json")
+        if not contributions_json:
+            return False
+        try:
+            contributions = json.loads(contributions_json)
+        except Exception:
+            return False
+
+        plan = self.compute_settlement_plan(period, contributions)
+        expected_plan_hash = proposal.get("plan_hash")
+        if isinstance(expected_plan_hash, str) and len(expected_plan_hash) == 64:
+            if plan["plan_hash"] != expected_plan_hash:
+                self.plugin.log(
+                    f"SETTLEMENT: Cannot complete {proposal_id[:16]}... (plan hash mismatch)",
+                    level="warn"
+                )
+                return False
+
+        # Validate that each participant has executed and their reported totals match.
+        executions_by_peer = {e.get("executor_peer_id"): e for e in executions}
+
+        for c in contributions:
+            peer_id = c.get("peer_id")
+            if not peer_id:
+                continue
+            ex = executions_by_peer.get(peer_id)
+            if not ex:
+                return False
+
+            # Check plan hash binding (newer clients).
+            ex_plan_hash = ex.get("plan_hash")
+            if isinstance(ex_plan_hash, str) and len(ex_plan_hash) == 64:
+                if ex_plan_hash != plan["plan_hash"]:
+                    return False
+
+            expected_sent = int(plan["expected_sent_sats"].get(peer_id, 0))
+            actual_sent = int(ex.get("amount_paid_sats", 0) or 0)
+            if actual_sent != expected_sent:
+                return False
+
         if exec_count >= member_count:
-            # All members have confirmed - mark as complete
+            # All members have confirmed correctly - mark as complete
             self.db.update_settlement_proposal_status(proposal_id, 'completed')
 
-            # Mark period as settled
-            total_distributed = sum(e.get('amount_paid_sats', 0) for e in executions)
+            # Mark period as settled (sum of expected sends is deterministic).
+            total_distributed = sum(int(v) for v in plan["expected_sent_sats"].values())
             self.db.mark_period_settled(period, proposal_id, total_distributed)
 
             self.plugin.log(

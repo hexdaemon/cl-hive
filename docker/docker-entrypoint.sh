@@ -128,14 +128,23 @@ mkdir -p "$LIGHTNING_DIR"
 # Validate Required Variables
 # -----------------------------------------------------------------------------
 
-if [ -z "$BITCOIN_RPCUSER" ]; then
-    echo "ERROR: BITCOIN_RPCUSER is required"
-    exit 1
-fi
+# Bitcoin RPC credentials are only required if NOT using trustedcoin explorer-only mode
+if [ "${TRUSTEDCOIN_ENABLED:-false}" != "true" ]; then
+    # Standard bcli mode requires bitcoind credentials
+    if [ -z "$BITCOIN_RPCUSER" ]; then
+        echo "ERROR: BITCOIN_RPCUSER is required (or enable TRUSTEDCOIN_ENABLED for explorer-only mode)"
+        exit 1
+    fi
 
-if [ -z "$BITCOIN_RPCPASSWORD" ]; then
-    echo "ERROR: BITCOIN_RPCPASSWORD is required"
-    exit 1
+    if [ -z "$BITCOIN_RPCPASSWORD" ]; then
+        echo "ERROR: BITCOIN_RPCPASSWORD is required (or enable TRUSTEDCOIN_ENABLED for explorer-only mode)"
+        exit 1
+    fi
+else
+    # Trustedcoin mode - credentials optional (for hybrid mode)
+    if [ -z "$BITCOIN_RPCUSER" ] || [ -z "$BITCOIN_RPCPASSWORD" ]; then
+        echo "INFO: Running in trustedcoin explorer-only mode (no bitcoind)"
+    fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -204,6 +213,40 @@ fi
 # Disable CLBOSS if requested
 if [ "${CLBOSS_ENABLED:-true}" != "true" ]; then
     echo "disable-plugin=clboss" >> "$CONFIG_FILE"
+fi
+
+# -----------------------------------------------------------------------------
+# Trustedcoin Configuration (Optional Bitcoin Backend)
+# -----------------------------------------------------------------------------
+# Trustedcoin replaces bcli for Bitcoin backend access.
+# - Explorer-only mode: No BITCOIN_RPC* settings, uses public block explorers
+# - Hybrid mode: BITCOIN_RPC* configured, bitcoind primary with explorer fallback
+#
+# When TRUSTEDCOIN_ENABLED=true:
+#   1. Disables the default bcli plugin
+#   2. Enables trustedcoin plugin
+#   3. If BITCOIN_RPCUSER is set: hybrid mode (bitcoind + explorer fallback)
+#   4. If BITCOIN_RPCUSER is empty: explorer-only mode (no bitcoind needed)
+# -----------------------------------------------------------------------------
+
+if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ]; then
+    echo "Configuring trustedcoin as Bitcoin backend..."
+    
+    # Disable bcli (trustedcoin replaces it)
+    echo "disable-plugin=bcli" >> "$CONFIG_FILE"
+    
+    # Enable trustedcoin plugin
+    echo "plugin=/usr/local/bin/trustedcoin" >> "$CONFIG_FILE"
+    
+    # Determine mode based on whether Bitcoin RPC credentials are configured
+    if [ -n "$BITCOIN_RPCUSER" ] && [ -n "$BITCOIN_RPCPASSWORD" ]; then
+        echo "Trustedcoin mode: HYBRID (bitcoind primary, explorers fallback)"
+        # Bitcoin RPC settings already in config, trustedcoin will use them
+    else
+        echo "Trustedcoin mode: EXPLORER-ONLY (no bitcoind required)"
+        echo "WARNING: Explorer-only mode trusts third-party block explorers"
+        echo "         For maximum security, configure bitcoind for hybrid mode"
+    fi
 fi
 
 # SECURITY: Restrict config file permissions (contains RPC password)
@@ -494,52 +537,57 @@ export ADVISOR_DB_PATH="$ADVISOR_DATA_DIR/advisor.db"
 # -----------------------------------------------------------------------------
 # Wait for Bitcoin RPC (with exponential backoff)
 # -----------------------------------------------------------------------------
+# Skip if using trustedcoin in explorer-only mode (no bitcoind)
 
-echo "Waiting for Bitcoin RPC at $BITCOIN_RPCHOST:$BITCOIN_RPCPORT..."
+if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ] && { [ -z "$BITCOIN_RPCUSER" ] || [ -z "$BITCOIN_RPCPASSWORD" ]; }; then
+    echo "Skipping Bitcoin RPC check (trustedcoin explorer-only mode)"
+else
+    echo "Waiting for Bitcoin RPC at $BITCOIN_RPCHOST:$BITCOIN_RPCPORT..."
 
-MAX_RETRIES=20
-RETRY_COUNT=0
-SLEEP_TIME=1
-MAX_SLEEP=30
+    MAX_RETRIES=20
+    RETRY_COUNT=0
+    SLEEP_TIME=1
+    MAX_SLEEP=30
 
-while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    # Test RPC connection and verify credentials
-    RPC_RESPONSE=$(curl -s --max-time 10 --user "$BITCOIN_RPCUSER:$BITCOIN_RPCPASSWORD" \
-        --data-binary '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' \
-        -H 'content-type: text/plain;' \
-        "http://$BITCOIN_RPCHOST:$BITCOIN_RPCPORT/" 2>&1) || true
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        # Test RPC connection and verify credentials
+        RPC_RESPONSE=$(curl -s --max-time 10 --user "$BITCOIN_RPCUSER:$BITCOIN_RPCPASSWORD" \
+            --data-binary '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' \
+            -H 'content-type: text/plain;' \
+            "http://$BITCOIN_RPCHOST:$BITCOIN_RPCPORT/" 2>&1) || true
 
-    # Check for successful response
-    if echo "$RPC_RESPONSE" | grep -q '"result"'; then
-        echo "Bitcoin RPC available"
-        # Extract and display chain info
-        CHAIN=$(echo "$RPC_RESPONSE" | grep -o '"chain":"[^"]*"' | cut -d'"' -f4 || echo "unknown")
-        BLOCKS=$(echo "$RPC_RESPONSE" | grep -o '"blocks":[0-9]*' | cut -d':' -f2 || echo "unknown")
-        echo "  Chain: $CHAIN, Blocks: $BLOCKS"
-        break
-    fi
+        # Check for successful response
+        if echo "$RPC_RESPONSE" | grep -q '"result"'; then
+            echo "Bitcoin RPC available"
+            # Extract and display chain info
+            CHAIN=$(echo "$RPC_RESPONSE" | grep -o '"chain":"[^"]*"' | cut -d'"' -f4 || echo "unknown")
+            BLOCKS=$(echo "$RPC_RESPONSE" | grep -o '"blocks":[0-9]*' | cut -d':' -f2 || echo "unknown")
+            echo "  Chain: $CHAIN, Blocks: $BLOCKS"
+            break
+        fi
 
-    # Check for authentication error (wrong credentials)
-    if echo "$RPC_RESPONSE" | grep -qi "401\|unauthorized\|authentication"; then
-        echo "ERROR: Bitcoin RPC authentication failed - check BITCOIN_RPCUSER and BITCOIN_RPCPASSWORD"
+        # Check for authentication error (wrong credentials)
+        if echo "$RPC_RESPONSE" | grep -qi "401\|unauthorized\|authentication"; then
+            echo "ERROR: Bitcoin RPC authentication failed - check BITCOIN_RPCUSER and BITCOIN_RPCPASSWORD"
+            exit 1
+        fi
+
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        echo "Waiting for Bitcoin RPC... ($RETRY_COUNT/$MAX_RETRIES, next retry in ${SLEEP_TIME}s)"
+        sleep "$SLEEP_TIME"
+
+        # Exponential backoff with cap
+        SLEEP_TIME=$((SLEEP_TIME * 2))
+        if [ $SLEEP_TIME -gt $MAX_SLEEP ]; then
+            SLEEP_TIME=$MAX_SLEEP
+        fi
+    done
+
+    if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+        echo "ERROR: Bitcoin RPC not available after $MAX_RETRIES attempts"
+        echo "Last response: $RPC_RESPONSE"
         exit 1
     fi
-
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "Waiting for Bitcoin RPC... ($RETRY_COUNT/$MAX_RETRIES, next retry in ${SLEEP_TIME}s)"
-    sleep "$SLEEP_TIME"
-
-    # Exponential backoff with cap
-    SLEEP_TIME=$((SLEEP_TIME * 2))
-    if [ $SLEEP_TIME -gt $MAX_SLEEP ]; then
-        SLEEP_TIME=$MAX_SLEEP
-    fi
-done
-
-if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-    echo "ERROR: Bitcoin RPC not available after $MAX_RETRIES attempts"
-    echo "Last response: $RPC_RESPONSE"
-    exit 1
 fi
 
 # -----------------------------------------------------------------------------
@@ -550,7 +598,15 @@ echo ""
 echo "=== Configuration Summary ==="
 echo "Network:        $NETWORK"
 echo "Alias:          $ALIAS"
-echo "Bitcoin RPC:    $BITCOIN_RPCHOST:$BITCOIN_RPCPORT"
+if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ]; then
+    if [ -n "$BITCOIN_RPCUSER" ] && [ -n "$BITCOIN_RPCPASSWORD" ]; then
+        echo "Bitcoin Backend: trustedcoin (hybrid: $BITCOIN_RPCHOST:$BITCOIN_RPCPORT + explorers)"
+    else
+        echo "Bitcoin Backend: trustedcoin (explorer-only)"
+    fi
+else
+    echo "Bitcoin Backend: bcli ($BITCOIN_RPCHOST:$BITCOIN_RPCPORT)"
+fi
 echo "Lightning Port: $LIGHTNING_PORT"
 echo "Network Mode:   $NETWORK_MODE"
 echo "WireGuard:      $WIREGUARD_ENABLED"
@@ -570,6 +626,9 @@ fi
 echo "  Sling:        installed"
 echo "  cl-hive:      installed"
 echo "  cl-revenue-ops: installed"
+if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ]; then
+    echo "  trustedcoin:  enabled (replaces bcli)"
+fi
 echo "============================="
 echo ""
 

@@ -35,6 +35,10 @@ MIN_GOSSIP_INTERVAL = 10
 MAX_TOPOLOGY_ENTRIES = 200
 MAX_FULL_SYNC_STATES = 2000
 MAX_FEE_POLICY_KEYS = 20
+MAX_GOSSIP_STRING_LEN = 256  # Pubkeys are 66 chars, channel IDs ~18
+
+# Rate limit for FULL_SYNC processing (seconds per peer)
+FULL_SYNC_COOLDOWN = 60
 
 
 # =============================================================================
@@ -111,6 +115,9 @@ class GossipManager:
 
         # Set of peers we've received gossip from (for connectivity tracking)
         self._active_peers: Set[str] = set()
+
+        # Per-peer rate limit for FULL_SYNC processing
+        self._full_sync_times: Dict[str, float] = {}
 
     def sync_version_from_state_manager(self, our_pubkey: str) -> None:
         """
@@ -339,6 +346,20 @@ class GossipManager:
             self._log(f"Rejected gossip from {sender_id[:16]}...: invalid topology")
             return False
 
+        # Validate individual string lengths (pubkeys are 66 chars, channel IDs ~18)
+        if any(not isinstance(t, str) or len(t) > MAX_GOSSIP_STRING_LEN for t in topology):
+            self._log(f"Rejected gossip from {sender_id[:16]}...: topology entry too long")
+            return False
+        if any(not isinstance(k, str) or len(k) > MAX_GOSSIP_STRING_LEN for k in fee_policy):
+            self._log(f"Rejected gossip from {sender_id[:16]}...: fee_policy key too long")
+            return False
+
+        MAX_FEE_VALUE = 10_000_000
+        for k, v in fee_policy.items():
+            if not isinstance(v, (int, float)) or v < 0 or v > MAX_FEE_VALUE:
+                self._log(f"Rejected gossip from {sender_id[:16]}...: invalid fee_policy value", level="warn")
+                return False
+
         # Track active peer
         with self._lock:
             self._active_peers.add(sender_id)
@@ -455,16 +476,30 @@ class GossipManager:
     def process_full_sync(self, sender_id: str, payload: Dict[str, Any]) -> int:
         """
         Process an incoming FULL_SYNC message.
-        
+
         Merges remote state into local state manager.
-        
+
         Args:
             sender_id: Public key of the sending node
             payload: FULL_SYNC payload with states array
-            
+
         Returns:
             Number of states that were updated
         """
+        # Per-peer rate limit to prevent DoS via repeated FULL_SYNC
+        now = time.time()
+        with self._lock:
+            last_sync = self._full_sync_times.get(sender_id, 0)
+            if now - last_sync < FULL_SYNC_COOLDOWN:
+                self._log(f"Rate-limited FULL_SYNC from {sender_id[:16]}...", level="warn")
+                return 0
+            self._full_sync_times[sender_id] = now
+
+            cutoff = now - FULL_SYNC_COOLDOWN * 2
+            stale_sync_keys = [k for k, t in self._full_sync_times.items() if t < cutoff]
+            for k in stale_sync_keys:
+                del self._full_sync_times[k]
+
         states = payload.get('states', [])
 
         if not states:

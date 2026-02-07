@@ -17,6 +17,7 @@ How this helps without fund transfer:
 Security: All operations use cryptographic signatures.
 """
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -156,6 +157,9 @@ class LiquidityCoordinator:
         self.our_pubkey = our_pubkey
         self.fee_intel_mgr = fee_intel_mgr
         self.state_manager = state_manager
+
+        # Lock protecting in-memory state
+        self._lock = threading.Lock()
 
         # In-memory tracking
         self._liquidity_needs: Dict[str, LiquidityNeed] = {}  # reporter_id -> need
@@ -351,8 +355,9 @@ class LiquidityCoordinator:
             signature=signature
         )
 
-        # Store in memory (replace older need from same reporter)
-        self._liquidity_needs[reporter_id] = need
+        # Store in memory using composite key (consistent with batch path)
+        key = f"{reporter_id}:{need.target_peer_id}"
+        self._liquidity_needs[key] = need
 
         # Prune old needs if over limit
         self._prune_old_needs()
@@ -574,8 +579,8 @@ class LiquidityCoordinator:
         )
 
         to_remove = len(sorted_needs) - MAX_PENDING_NEEDS
-        for reporter_id, _ in sorted_needs[:to_remove]:
-            del self._liquidity_needs[reporter_id]
+        for key, _ in sorted_needs[:to_remove]:
+            del self._liquidity_needs[key]
 
     def get_prioritized_needs(self) -> List[LiquidityNeed]:
         """

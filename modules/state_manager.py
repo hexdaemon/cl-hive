@@ -92,14 +92,17 @@ class HivePeerState:
         return asdict(self)
     
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'HivePeerState':
+    def from_dict(cls, data: Dict[str, Any]) -> Optional['HivePeerState']:
         """
         Create from dictionary with backward compatibility.
 
         Handles old nodes that don't send budget fields by using defaults.
+        Returns None if peer_id is missing or empty.
         """
         # Required fields
         peer_id = data.get("peer_id", "")
+        if not peer_id:
+            return None
         capacity_sats = data.get("capacity_sats", 0)
         available_sats = data.get("available_sats", 0)
         fee_policy = data.get("fee_policy", {})
@@ -127,8 +130,8 @@ class HivePeerState:
             peer_id=peer_id,
             capacity_sats=capacity_sats,
             available_sats=available_sats,
-            fee_policy=fee_policy,
-            topology=topology,
+            fee_policy=dict(fee_policy),       # defensive copy
+            topology=list(topology),           # defensive copy
             version=version,
             last_update=last_update,
             state_hash=state_hash,
@@ -140,7 +143,7 @@ class HivePeerState:
             fees_period_start=fees_period_start,
             fees_last_report=fees_last_report,
             fees_costs_sats=fees_costs_sats,
-            capabilities=capabilities,
+            capabilities=list(capabilities),   # defensive copy
         )
     
     def to_hash_tuple(self) -> Dict[str, Any]:
@@ -233,6 +236,9 @@ class StateManager:
         for entry in topology:
             if not isinstance(entry, str) or not entry or len(entry) > MAX_PEER_ID_LEN:
                 return False
+
+        if data.get('available_sats', 0) > data.get('capacity_sats', 0):
+            data['available_sats'] = data['capacity_sats']
 
         return True
 
@@ -654,9 +660,9 @@ class StateManager:
         hash_bytes = hashlib.sha256(json_str.encode('utf-8')).digest()
         hash_hex = hash_bytes.hex()
 
-        # Cache the result
-        self._last_hash = hash_hex
-        self._last_hash_time = int(time.time())
+        with self._lock:
+            self._last_hash = hash_hex
+            self._last_hash_time = int(time.time())
 
         return hash_hex
     
@@ -728,6 +734,8 @@ class StateManager:
                 # Only update if remote is newer
                 if not local_state or local_state.version < remote_version:
                     new_state = HivePeerState.from_dict(state_dict)
+                    if new_state is None:
+                        continue
                     self._local_state[peer_id] = new_state
                     states_to_persist.append((peer_id, new_state, remote_version))
                     updated_count += 1
@@ -759,23 +767,25 @@ class StateManager:
             Number of states loaded
         """
         db_states = self.db.get_all_hive_states()
-        
-        for state_dict in db_states:
-            peer_id = state_dict.get('peer_id')
-            if peer_id:
-                self._local_state[peer_id] = HivePeerState(
-                    peer_id=peer_id,
-                    capacity_sats=state_dict.get('capacity_sats', 0),
-                    available_sats=state_dict.get('available_sats', 0),
-                    fee_policy=state_dict.get('fee_policy', {}),
-                    topology=state_dict.get('topology', []),
-                    version=state_dict.get('version', 0),
-                    last_update=state_dict.get('last_gossip', 0),
-                    state_hash=state_dict.get('state_hash', "")
-                )
-        
-        self._log(f"Loaded {len(self._local_state)} peer states from database")
-        return len(self._local_state)
+
+        with self._lock:
+            for state_dict in db_states:
+                peer_id = state_dict.get('peer_id')
+                if peer_id:
+                    self._local_state[peer_id] = HivePeerState(
+                        peer_id=peer_id,
+                        capacity_sats=state_dict.get('capacity_sats', 0),
+                        available_sats=state_dict.get('available_sats', 0),
+                        fee_policy=state_dict.get('fee_policy', {}),
+                        topology=state_dict.get('topology', []),
+                        version=state_dict.get('version', 0),
+                        last_update=state_dict.get('last_gossip', 0),
+                        state_hash=state_dict.get('state_hash', "")
+                    )
+            loaded = len(self._local_state)
+
+        self._log(f"Loaded {loaded} peer states from database")
+        return loaded
     
     def cleanup_stale_states(self, max_age_seconds: int = STALE_STATE_THRESHOLD) -> int:
         """

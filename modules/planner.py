@@ -1102,14 +1102,15 @@ class Planner:
                     continue
 
                 # Parse capacity (may be int or dict with msat)
-                capacity_raw = ch.get('amount_msat') or ch.get('satoshis', 0)
+                capacity_field = 'amount_msat' if 'amount_msat' in ch else 'satoshis'
+                capacity_raw = ch.get(capacity_field, 0)
+                is_msat_field = 'msat' in capacity_field
                 if isinstance(capacity_raw, dict):
                     capacity_sats = capacity_raw.get('msat', 0) // 1000
                 elif isinstance(capacity_raw, str) and capacity_raw.endswith('msat'):
                     capacity_sats = int(capacity_raw[:-4]) // 1000
                 elif isinstance(capacity_raw, int):
-                    # Could be msat or sats depending on field
-                    if capacity_raw > 10_000_000_000:  # Likely msat
+                    if is_msat_field:
                         capacity_sats = capacity_raw // 1000
                     else:
                         capacity_sats = capacity_raw
@@ -2118,6 +2119,9 @@ class Planner:
                     decisions[-1]['reason'] = 'insufficient_budget'
                     decisions[-1]['available_budget'] = available_budget
                     decisions[-1]['min_channel_sats'] = min_channel_size
+                    # Abort the intent created above to prevent leak
+                    intent_type_val = IntentType.CHANNEL_OPEN.value if hasattr(IntentType.CHANNEL_OPEN, 'value') else IntentType.CHANNEL_OPEN
+                    self.intent_manager.abort_local_intent(selected_target.target, intent_type_val)
                     return decisions
 
                 # Get target's channel count for routing potential calculation

@@ -14,6 +14,7 @@ from . import network_metrics
 
 ACTIVE_MEMBER_WINDOW_SECONDS = 24 * 3600
 BAN_QUORUM_THRESHOLD = 0.51  # 51% quorum for ban proposals
+CONTRIBUTION_RATIO_NO_DATA = 999999999
 
 
 class MembershipTier(str, Enum):
@@ -147,7 +148,7 @@ class MembershipManager:
         forwarded = stats["forwarded"]
         received = stats["received"]
         if received == 0:
-            return 1.0 if forwarded == 0 else float("inf")
+            return 1.0 if forwarded == 0 else CONTRIBUTION_RATIO_NO_DATA
         return forwarded / received
 
     def get_unique_peers(self, peer_id: str) -> List[str]:

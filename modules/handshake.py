@@ -24,6 +24,7 @@ Having a channel demonstrates economic commitment to the network.
 
 import os
 import json
+import threading
 import time
 import base64
 import hashlib
@@ -52,7 +53,7 @@ MAX_PENDING_CHALLENGES = 1000
 CHALLENGE_RATE_LIMIT_SECONDS = 10  # Minimum seconds between challenges per peer
 
 # Plugin version for manifest
-PLUGIN_VERSION = "cl-hive v2.2.3"
+PLUGIN_VERSION = "cl-hive v2.2.6"
 
 
 # =============================================================================
@@ -179,6 +180,7 @@ class HandshakeManager:
         self.plugin = plugin
         self.min_vouch_count = min_vouch_count
         self._our_pubkey: Optional[str] = None
+        self._challenge_lock = threading.Lock()
         self._pending_challenges: Dict[str, Dict[str, Any]] = {}
     
     # =========================================================================
@@ -487,40 +489,52 @@ class HandshakeManager:
         """
         now = int(time.time())
 
-        # Check per-peer rate limit
-        existing = self._pending_challenges.get(peer_id)
-        if existing:
-            time_since_last = now - existing["issued_at"]
-            if time_since_last < CHALLENGE_RATE_LIMIT_SECONDS:
-                raise ValueError(
-                    f"Rate limit exceeded: wait {CHALLENGE_RATE_LIMIT_SECONDS - time_since_last}s"
+        with self._challenge_lock:
+            # Check per-peer rate limit
+            existing = self._pending_challenges.get(peer_id)
+            if existing:
+                time_since_last = now - existing["issued_at"]
+                if time_since_last < CHALLENGE_RATE_LIMIT_SECONDS:
+                    raise ValueError(
+                        f"Rate limit exceeded: wait {CHALLENGE_RATE_LIMIT_SECONDS - time_since_last}s"
+                    )
+
+            nonce = secrets.token_hex(NONCE_SIZE)
+            self._pending_challenges[peer_id] = {
+                "nonce": nonce,
+                "issued_at": now,
+                "requirements": requirements,
+                "initial_tier": initial_tier
+            }
+
+            # LRU eviction if over limit
+            if len(self._pending_challenges) > MAX_PENDING_CHALLENGES:
+                oldest = sorted(
+                    self._pending_challenges.items(),
+                    key=lambda item: item[1]["issued_at"]
                 )
+                for key, _ in oldest[: len(self._pending_challenges) - MAX_PENDING_CHALLENGES]:
+                    self._pending_challenges.pop(key, None)
 
-        nonce = secrets.token_hex(NONCE_SIZE)
-        self._pending_challenges[peer_id] = {
-            "nonce": nonce,
-            "issued_at": now,
-            "requirements": requirements,
-            "initial_tier": initial_tier
-        }
-
-        # LRU eviction if over limit
-        if len(self._pending_challenges) > MAX_PENDING_CHALLENGES:
-            oldest = sorted(
-                self._pending_challenges.items(),
-                key=lambda item: item[1]["issued_at"]
-            )
-            for key, _ in oldest[: len(self._pending_challenges) - MAX_PENDING_CHALLENGES]:
-                self._pending_challenges.pop(key, None)
         return nonce
-    
+
     def get_pending_challenge(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """Get the pending challenge nonce for a peer."""
-        return self._pending_challenges.get(peer_id)
-    
+        with self._challenge_lock:
+            challenge = self._pending_challenges.get(peer_id)
+            if challenge is None:
+                return None
+            # Enforce TTL - expire stale challenges
+            now = int(time.time())
+            if now - challenge["issued_at"] > CHALLENGE_TTL_SECONDS:
+                self._pending_challenges.pop(peer_id, None)
+                return None
+            return challenge
+
     def clear_challenge(self, peer_id: str) -> None:
         """Clear the pending challenge for a peer."""
-        self._pending_challenges.pop(peer_id, None)
+        with self._challenge_lock:
+            self._pending_challenges.pop(peer_id, None)
     
     # =========================================================================
     # FEATURE DETECTION
@@ -546,7 +560,11 @@ class HandshakeManager:
                 features.append('onion-msg')
         except Exception:
             pass
-        
+
+        # Advertise max supported protocol version (Phase B hardening)
+        from modules.protocol import SUPPORTED_VERSIONS
+        features.append(f'proto-v{max(SUPPORTED_VERSIONS)}')
+
         return features
     
     def check_requirements(self, requirements: int, features: list) -> Tuple[bool, list]:
