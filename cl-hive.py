@@ -1091,7 +1091,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize intent manager (Phase 3)
     # Get our pubkey for tie-breaker logic
-    our_pubkey = safe_plugin.rpc.getinfo()['id']
+    our_pubkey = safe_plugin.rpc.getinfo().get('id', '')
 
     # Sync gossip version from persisted state to avoid version reset on restart
     gossip_mgr.sync_version_from_state_manager(our_pubkey)
@@ -5330,7 +5330,7 @@ def handle_expansion_nominate(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     signing_message = get_expansion_nominate_signing_payload(payload)
 
     try:
-        verify_result = plugin.rpc.checkmessage(signing_message, signature)
+        verify_result = safe_plugin.rpc.checkmessage(signing_message, signature)
         if not verify_result.get("verified", False):
             plugin.log(
                 f"cl-hive: [NOMINATE] Signature verification failed for {nominator_id[:16]}...",
@@ -5401,7 +5401,7 @@ def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     signing_message = get_expansion_elect_signing_payload(payload)
 
     try:
-        verify_result = plugin.rpc.checkmessage(signing_message, signature)
+        verify_result = safe_plugin.rpc.checkmessage(signing_message, signature)
         if not verify_result.get("verified", False):
             plugin.log(
                 f"cl-hive: [ELECT] Signature verification failed for coordinator {coordinator_id[:16]}...",
@@ -5525,7 +5525,7 @@ def handle_expansion_decline(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     signing_message = get_expansion_decline_signing_payload(payload)
 
     try:
-        verify_result = plugin.rpc.checkmessage(signing_message, signature)
+        verify_result = safe_plugin.rpc.checkmessage(signing_message, signature)
         if not verify_result.get("verified", False):
             plugin.log(
                 f"cl-hive: [DECLINE] Signature verification failed for decliner {decliner_id[:16]}...",
@@ -5569,7 +5569,7 @@ def handle_expansion_decline(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
         new_elected = result.get("elected_id", "")
         our_id = None
         try:
-            our_id = plugin.rpc.getinfo().get("id")
+            our_id = safe_plugin.rpc.getinfo().get("id")
         except Exception:
             pass
 
@@ -9336,7 +9336,11 @@ def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
 
     # Add our vote (proposer auto-votes approve)
     vote_canonical = f"hive:ban_vote:{proposal_id}:approve:{timestamp}"
-    vote_sig = safe_plugin.rpc.signmessage(vote_canonical)["zbase"]
+    try:
+        vote_sig = safe_plugin.rpc.signmessage(vote_canonical).get("zbase", "")
+    except Exception as e:
+        safe_plugin.log(f"SETTLEMENT: Failed to sign gaming ban vote: {e}", level='warn')
+        return
     database.add_ban_vote(proposal_id, our_pubkey, "approve", timestamp, vote_sig)
 
     # Broadcast proposal
@@ -11620,7 +11624,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
     if capacity_sats is None or channel_count is None:
         try:
             # Try to get from listchannels
-            channels = plugin.rpc.listchannels(source=peer_id)
+            channels = safe_plugin.rpc.listchannels(source=peer_id)
             peer_channels = channels.get('channels', [])
 
             if capacity_sats is None:
@@ -11641,7 +11645,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
 
     # Get onchain balance
     try:
-        funds = plugin.rpc.listfunds()
+        funds = safe_plugin.rpc.listfunds()
         outputs = funds.get('outputs', [])
         onchain_balance = sum(
             (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
@@ -12126,7 +12130,7 @@ def hive_test_intent(plugin: Plugin, target: str, intent_type: str = "channel_op
             result["broadcast"] = success
             if success:
                 members = database.get_all_members()
-                our_id = plugin.rpc.getinfo()['id']
+                our_id = safe_plugin.rpc.getinfo().get('id', '')
                 result["broadcast_count"] = len([m for m in members if m.get('peer_id') != our_id])
 
         return result
@@ -12182,10 +12186,10 @@ def hive_test_pending_action(plugin: Plugin, action_type: str = "channel_open",
     if not target:
         # Try to find an external node from the network graph
         try:
-            channels = plugin.rpc.listchannels()
-            our_id = plugin.rpc.getinfo()['id']
+            channels = safe_plugin.rpc.listchannels()
+            our_id = safe_plugin.rpc.getinfo().get('id', '')
             members = database.get_all_members()
-            member_ids = {m['peer_id'] for m in members}
+            member_ids = {m.get('peer_id', '') for m in members}
 
             # Find a node that's not in our hive
             for ch in channels.get('channels', []):
@@ -13991,7 +13995,10 @@ def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason give
 
     # Add our vote (proposer auto-votes approve)
     vote_canonical = f"hive:ban_vote:{proposal_id}:approve:{timestamp}"
-    vote_sig = safe_plugin.rpc.signmessage(vote_canonical)["zbase"]
+    try:
+        vote_sig = safe_plugin.rpc.signmessage(vote_canonical).get("zbase", "")
+    except Exception as e:
+        return {"error": f"Failed to sign proposal vote: {e}"}
     database.add_ban_vote(proposal_id, our_pubkey, "approve", timestamp, vote_sig)
 
     # Broadcast proposal
