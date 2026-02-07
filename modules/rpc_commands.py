@@ -312,6 +312,16 @@ def members(ctx: HiveContext) -> Dict[str, Any]:
         return {"error": "Hive not initialized"}
 
     all_members = ctx.database.get_all_members()
+
+    # Enrich with live contribution ratio from ledger (Issue #59)
+    if ctx.membership_mgr:
+        for m in all_members:
+            peer_id = m.get("peer_id")
+            if peer_id:
+                m["contribution_ratio"] = ctx.membership_mgr.calculate_contribution_ratio(peer_id)
+                # Format uptime as percentage (stored as 0.0-1.0 decimal)
+                m["uptime_pct"] = round(m.get("uptime_pct", 0.0) * 100, 2)
+
     return {
         "count": len(all_members),
         "members": all_members,
