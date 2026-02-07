@@ -191,7 +191,9 @@ class TestLiquidityCoordinator:
         )
 
         assert result.get("success") is True
-        assert reporter_id in self.coordinator._liquidity_needs
+        # Keyed by composite key: reporter_id:target_peer_id
+        target_id = payload["target_peer_id"]
+        assert f"{reporter_id}:{target_id}" in self.coordinator._liquidity_needs
 
     def test_handle_liquidity_need_non_member(self):
         """Test that non-members are rejected."""

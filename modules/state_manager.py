@@ -127,8 +127,8 @@ class HivePeerState:
             peer_id=peer_id,
             capacity_sats=capacity_sats,
             available_sats=available_sats,
-            fee_policy=fee_policy,
-            topology=topology,
+            fee_policy=dict(fee_policy),       # defensive copy
+            topology=list(topology),           # defensive copy
             version=version,
             last_update=last_update,
             state_hash=state_hash,
@@ -140,7 +140,7 @@ class HivePeerState:
             fees_period_start=fees_period_start,
             fees_last_report=fees_last_report,
             fees_costs_sats=fees_costs_sats,
-            capabilities=capabilities,
+            capabilities=list(capabilities),   # defensive copy
         )
     
     def to_hash_tuple(self) -> Dict[str, Any]:

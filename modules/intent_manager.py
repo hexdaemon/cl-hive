@@ -195,20 +195,24 @@ class IntentManager:
     # INTENT CREATION
     # =========================================================================
     
-    def create_intent(self, intent_type: str, target: str) -> Intent:
+    def create_intent(self, intent_type: str, target: str) -> Optional[Intent]:
         """
         Create a new local intent and persist to database.
-        
+
         Args:
             intent_type: Type of action (from IntentType enum)
             target: Target identifier
-            
+
         Returns:
-            The created Intent object with database ID
+            The created Intent object with database ID, or None if our_pubkey not set
         """
+        if not self.our_pubkey:
+            self._log("Cannot create intent: our_pubkey not set", level="warn")
+            return None
+
         now = int(time.time())
         expires_at = now + self.hold_seconds
-        
+
         # Insert into database
         intent_id = self.db.create_intent(
             intent_type=intent_type,
@@ -267,15 +271,20 @@ class IntentManager:
             - has_conflict: True if there's a local pending intent for same target
             - we_win: True if we win the tie-breaker (our pubkey < their pubkey)
         """
+        # Guard: our_pubkey must be set for tie-breaker comparison
+        if not self.our_pubkey:
+            self._log("Cannot resolve conflict: our_pubkey not set", level="warn")
+            return (True, False)  # Conflict exists, we lose (safe default)
+
         # Query local pending intents for same target
         local_conflicts = self.db.get_conflicting_intents(
             target=remote_intent.target,
             intent_type=remote_intent.intent_type
         )
-        
+
         if not local_conflicts:
             return (False, False)
-        
+
         # We have a conflict - apply tie-breaker
         # Lowest lexicographical pubkey wins
         we_win = self.our_pubkey < remote_intent.initiator

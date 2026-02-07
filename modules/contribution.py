@@ -232,10 +232,10 @@ class ContributionManager:
         ban_triggered = bool(flag["ban_triggered"])
         if not ban_triggered and now - low_since >= (LEECH_WINDOW_DAYS * 86400):
             if self.config.ban_autotrigger_enabled:
-                self._log(f"Leech ban trigger for {peer_id[:16]}... (ratio={ratio:.2f})", level="warn")
+                self._log(f"Leech ban auto-triggered for {peer_id[:16]}... (ratio={ratio:.2f})", level="warn")
                 self.db.set_leech_flag(peer_id, low_since, True)
             else:
-                self._log(f"Leech ban proposal flagged for {peer_id[:16]}... (ratio={ratio:.2f})", level="warn")
-                self.db.set_leech_flag(peer_id, low_since, True)
+                self._log(f"Leech ban flagged for review: {peer_id[:16]}... (ratio={ratio:.2f})", level="warn")
+                self.db.set_leech_flag(peer_id, low_since, False)
 
         return {"is_leech": True, "ratio": ratio}

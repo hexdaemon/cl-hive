@@ -174,7 +174,16 @@ class HiveConfig:
             value = getattr(self, key, None)
             if value is not None and not (min_val <= value <= max_val):
                 return f"Config {key}={value} out of range [{min_val}, {max_val}]"
-        
+
+        # Cross-field constraints
+        if self.planner_min_channel_sats > self.planner_max_channel_sats:
+            return (f"planner_min_channel_sats ({self.planner_min_channel_sats}) > "
+                    f"planner_max_channel_sats ({self.planner_max_channel_sats})")
+        if (self.planner_default_channel_sats < self.planner_min_channel_sats or
+                self.planner_default_channel_sats > self.planner_max_channel_sats):
+            return (f"planner_default_channel_sats ({self.planner_default_channel_sats}) "
+                    f"outside [{self.planner_min_channel_sats}, {self.planner_max_channel_sats}]")
+
         return None
 
 

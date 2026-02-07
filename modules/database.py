@@ -89,6 +89,16 @@ class HiveDatabase:
             )
         return self._local.conn
 
+    def close_connection(self):
+        """Close the thread-local connection if it exists."""
+        conn = getattr(self._local, 'conn', None)
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
+
     @contextmanager
     def transaction(self) -> Generator[sqlite3.Connection, None, None]:
         """
