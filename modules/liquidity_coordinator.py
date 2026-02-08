@@ -363,7 +363,8 @@ class LiquidityCoordinator:
 
         # Store in memory using composite key (consistent with batch path)
         key = f"{reporter_id}:{need.target_peer_id}"
-        self._liquidity_needs[key] = need
+        with self._lock:
+            self._liquidity_needs[key] = need
 
         # Prune old needs if over limit
         self._prune_old_needs()
@@ -477,7 +478,8 @@ class LiquidityCoordinator:
 
             # Use composite key for multiple needs from same reporter
             key = f"{reporter_id}:{need.target_peer_id}"
-            self._liquidity_needs[key] = need
+            with self._lock:
+                self._liquidity_needs[key] = need
 
             # Store in database
             self.database.store_liquidity_need(
@@ -575,18 +577,19 @@ class LiquidityCoordinator:
 
     def _prune_old_needs(self):
         """Remove old liquidity needs to stay under limit."""
-        if len(self._liquidity_needs) <= MAX_PENDING_NEEDS:
-            return
+        with self._lock:
+            if len(self._liquidity_needs) <= MAX_PENDING_NEEDS:
+                return
 
-        # Sort by timestamp, remove oldest
-        sorted_needs = sorted(
-            self._liquidity_needs.items(),
-            key=lambda x: x[1].timestamp
-        )
+            # Sort by timestamp, remove oldest
+            sorted_needs = sorted(
+                self._liquidity_needs.items(),
+                key=lambda x: x[1].timestamp
+            )
 
-        to_remove = len(sorted_needs) - MAX_PENDING_NEEDS
-        for key, _ in sorted_needs[:to_remove]:
-            del self._liquidity_needs[key]
+            to_remove = len(sorted_needs) - MAX_PENDING_NEEDS
+            for key, _ in sorted_needs[:to_remove]:
+                del self._liquidity_needs[key]
 
     def get_prioritized_needs(self) -> List[LiquidityNeed]:
         """
@@ -597,7 +600,8 @@ class LiquidityCoordinator:
         Returns:
             List of needs sorted by priority (highest first)
         """
-        needs = list(self._liquidity_needs.values())
+        with self._lock:
+            needs = list(self._liquidity_needs.values())
 
         def nnlb_priority(need: LiquidityNeed) -> float:
             """Calculate NNLB priority score."""
@@ -711,13 +715,14 @@ class LiquidityCoordinator:
         """Clean up old liquidity needs."""
         now = time.time()
 
-        # Remove old needs (older than 1 hour)
-        old_needs = [
-            rid for rid, need in self._liquidity_needs.items()
-            if now - need.timestamp > 3600
-        ]
-        for rid in old_needs:
-            del self._liquidity_needs[rid]
+        with self._lock:
+            # Remove old needs (older than 1 hour)
+            old_needs = [
+                rid for rid, need in self._liquidity_needs.items()
+                if now - need.timestamp > 3600
+            ]
+            for rid in old_needs:
+                del self._liquidity_needs[rid]
 
     def get_status(self) -> Dict[str, Any]:
         """
@@ -799,13 +804,14 @@ class LiquidityCoordinator:
         )
 
         # Update in-memory tracking for fast access
-        self._member_liquidity_state[member_id] = {
-            "depleted_channels": depleted_channels,
-            "saturated_channels": saturated_channels,
-            "rebalancing_active": rebalancing_active,
-            "rebalancing_peers": rebalancing_peers or [],
-            "timestamp": timestamp
-        }
+        with self._lock:
+            self._member_liquidity_state[member_id] = {
+                "depleted_channels": depleted_channels,
+                "saturated_channels": saturated_channels,
+                "rebalancing_active": rebalancing_active,
+                "rebalancing_peers": rebalancing_peers or [],
+                "timestamp": timestamp
+            }
 
         if self.plugin:
             self.plugin.log(
@@ -1030,7 +1036,10 @@ class LiquidityCoordinator:
         Returns:
             Conflict info if found
         """
-        for member_id, state in self._member_liquidity_state.items():
+        with self._lock:
+            state_snapshot = dict(self._member_liquidity_state)
+
+        for member_id, state in state_snapshot.items():
             if member_id == self.our_pubkey:
                 continue
 
@@ -1421,26 +1430,27 @@ class LiquidityCoordinator:
             return False
 
         # Store by reporter_id (latest need per member)
-        self._remote_mcf_needs[reporter_id] = {
-            "reporter_id": reporter_id,
-            "need_type": need_type,
-            "target_peer": need.get("target_peer", ""),
-            "amount_sats": amount_sats,
-            "urgency": need.get("urgency", "medium"),
-            "max_fee_ppm": need.get("max_fee_ppm", 1000),
-            "channel_id": need.get("channel_id", ""),
-            "received_at": need.get("received_at", int(time.time())),
-        }
+        with self._lock:
+            self._remote_mcf_needs[reporter_id] = {
+                "reporter_id": reporter_id,
+                "need_type": need_type,
+                "target_peer": need.get("target_peer", ""),
+                "amount_sats": amount_sats,
+                "urgency": need.get("urgency", "medium"),
+                "max_fee_ppm": need.get("max_fee_ppm", 1000),
+                "channel_id": need.get("channel_id", ""),
+                "received_at": need.get("received_at", int(time.time())),
+            }
 
-        # Enforce size limit
-        if len(self._remote_mcf_needs) > self._max_remote_needs:
-            # Remove oldest entries
-            sorted_needs = sorted(
-                self._remote_mcf_needs.items(),
-                key=lambda x: x[1].get("received_at", 0)
-            )
-            for k, _ in sorted_needs[:100]:
-                del self._remote_mcf_needs[k]
+            # Enforce size limit
+            if len(self._remote_mcf_needs) > self._max_remote_needs:
+                # Remove oldest entries
+                sorted_needs = sorted(
+                    self._remote_mcf_needs.items(),
+                    key=lambda x: x[1].get("received_at", 0)
+                )
+                for k, _ in sorted_needs[:100]:
+                    del self._remote_mcf_needs[k]
 
         return True
 
@@ -1517,12 +1527,16 @@ class LiquidityCoordinator:
         )
 
         # Enforce limits
-        if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
-            self._cleanup_old_mcf_assignments()
+        with self._lock:
+            if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
+                self._cleanup_old_mcf_assignments()
+                # If still at limit after cleanup, reject
+                if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
+                    return False
 
-        self._mcf_assignments[assignment_id] = assignment
-        self._last_mcf_solution_timestamp = solution_timestamp
-        self._mcf_ack_sent = False
+            self._mcf_assignments[assignment_id] = assignment
+            self._last_mcf_solution_timestamp = solution_timestamp
+            self._mcf_ack_sent = False
 
         self._log(
             f"Received MCF assignment {assignment_id}: "

@@ -562,12 +562,14 @@ class FleetRebalanceRouter:
                     reliability_score=max(0.5, 1.0 - 0.1 * len(path))
                 )
 
-            # Add neighbors (other fleet members this member is connected to)
+            # Add neighbors (other fleet members this member has a direct channel to)
             current_peers = topology.get(current, set())
-            for member, member_peers in topology.items():
+            for member in topology:
                 if member not in visited and member != current:
-                    # Check if there's a connection
-                    if current_peers & member_peers:  # Shared peers
+                    # Check if current has a direct channel to member
+                    # (member appears in current's peer set, or current in member's)
+                    member_peers = topology.get(member, set())
+                    if member in current_peers or current in member_peers:
                         queue.append((member, path + [member]))
 
         return None
@@ -858,10 +860,11 @@ class FleetRebalanceRouter:
                 return
 
             current_peers = topology.get(current, set())
-            for member, member_peers in topology.items():
+            for member in topology:
                 if member not in visited and member != current:
-                    # Check if connected
-                    if current_peers & member_peers:
+                    # Check if current has a direct channel to member
+                    member_peers = topology.get(member, set())
+                    if member in current_peers or current in member_peers:
                         visited.add(member)
                         path.append(member)
                         dfs(member, path, visited)
@@ -1209,14 +1212,14 @@ class CircularFlowDetector:
                     continue
 
                 recommendation = self._get_circular_flow_recommendation(
-                    cf.cycle, cf.total_amount_sats, cf.total_cost_sats
+                    cf.members, cf.total_amount_sats, cf.total_cost_sats
                 )
 
                 shareable.append({
-                    "members_involved": cf.cycle,
+                    "members_involved": cf.members,
                     "total_amount_sats": cf.total_amount_sats,
                     "total_cost_sats": cf.total_cost_sats,
-                    "cycle_count": cf.cycle_count,
+                    "cycle_count": cf.members_count,
                     "detection_window_hours": cf.detection_window_hours,
                     "recommendation": recommendation
                 })
@@ -1288,12 +1291,12 @@ class CircularFlowDetector:
             for cf in local_flows:
                 alerts.append({
                     "source": "local",
-                    "members_involved": cf.cycle,
+                    "members_involved": cf.members,
                     "total_amount_sats": cf.total_amount_sats,
                     "total_cost_sats": cf.total_cost_sats,
-                    "cycle_count": cf.cycle_count,
+                    "cycle_count": cf.members_count,
                     "recommendation": self._get_circular_flow_recommendation(
-                        cf.cycle, cf.total_amount_sats, cf.total_cost_sats
+                        cf.members, cf.total_amount_sats, cf.total_cost_sats
                     )
                 })
         except Exception:
@@ -1559,9 +1562,15 @@ class CostReductionManager:
         Returns:
             Dict with recording result and any circular flow warnings
         """
-        # Get peer IDs
-        from_peer = self.fleet_router._get_peer_for_channel(from_channel) or ""
-        to_peer = self.fleet_router._get_peer_for_channel(to_channel) or ""
+        # Get peer IDs (skip circular flow recording if peers unknown)
+        from_peer = self.fleet_router._get_peer_for_channel(from_channel)
+        to_peer = self.fleet_router._get_peer_for_channel(to_channel)
+
+        if not from_peer or not to_peer:
+            return {
+                "status": "recorded",
+                "warning": "Could not resolve peers for circular flow tracking"
+            }
 
         # Record for circular flow detection
         self.circular_detector.record_rebalance_outcome(
@@ -1932,7 +1941,7 @@ class CostReductionManager:
                 return {"error": f"Destination channel {to_channel} not found"}
 
             # Verify source has enough outbound liquidity
-            from_local = from_chan.get('to_us_msat', 0)
+            from_local = int(from_chan.get('to_us_msat', 0))
             if from_local < amount_msat:
                 return {
                     "error": f"Insufficient outbound liquidity in {from_channel}",

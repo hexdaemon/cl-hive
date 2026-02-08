@@ -792,14 +792,14 @@ class TestMCFCoordinator:
 
         needs = [
             RebalanceNeed("02a", "inbound", "02b", 100_000),
-            RebalanceNeed("02c", "outbound", "02d", 50_000),  # Not counted
+            RebalanceNeed("02c", "outbound", "02d", 50_000),
             RebalanceNeed("02e", "inbound", "02f", 200_000),
         ]
 
         total = coordinator.get_total_demand(needs)
 
-        # Only inbound needs count as demand
-        assert total == 300_000
+        # All needs count as demand (inbound + outbound)
+        assert total == 350_000
 
     def test_get_status(self):
         """Test getting coordinator status."""

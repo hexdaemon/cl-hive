@@ -25,6 +25,7 @@ Author: Lightning Goats Team
 """
 
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
@@ -80,6 +81,7 @@ class MCFCircuitBreaker:
     HALF_OPEN = "half_open"
 
     def __init__(self):
+        self._lock = threading.Lock()
         self.state = self.CLOSED
         self.failure_count = 0
         self.success_count = 0
@@ -93,49 +95,52 @@ class MCFCircuitBreaker:
 
     def record_success(self) -> None:
         """Record a successful MCF operation."""
-        self.total_successes += 1
-        self.failure_count = 0
+        with self._lock:
+            self.total_successes += 1
+            self.failure_count = 0
 
-        if self.state == self.HALF_OPEN:
-            self.success_count += 1
-            if self.success_count >= MCF_CIRCUIT_SUCCESS_THRESHOLD:
+            if self.state == self.HALF_OPEN:
+                self.success_count += 1
+                if self.success_count >= MCF_CIRCUIT_SUCCESS_THRESHOLD:
+                    self._transition_to(self.CLOSED)
+            elif self.state == self.OPEN:
+                # Shouldn't happen, but reset just in case
                 self._transition_to(self.CLOSED)
-        elif self.state == self.OPEN:
-            # Shouldn't happen, but reset just in case
-            self._transition_to(self.CLOSED)
 
     def record_failure(self, error: str = "") -> None:
         """Record a failed MCF operation."""
-        self.total_failures += 1
-        self.failure_count += 1
-        self.last_failure_time = time.time()
+        with self._lock:
+            self.total_failures += 1
+            self.failure_count += 1
+            self.last_failure_time = time.time()
 
-        if self.state == self.CLOSED:
-            if self.failure_count >= MCF_CIRCUIT_FAILURE_THRESHOLD:
+            if self.state == self.CLOSED:
+                if self.failure_count >= MCF_CIRCUIT_FAILURE_THRESHOLD:
+                    self._transition_to(self.OPEN)
+                    self.total_trips += 1
+            elif self.state == self.HALF_OPEN:
+                # Single failure in half-open goes back to open
                 self._transition_to(self.OPEN)
-                self.total_trips += 1
-        elif self.state == self.HALF_OPEN:
-            # Single failure in half-open goes back to open
-            self._transition_to(self.OPEN)
 
     def can_execute(self) -> bool:
         """Check if MCF operation should be attempted."""
-        if self.state == self.CLOSED:
+        with self._lock:
+            if self.state == self.CLOSED:
+                return True
+
+            if self.state == self.OPEN:
+                # Check if recovery timeout has passed
+                elapsed = time.time() - self.last_state_change
+                if elapsed >= MCF_CIRCUIT_RECOVERY_TIMEOUT:
+                    self._transition_to(self.HALF_OPEN)
+                    return True
+                return False
+
+            # HALF_OPEN - allow one attempt
             return True
 
-        if self.state == self.OPEN:
-            # Check if recovery timeout has passed
-            elapsed = time.time() - self.last_state_change
-            if elapsed >= MCF_CIRCUIT_RECOVERY_TIMEOUT:
-                self._transition_to(self.HALF_OPEN)
-                return True
-            return False
-
-        # HALF_OPEN - allow one attempt
-        return True
-
     def _transition_to(self, new_state: str) -> None:
-        """Transition to a new state."""
+        """Transition to a new state. Caller must hold self._lock."""
         self.state = new_state
         self.last_state_change = time.time()
         if new_state == self.CLOSED:
@@ -146,25 +151,28 @@ class MCFCircuitBreaker:
 
     def get_status(self) -> Dict[str, Any]:
         """Get circuit breaker status."""
-        now = time.time()
-        return {
-            "state": self.state,
-            "failure_count": self.failure_count,
-            "success_count": self.success_count,
-            "time_in_state_seconds": int(now - self.last_state_change),
-            "total_successes": self.total_successes,
-            "total_failures": self.total_failures,
-            "total_trips": self.total_trips,
-            "can_execute": self.can_execute(),
-        }
+        can_exec = self.can_execute()
+        with self._lock:
+            now = time.time()
+            return {
+                "state": self.state,
+                "failure_count": self.failure_count,
+                "success_count": self.success_count,
+                "time_in_state_seconds": int(now - self.last_state_change),
+                "total_successes": self.total_successes,
+                "total_failures": self.total_failures,
+                "total_trips": self.total_trips,
+                "can_execute": can_exec,
+            }
 
     def reset(self) -> None:
         """Reset circuit breaker to initial state."""
-        self.state = self.CLOSED
-        self.failure_count = 0
-        self.success_count = 0
-        self.last_failure_time = 0
-        self.last_state_change = time.time()
+        with self._lock:
+            self.state = self.CLOSED
+            self.failure_count = 0
+            self.success_count = 0
+            self.last_failure_time = 0
+            self.last_state_change = time.time()
 
 
 # =============================================================================
@@ -1157,11 +1165,8 @@ class MCFCoordinator:
         return needs
 
     def get_total_demand(self, needs: List[RebalanceNeed]) -> int:
-        """Get total demand (inbound needs) in sats."""
-        return sum(
-            n.amount_sats for n in needs
-            if n.need_type == "inbound"
-        )
+        """Get total demand (inbound + outbound needs) in sats."""
+        return sum(n.amount_sats for n in needs)
 
     def run_optimization_cycle(self) -> Optional[MCFSolution]:
         """
