@@ -510,9 +510,6 @@ cat >> "$CONFIG_FILE" << EOF
 # Vitality monitors channel health and pings Amboss for online status
 
 vitality-amboss=true
-vitality-watch-channels=true
-vitality-watch-gossip=false
-vitality-expiring-htlcs=50
 
 # =============================================================================
 # cl-hive Configuration
