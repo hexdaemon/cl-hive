@@ -1723,6 +1723,11 @@ class LiquidityCoordinator:
         if expired:
             self._log(f"Cleaned up {len(expired)} old MCF assignments", "debug")
 
+    def get_all_assignments(self) -> List:
+        """Return a snapshot of all MCF assignments (thread-safe)."""
+        with self._lock:
+            return list(self._mcf_assignments.values())
+
     def timeout_stuck_assignments(self, max_execution_time: int = 1800) -> List[str]:
         """
         Check for and timeout assignments stuck in 'executing' state.

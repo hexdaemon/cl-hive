@@ -3653,8 +3653,8 @@ def mcf_assignments(ctx: HiveContext) -> Dict[str, Any]:
 
         # Get all assignments by status
         all_assignments = []
-        if hasattr(ctx.liquidity_coordinator, '_mcf_assignments'):
-            all_assignments = list(ctx.liquidity_coordinator._mcf_assignments.values())
+        if hasattr(ctx.liquidity_coordinator, 'get_all_assignments'):
+            all_assignments = ctx.liquidity_coordinator.get_all_assignments()
 
         pending = [a for a in all_assignments if a.status == "pending"]
         executing = [a for a in all_assignments if a.status == "executing"]
