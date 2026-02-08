@@ -497,10 +497,51 @@ class IntentManager:
     # CLEANUP
     # =========================================================================
     
+    def clear_intents_by_peer(self, peer_id: str) -> int:
+        """
+        Clear all intent locks held by a specific peer (e.g., on ban).
+
+        Aborts pending DB intents and removes from remote cache.
+
+        Args:
+            peer_id: The peer whose intents to clear
+
+        Returns:
+            Number of intents cleared
+        """
+        cleared = 0
+
+        # Clear from DB: abort any pending intents by this peer
+        try:
+            pending = self.db.get_pending_intents()
+            for intent_row in pending:
+                if intent_row.get("initiator") == peer_id:
+                    intent_id = intent_row.get("id")
+                    if intent_id:
+                        self.db.update_intent_status(intent_id, STATUS_ABORTED)
+                        cleared += 1
+        except Exception as e:
+            self._log(f"Error clearing DB intents for {peer_id[:16]}...: {e}", level='warn')
+
+        # Clear from remote cache
+        with self._remote_lock:
+            stale_keys = [
+                key for key, intent in self._remote_intents.items()
+                if intent.initiator == peer_id
+            ]
+            for key in stale_keys:
+                del self._remote_intents[key]
+            cleared += len(stale_keys)
+
+        if cleared:
+            self._log(f"Cleared {cleared} intents for peer {peer_id[:16]}...")
+
+        return cleared
+
     def cleanup_expired_intents(self) -> int:
         """
         Clean up expired and stale intents.
-        
+
         Returns:
             Number of intents cleaned up
         """

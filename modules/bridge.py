@@ -555,7 +555,8 @@ class Bridge:
         # Security: Rate limit policy changes per peer (Issue #27)
         now = time.time()
         if not bypass_rate_limit:
-            last_change = self._policy_last_change.get(peer_id, 0)
+            with self._budget_lock:
+                last_change = self._policy_last_change.get(peer_id, 0)
             if now - last_change < POLICY_RATE_LIMIT_SECONDS:
                 wait_time = int(POLICY_RATE_LIMIT_SECONDS - (now - last_change))
                 self._log(
@@ -584,10 +585,12 @@ class Bridge:
 
             success = result.get("status") == "success"
             if success:
-                self._policy_last_change[peer_id] = now
-                if len(self._policy_last_change) > MAX_POLICY_CACHE:
-                    oldest_key = min(self._policy_last_change, key=self._policy_last_change.get)
-                    del self._policy_last_change[oldest_key]
+                with self._budget_lock:
+                    self._policy_last_change[peer_id] = now
+                    if len(self._policy_last_change) > MAX_POLICY_CACHE:
+                        if self._policy_last_change:
+                            oldest_key = min(self._policy_last_change, key=self._policy_last_change.get)
+                            del self._policy_last_change[oldest_key]
                 self._log(f"Set {'hive' if is_member else 'dynamic'} policy for {peer_id[:16]}...")
             else:
                 self._log(f"Policy set returned: {result}", level='warn')

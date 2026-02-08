@@ -2267,12 +2267,15 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             )
         return {"result": "continue"}
 
-    # Verify original sender is a Hive member before processing
+    # Verify original sender is a Hive member and not banned before processing
     if not database:
         return {"result": "continue"}
     member = database.get_member(sender_id)
     if not member:
         plugin.log(f"cl-hive: GOSSIP from non-member {sender_id[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+    if database.is_banned(sender_id):
+        plugin.log(f"cl-hive: GOSSIP from banned member {sender_id[:16]}..., ignoring", level='warn')
         return {"result": "continue"}
 
     accepted = gossip_mgr.process_gossip(sender_id, payload)
@@ -2349,6 +2352,16 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             level='warn'
         )
         return {"result": "continue"}
+
+    # SECURITY: Verify sender is a member and not banned
+    if database:
+        member = database.get_member(peer_id)
+        if not member:
+            plugin.log(f"cl-hive: STATE_HASH from non-member {peer_id[:16]}..., ignoring", level='warn')
+            return {"result": "continue"}
+        if database.is_banned(peer_id):
+            plugin.log(f"cl-hive: STATE_HASH from banned member {peer_id[:16]}..., ignoring", level='warn')
+            return {"result": "continue"}
 
     hashes_match = gossip_mgr.process_state_hash(peer_id, payload)
 
@@ -2438,6 +2451,12 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         if not member:
             plugin.log(
                 f"cl-hive: FULL_SYNC rejected from non-member {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+        if database.is_banned(peer_id):
+            plugin.log(
+                f"cl-hive: FULL_SYNC rejected from banned member {peer_id[:16]}...",
                 level='warn'
             )
             return {"result": "continue"}
@@ -3240,12 +3259,15 @@ def handle_intent(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not intent_mgr:
         return {"result": "continue"}
 
-    # P3-02: Verify sender is a Hive member before processing
+    # P3-02: Verify sender is a Hive member and not banned before processing
     if not database:
         return {"result": "continue"}
     member = database.get_member(peer_id)
     if not member:
         plugin.log(f"cl-hive: INTENT from non-member {peer_id[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+    if database.is_banned(peer_id):
+        plugin.log(f"cl-hive: INTENT from banned member {peer_id[:16]}..., ignoring", level='warn')
         return {"result": "continue"}
 
     required_fields = ["intent_type", "target", "initiator", "timestamp"]
@@ -4412,9 +4434,12 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if event_id:
         payload["_event_id"] = event_id
 
-    # Verify voter is a member or admin
+    # Verify voter is a member or admin and not banned
     voter = database.get_member(voter_peer_id)
     if not voter or voter.get("tier") not in (MembershipTier.MEMBER.value,):
+        return {"result": "continue"}
+    if database.is_banned(voter_peer_id):
+        plugin.log(f"cl-hive: BAN_VOTE from banned member {voter_peer_id[:16]}..., ignoring", level='warn')
         return {"result": "continue"}
 
     # Get the proposal
@@ -4521,6 +4546,15 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
         proposer_id = proposal.get("proposer_peer_id", "quorum_vote")
         database.add_ban(target_peer_id, proposal.get("reason", "quorum_ban"), proposer_id)
         database.remove_member(target_peer_id)
+
+        # Clear any intent locks held by the banned member
+        if intent_mgr:
+            try:
+                cleared = intent_mgr.clear_intents_by_peer(target_peer_id)
+                if cleared:
+                    plugin.log(f"cl-hive: Cleared {cleared} intent locks for banned member {target_peer_id[:16]}...")
+            except Exception as e:
+                plugin.log(f"cl-hive: Failed to clear intents for banned member: {e}", level='warn')
 
         # Revert fee policy
         if bridge and bridge.status == BridgeStatus.ENABLED:
@@ -6172,7 +6206,15 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
 
     for marker_data in markers:
         try:
-            # Add depositor field (the original reporter)
+            # Verify depositor matches reporter to prevent attribution spoofing
+            claimed_depositor = marker_data.get("depositor")
+            if claimed_depositor and claimed_depositor != reporter_id:
+                plugin.log(
+                    f"cl-hive: Marker depositor mismatch: claimed {claimed_depositor[:16]}... "
+                    f"but reporter is {reporter_id[:16]}..., overriding",
+                    level='debug'
+                )
+            # Force depositor to match the authenticated reporter
             marker_data["depositor"] = reporter_id
 
             # Use the existing receive_marker_from_gossip method
@@ -8420,15 +8462,18 @@ def intent_monitor_loop():
 def process_ready_intents():
     """
     Process intents that are ready to commit.
-    
+
     An intent is ready if:
     - Status is 'pending'
     - Current time > timestamp + hold_seconds
     """
     if not intent_mgr or not database or not config:
         return
-    
-    ready_intents = database.get_pending_intents_ready(config.intent_hold_seconds)
+
+    # Use config snapshot to avoid reading mutable config mid-cycle
+    cfg = config.snapshot()
+
+    ready_intents = database.get_pending_intents_ready(cfg.intent_hold_seconds)
 
     for intent_row in ready_intents:
         intent_id = intent_row.get('id')
@@ -8439,11 +8484,11 @@ def process_ready_intents():
         # to prevent state inconsistency where intents are COMMITTED but never executed
         # In advisor mode, intents wait for AI/human approval
         # In failsafe mode, only emergency actions auto-execute (not intents)
-        if config.governance_mode != "failsafe":
+        if cfg.governance_mode != "failsafe":
             if safe_plugin:
                 safe_plugin.log(
                     f"cl-hive: Intent {intent_id} ready but not committing "
-                    f"(mode={config.governance_mode})",
+                    f"(mode={cfg.governance_mode})",
                     level='debug'
                 )
             continue

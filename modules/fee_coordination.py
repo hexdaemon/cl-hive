@@ -997,7 +997,7 @@ class AdaptiveFeeController:
         for r in recent:
             age_hours = (now - r.get("timestamp", now)) / 3600
             recency_weight = max(0.1, 1.0 - (age_hours / 24))
-            level_weight = r.get("level", 0) / 10  # Normalize level
+            level_weight = min(10.0, max(0.0, r.get("level", 0))) / 10  # Normalize and bound level
             weight = recency_weight * level_weight * r.get("weight", 0.3)
 
             weighted_fee += r.get("fee_ppm", 0) * weight
@@ -1184,17 +1184,17 @@ class StigmergicCoordinator:
         Read markers left by other fleet members for this route.
         """
         key = (source, destination)
-        markers = self._markers.get(key, [])
-
         now = time.time()
         result = []
 
-        for m in markers:
-            # Update strength based on decay
-            current_strength = self._calculate_marker_strength(m, now)
-            if current_strength > MARKER_MIN_STRENGTH:
-                m.strength = current_strength
-                result.append(m)
+        with self._lock:
+            markers = self._markers.get(key, [])
+            for m in markers:
+                # Update strength based on decay
+                current_strength = self._calculate_marker_strength(m, now)
+                if current_strength > MARKER_MIN_STRENGTH:
+                    m.strength = current_strength
+                    result.append(m)
 
         return result
 
@@ -1241,6 +1241,10 @@ class StigmergicCoordinator:
     def receive_marker_from_gossip(self, marker_data: Dict) -> Optional[RouteMarker]:
         """Process a marker received from fleet gossip."""
         try:
+            # Bound strength to [0, 1] to prevent manipulation via gossip
+            raw_strength = marker_data.get("strength", 1.0)
+            bounded_strength = max(0.0, min(1.0, float(raw_strength)))
+
             marker = RouteMarker(
                 depositor=marker_data["depositor"],
                 source_peer_id=marker_data["source_peer_id"],
@@ -1249,12 +1253,13 @@ class StigmergicCoordinator:
                 success=marker_data["success"],
                 volume_sats=marker_data["volume_sats"],
                 timestamp=marker_data["timestamp"],
-                strength=marker_data.get("strength", 1.0)
+                strength=bounded_strength
             )
 
             key = (marker.source_peer_id, marker.destination_peer_id)
-            self._markers[key].append(marker)
-            self._prune_markers(key)
+            with self._lock:
+                self._markers[key].append(marker)
+                self._prune_markers(key)
 
             return marker
         except (KeyError, TypeError) as e:
