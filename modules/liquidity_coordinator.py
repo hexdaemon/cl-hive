@@ -612,6 +612,8 @@ class LiquidityCoordinator:
             else:
                 health_score = 50
 
+            # Clamp health_score to valid range before priority calc
+            health_score = max(0, min(100, health_score))
             # Lower health = higher priority (inverted)
             health_priority = 1.0 - (health_score / 100.0)
 

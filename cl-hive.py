@@ -10036,6 +10036,8 @@ def _broadcast_our_pheromones():
                     "peer_id": ch.get("peer_id")
                 })
         fee_coordination_mgr.adaptive_controller.update_channel_peer_mappings(channel_infos)
+        if anticipatory_liquidity_mgr:
+            anticipatory_liquidity_mgr.update_channel_peer_mappings(channel_infos)
 
         # Get hive member IDs to exclude from sharing
         members = database.get_all_members()

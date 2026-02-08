@@ -65,6 +65,7 @@ SATURATION_PCT_THRESHOLD = 0.80       # >80% local = saturation risk
 MAX_PREDICTIONS_PER_CHANNEL = 5       # Max predictions cached per channel
 PREDICTION_STALE_HOURS = 1            # Refresh predictions hourly
 MAX_FLOW_HISTORY_CHANNELS = 500
+MAX_FLOW_SAMPLES_PER_CHANNEL = 2000  # ~83 days at 1 sample/hour
 
 # =============================================================================
 # INTRA-DAY PATTERN DETECTION SETTINGS (Kalman-Enhanced)
@@ -551,6 +552,13 @@ class AnticipatoryLiquidityManager:
         # Peer-to-channel mapping for queries by peer_id
         self._peer_to_channels: Dict[str, Set[str]] = defaultdict(set)
 
+        # Intra-day pattern cache (previously lazy-initialized via hasattr)
+        self._intraday_cache: Dict[str, Dict] = {}
+        # Channel-to-peer mapping for pattern sharing
+        self._channel_peer_map: Dict[str, str] = {}
+        # Remote temporal patterns from fleet members
+        self._remote_patterns: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
         if self.plugin:
@@ -602,29 +610,34 @@ class AnticipatoryLiquidityManager:
             timestamp=ts
         )
 
-        # Add to in-memory history
-        self._flow_history[channel_id].append(sample)
+        # Add to in-memory history (lock protects shared caches)
+        with self._lock:
+            self._flow_history[channel_id].append(sample)
 
-        # Evict oldest channel if dict exceeds limit
-        if len(self._flow_history) > MAX_FLOW_HISTORY_CHANNELS:
-            oldest_cid = None
-            oldest_ts = float('inf')
-            for cid, samples_list in self._flow_history.items():
-                if cid == channel_id:
-                    continue
-                last_ts = samples_list[-1].timestamp if samples_list else 0
-                if last_ts < oldest_ts:
-                    oldest_ts = last_ts
-                    oldest_cid = cid
-            if oldest_cid:
-                del self._flow_history[oldest_cid]
+            # Enforce per-channel sample limit
+            if len(self._flow_history[channel_id]) > MAX_FLOW_SAMPLES_PER_CHANNEL:
+                self._flow_history[channel_id] = self._flow_history[channel_id][-MAX_FLOW_SAMPLES_PER_CHANNEL:]
 
-        # Trim old samples (keep PATTERN_WINDOW_DAYS)
-        cutoff = ts - (PATTERN_WINDOW_DAYS * 24 * 3600)
-        self._flow_history[channel_id] = [
-            s for s in self._flow_history[channel_id]
-            if s.timestamp > cutoff
-        ]
+            # Evict oldest channel if dict exceeds limit
+            if len(self._flow_history) > MAX_FLOW_HISTORY_CHANNELS:
+                oldest_cid = None
+                oldest_ts = float('inf')
+                for cid, samples_list in self._flow_history.items():
+                    if cid == channel_id:
+                        continue
+                    last_ts = samples_list[-1].timestamp if samples_list else 0
+                    if last_ts < oldest_ts:
+                        oldest_ts = last_ts
+                        oldest_cid = cid
+                if oldest_cid:
+                    del self._flow_history[oldest_cid]
+
+            # Trim old samples (keep PATTERN_WINDOW_DAYS)
+            cutoff = ts - (PATTERN_WINDOW_DAYS * 24 * 3600)
+            self._flow_history[channel_id] = [
+                s for s in self._flow_history[channel_id]
+                if s.timestamp > cutoff
+            ]
 
         # Persist to database
         self._persist_flow_sample(sample)
@@ -673,12 +686,14 @@ class AnticipatoryLiquidityManager:
                 ))
 
             # Update in-memory cache
-            self._flow_history[channel_id] = samples
+            with self._lock:
+                self._flow_history[channel_id] = samples
             return samples
 
         except Exception as e:
             self._log(f"Failed to load flow history: {e}", level="debug")
-            return self._flow_history.get(channel_id, [])
+            with self._lock:
+                return list(self._flow_history.get(channel_id, []))
 
     # =========================================================================
     # PATTERN DETECTION
@@ -707,10 +722,11 @@ class AnticipatoryLiquidityManager:
         now = int(time.time())
 
         # Check cache
-        if not force_refresh and channel_id in self._pattern_cache:
-            cache_age = now - self._pattern_cache_time.get(channel_id, 0)
-            if cache_age < PREDICTION_STALE_HOURS * 3600:
-                return self._pattern_cache[channel_id]
+        with self._lock:
+            if not force_refresh and channel_id in self._pattern_cache:
+                cache_age = now - self._pattern_cache_time.get(channel_id, 0)
+                if cache_age < PREDICTION_STALE_HOURS * 3600:
+                    return list(self._pattern_cache[channel_id])
 
         # Load history
         samples = self.load_flow_history(channel_id)
@@ -742,8 +758,9 @@ class AnticipatoryLiquidityManager:
             patterns.extend(monthly_patterns)
 
         # Cache results
-        self._pattern_cache[channel_id] = patterns
-        self._pattern_cache_time[channel_id] = now
+        with self._lock:
+            self._pattern_cache[channel_id] = patterns
+            self._pattern_cache_time[channel_id] = now
 
         self._log(
             f"Detected {len(patterns)} patterns for {channel_id[:12]}... "
@@ -1141,10 +1158,11 @@ class AnticipatoryLiquidityManager:
         cache_key = f"intraday_{channel_id}"
 
         # Check cache
-        if not force_refresh and hasattr(self, '_intraday_cache'):
-            cached = self._intraday_cache.get(cache_key)
-            if cached and (now - cached.get('time', 0)) < PREDICTION_STALE_HOURS * 3600:
-                return cached.get('patterns', [])
+        with self._lock:
+            if not force_refresh:
+                cached = self._intraday_cache.get(cache_key)
+                if cached and (now - cached.get('time', 0)) < PREDICTION_STALE_HOURS * 3600:
+                    return list(cached.get('patterns', []))
 
         # Load flow history
         samples = self.load_flow_history(channel_id)
@@ -1158,7 +1176,8 @@ class AnticipatoryLiquidityManager:
 
         if kalman_data is not None:
             # Get full Kalman report for uncertainty
-            reports = self._kalman_velocities.get(channel_id, [])
+            with self._lock:
+                reports = list(self._kalman_velocities.get(channel_id, []))
             if reports:
                 valid_reports = [r for r in reports if not r.is_stale()]
                 if valid_reports:
@@ -1185,12 +1204,11 @@ class AnticipatoryLiquidityManager:
                 patterns.append(pattern)
 
         # Cache results
-        if not hasattr(self, '_intraday_cache'):
-            self._intraday_cache: Dict[str, Dict] = {}
-        self._intraday_cache[cache_key] = {
-            'time': now,
-            'patterns': patterns
-        }
+        with self._lock:
+            self._intraday_cache[cache_key] = {
+                'time': now,
+                'patterns': patterns
+            }
 
         self._log(
             f"Detected {len(patterns)} intra-day patterns for {channel_id[:12]}...",
@@ -1514,7 +1532,9 @@ class AnticipatoryLiquidityManager:
             # Get patterns for all channels with flow history
             patterns = []
             forecasts = []
-            for cid in list(self._flow_history.keys())[:20]:  # Limit to 20
+            with self._lock:
+                channel_ids = list(self._flow_history.keys())[:20]  # Limit to 20
+            for cid in channel_ids:
                 channel_patterns = self.detect_intraday_patterns(cid)
                 patterns.extend(channel_patterns)
                 forecast = self.get_intraday_forecast(cid)
@@ -1656,7 +1676,8 @@ class AnticipatoryLiquidityManager:
         )
 
         # Cache prediction
-        self._prediction_cache[channel_id] = prediction
+        with self._lock:
+            self._prediction_cache[channel_id] = prediction
 
         return prediction
 
@@ -1738,7 +1759,8 @@ class AnticipatoryLiquidityManager:
 
         This is the fallback when no Kalman data is available.
         """
-        samples = self._flow_history.get(channel_id, [])
+        with self._lock:
+            samples = list(self._flow_history.get(channel_id, []))
         if len(samples) < 2 or capacity_sats == 0:
             return 0.0
 
@@ -1775,7 +1797,8 @@ class AnticipatoryLiquidityManager:
         Returns:
             Consensus velocity (% change per hour) or None if unavailable
         """
-        reports = self._kalman_velocities.get(channel_id, [])
+        with self._lock:
+            reports = list(self._kalman_velocities.get(channel_id, []))
         if not reports:
             return None
 
@@ -2169,11 +2192,15 @@ class AnticipatoryLiquidityManager:
 
     def get_status(self) -> Dict[str, Any]:
         """Get manager status for diagnostics."""
+        with self._lock:
+            channels_with_patterns = len(self._pattern_cache)
+            channels_with_predictions = len(self._prediction_cache)
+            total_flow_samples = sum(len(s) for s in self._flow_history.values())
         return {
             "active": True,
-            "channels_with_patterns": len(self._pattern_cache),
-            "channels_with_predictions": len(self._prediction_cache),
-            "total_flow_samples": sum(len(s) for s in self._flow_history.values()),
+            "channels_with_patterns": channels_with_patterns,
+            "channels_with_predictions": channels_with_predictions,
+            "total_flow_samples": total_flow_samples,
             "pattern_window_days": PATTERN_WINDOW_DAYS,
             "prediction_stale_hours": PREDICTION_STALE_HOURS,
             "min_pattern_samples": MIN_PATTERN_SAMPLES,
@@ -2183,7 +2210,9 @@ class AnticipatoryLiquidityManager:
     def get_patterns_summary(self) -> Dict[str, Any]:
         """Get summary of detected patterns across all channels."""
         all_patterns = []
-        for channel_id, patterns in self._pattern_cache.items():
+        with self._lock:
+            cache_snapshot = dict(self._pattern_cache)
+        for channel_id, patterns in cache_snapshot.items():
             for p in patterns:
                 all_patterns.append(p.to_dict())
 
@@ -2228,9 +2257,13 @@ class AnticipatoryLiquidityManager:
         exclude_peer_ids = exclude_peer_ids or set()
         shareable = []
 
-        for channel_id, patterns in self._pattern_cache.items():
+        with self._lock:
+            cache_snapshot = dict(self._pattern_cache)
+            peer_map_snapshot = dict(self._channel_peer_map)
+
+        for channel_id, patterns in cache_snapshot.items():
             # Get peer_id for this channel (if we have mapping)
-            peer_id = self._channel_peer_map.get(channel_id) if hasattr(self, '_channel_peer_map') else None
+            peer_id = peer_map_snapshot.get(channel_id)
             if not peer_id:
                 continue
 
@@ -2262,19 +2295,17 @@ class AnticipatoryLiquidityManager:
 
     def set_channel_peer_mapping(self, channel_id: str, peer_id: str) -> None:
         """Set the mapping from channel_id to peer_id for sharing."""
-        if not hasattr(self, '_channel_peer_map'):
-            self._channel_peer_map: Dict[str, str] = {}
-        self._channel_peer_map[channel_id] = peer_id
+        with self._lock:
+            self._channel_peer_map[channel_id] = peer_id
 
     def update_channel_peer_mappings(self, channels: List[Dict[str, Any]]) -> None:
         """Update channel-to-peer mappings from a list of channel info."""
-        if not hasattr(self, '_channel_peer_map'):
-            self._channel_peer_map: Dict[str, str] = {}
-        for ch in channels:
-            channel_id = ch.get("short_channel_id")
-            peer_id = ch.get("peer_id")
-            if channel_id and peer_id:
-                self._channel_peer_map[channel_id] = peer_id
+        with self._lock:
+            for ch in channels:
+                channel_id = ch.get("short_channel_id")
+                peer_id = ch.get("peer_id")
+                if channel_id and peer_id:
+                    self._channel_peer_map[channel_id] = peer_id
 
     def receive_pattern_from_fleet(
         self,
@@ -2297,24 +2328,21 @@ class AnticipatoryLiquidityManager:
         if not peer_id:
             return False
 
-        # Initialize remote patterns storage if needed
-        if not hasattr(self, "_remote_patterns"):
-            self._remote_patterns: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-
-        # Limit total number of tracked peers to prevent unbounded growth
-        MAX_REMOTE_PEERS = 500
-        if peer_id not in self._remote_patterns and len(self._remote_patterns) >= MAX_REMOTE_PEERS:
-            # Evict oldest peer (by most recent pattern timestamp)
-            oldest_peer = None
-            oldest_time = float('inf')
-            for pid, patterns in self._remote_patterns.items():
-                if patterns:
-                    latest = max(p.get("timestamp", 0) for p in patterns)
-                    if latest < oldest_time:
-                        oldest_time = latest
-                        oldest_peer = pid
-            if oldest_peer:
-                del self._remote_patterns[oldest_peer]
+        with self._lock:
+            # Limit total number of tracked peers to prevent unbounded growth
+            MAX_REMOTE_PEERS = 500
+            if peer_id not in self._remote_patterns and len(self._remote_patterns) >= MAX_REMOTE_PEERS:
+                # Evict oldest peer (by most recent pattern timestamp)
+                oldest_peer = None
+                oldest_time = float('inf')
+                for pid, patterns in self._remote_patterns.items():
+                    if patterns:
+                        latest = max(p.get("timestamp", 0) for p in patterns)
+                        if latest < oldest_time:
+                            oldest_time = latest
+                            oldest_peer = pid
+                if oldest_peer:
+                    del self._remote_patterns[oldest_peer]
 
         hour = pattern_data.get("hour_of_day", -1)
         day = pattern_data.get("day_of_week", -1)
@@ -2330,11 +2358,12 @@ class AnticipatoryLiquidityManager:
             "timestamp": time.time()
         }
 
-        self._remote_patterns[peer_id].append(entry)
+        with self._lock:
+            self._remote_patterns[peer_id].append(entry)
 
-        # Keep only recent patterns per peer (last 50)
-        if len(self._remote_patterns[peer_id]) > 50:
-            self._remote_patterns[peer_id] = self._remote_patterns[peer_id][-50:]
+            # Keep only recent patterns per peer (last 50)
+            if len(self._remote_patterns[peer_id]) > 50:
+                self._remote_patterns[peer_id] = self._remote_patterns[peer_id][-50:]
 
         return True
 
@@ -2350,10 +2379,8 @@ class AnticipatoryLiquidityManager:
         Returns:
             List of aggregated pattern data
         """
-        if not hasattr(self, "_remote_patterns"):
-            return []
-
-        patterns = self._remote_patterns.get(peer_id, [])
+        with self._lock:
+            patterns = list(self._remote_patterns.get(peer_id, []))
         if not patterns:
             return []
 
@@ -2365,22 +2392,20 @@ class AnticipatoryLiquidityManager:
 
     def cleanup_old_remote_patterns(self, max_age_days: float = 7) -> int:
         """Remove old remote pattern data."""
-        if not hasattr(self, "_remote_patterns"):
-            return 0
-
         cutoff = time.time() - (max_age_days * 86400)
         cleaned = 0
 
-        for peer_id in list(self._remote_patterns.keys()):
-            before = len(self._remote_patterns[peer_id])
-            self._remote_patterns[peer_id] = [
-                p for p in self._remote_patterns[peer_id]
-                if p.get("timestamp", 0) > cutoff
-            ]
-            cleaned += before - len(self._remote_patterns[peer_id])
+        with self._lock:
+            for peer_id in list(self._remote_patterns.keys()):
+                before = len(self._remote_patterns[peer_id])
+                self._remote_patterns[peer_id] = [
+                    p for p in self._remote_patterns[peer_id]
+                    if p.get("timestamp", 0) > cutoff
+                ]
+                cleaned += before - len(self._remote_patterns[peer_id])
 
-            if not self._remote_patterns[peer_id]:
-                del self._remote_patterns[peer_id]
+                if not self._remote_patterns[peer_id]:
+                    del self._remote_patterns[peer_id]
 
         return cleaned
 
@@ -2437,26 +2462,6 @@ class AnticipatoryLiquidityManager:
         if uncertainty < 0:
             uncertainty = abs(uncertainty)
 
-        # Limit total channels tracked to prevent unbounded growth
-        MAX_KALMAN_CHANNELS = 1000
-        if channel_id not in self._kalman_velocities and len(self._kalman_velocities) >= MAX_KALMAN_CHANNELS:
-            # Evict channel with oldest reports (least recently updated)
-            oldest_channel = None
-            oldest_time = float('inf')
-            for cid, reports in self._kalman_velocities.items():
-                if reports:
-                    latest = max(r.timestamp for r in reports)
-                    if latest < oldest_time:
-                        oldest_time = latest
-                        oldest_channel = cid
-            if oldest_channel:
-                # Clean up peer_to_channels mapping for evicted channel
-                for pid in list(self._peer_to_channels.keys()):
-                    self._peer_to_channels[pid].discard(oldest_channel)
-                    if not self._peer_to_channels[pid]:
-                        del self._peer_to_channels[pid]
-                del self._kalman_velocities[oldest_channel]
-
         report = KalmanVelocityReport(
             channel_id=channel_id,
             peer_id=peer_id,
@@ -2468,26 +2473,47 @@ class AnticipatoryLiquidityManager:
             is_regime_change=is_regime_change
         )
 
-        # Update or add report from this reporter
-        reports = self._kalman_velocities[channel_id]
-        updated = False
-        for i, existing in enumerate(reports):
-            if existing.reporter_id == reporter_id:
-                reports[i] = report
-                updated = True
-                break
+        with self._lock:
+            # Limit total channels tracked to prevent unbounded growth
+            MAX_KALMAN_CHANNELS = 1000
+            if channel_id not in self._kalman_velocities and len(self._kalman_velocities) >= MAX_KALMAN_CHANNELS:
+                # Evict channel with oldest reports (least recently updated)
+                oldest_channel = None
+                oldest_time = float('inf')
+                for cid, reps in self._kalman_velocities.items():
+                    if reps:
+                        latest = max(r.timestamp for r in reps)
+                        if latest < oldest_time:
+                            oldest_time = latest
+                            oldest_channel = cid
+                if oldest_channel:
+                    # Clean up peer_to_channels mapping for evicted channel
+                    for pid in list(self._peer_to_channels.keys()):
+                        self._peer_to_channels[pid].discard(oldest_channel)
+                        if not self._peer_to_channels[pid]:
+                            del self._peer_to_channels[pid]
+                    del self._kalman_velocities[oldest_channel]
 
-        if not updated:
-            reports.append(report)
+            # Update or add report from this reporter
+            reports = self._kalman_velocities[channel_id]
+            updated = False
+            for i, existing in enumerate(reports):
+                if existing.reporter_id == reporter_id:
+                    reports[i] = report
+                    updated = True
+                    break
 
-        # Limit reports per channel (keep most recent 10)
-        if len(reports) > 10:
-            reports.sort(key=lambda r: r.timestamp, reverse=True)
-            self._kalman_velocities[channel_id] = reports[:10]
+            if not updated:
+                reports.append(report)
 
-        # Update peer-to-channel mapping
-        if peer_id:
-            self._peer_to_channels[peer_id].add(channel_id)
+            # Limit reports per channel (keep most recent 10)
+            if len(reports) > 10:
+                reports.sort(key=lambda r: r.timestamp, reverse=True)
+                self._kalman_velocities[channel_id] = reports[:10]
+
+            # Update peer-to-channel mapping
+            if peer_id:
+                self._peer_to_channels[peer_id].add(channel_id)
 
         self._log(
             f"Received Kalman velocity for {channel_id[:12]}... from {reporter_id[:12]}...: "
@@ -2513,7 +2539,8 @@ class AnticipatoryLiquidityManager:
         Returns:
             Aggregated Kalman velocity data or None
         """
-        reports = self._kalman_velocities.get(channel_id, [])
+        with self._lock:
+            reports = list(self._kalman_velocities.get(channel_id, []))
         if not reports:
             return None
 
@@ -2531,7 +2558,7 @@ class AnticipatoryLiquidityManager:
         else:
             # Combined variance from multiple independent estimates
             inv_var_sum = sum(1.0 / max(0.001, r.uncertainty ** 2) for r in valid_reports)
-            aggregate_uncertainty = 1.0 / math.sqrt(inv_var_sum) if inv_var_sum > 0 else 0.1
+            aggregate_uncertainty = 1.0 / math.sqrt(max(0.001, inv_var_sum))
 
         # Average flow ratio
         avg_flow_ratio = sum(r.flow_ratio for r in valid_reports) / len(valid_reports)
@@ -2560,16 +2587,18 @@ class AnticipatoryLiquidityManager:
 
     def get_kalman_velocity_status(self) -> Dict[str, Any]:
         """Get status of Kalman velocity integration."""
-        now = int(time.time())
-        total_reports = sum(len(r) for r in self._kalman_velocities.values())
-        fresh_reports = sum(
-            sum(1 for r in reports if not r.is_stale())
-            for reports in self._kalman_velocities.values()
-        )
+        with self._lock:
+            total_reports = sum(len(r) for r in self._kalman_velocities.values())
+            fresh_reports = sum(
+                sum(1 for r in reports if not r.is_stale())
+                for reports in self._kalman_velocities.values()
+            )
+            channels_with_data = len(self._kalman_velocities)
+            channel_ids = list(self._kalman_velocities.keys())
+            unique_peers = len(self._peer_to_channels)
 
-        channels_with_data = len(self._kalman_velocities)
         channels_with_consensus = sum(
-            1 for channel_id in self._kalman_velocities
+            1 for channel_id in channel_ids
             if self._get_kalman_consensus_velocity(channel_id) is not None
         )
 
@@ -2579,7 +2608,7 @@ class AnticipatoryLiquidityManager:
             "fresh_reports": fresh_reports,
             "channels_with_data": channels_with_data,
             "channels_with_consensus": channels_with_consensus,
-            "unique_peers": len(self._peer_to_channels),
+            "unique_peers": unique_peers,
             "ttl_seconds": KALMAN_VELOCITY_TTL_SECONDS,
             "min_confidence": KALMAN_MIN_CONFIDENCE,
             "min_reporters": KALMAN_MIN_REPORTERS
@@ -2589,15 +2618,16 @@ class AnticipatoryLiquidityManager:
         """Remove stale Kalman velocity reports."""
         cleaned = 0
 
-        for channel_id in list(self._kalman_velocities.keys()):
-            before = len(self._kalman_velocities[channel_id])
-            self._kalman_velocities[channel_id] = [
-                r for r in self._kalman_velocities[channel_id]
-                if not r.is_stale()
-            ]
-            cleaned += before - len(self._kalman_velocities[channel_id])
+        with self._lock:
+            for channel_id in list(self._kalman_velocities.keys()):
+                before = len(self._kalman_velocities[channel_id])
+                self._kalman_velocities[channel_id] = [
+                    r for r in self._kalman_velocities[channel_id]
+                    if not r.is_stale()
+                ]
+                cleaned += before - len(self._kalman_velocities[channel_id])
 
-            if not self._kalman_velocities[channel_id]:
-                del self._kalman_velocities[channel_id]
+                if not self._kalman_velocities[channel_id]:
+                    del self._kalman_velocities[channel_id]
 
         return cleaned

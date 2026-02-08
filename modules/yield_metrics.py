@@ -13,6 +13,7 @@ This module bridges cl-hive coordination with cl-revenue-ops profitability data.
 """
 
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -350,6 +351,9 @@ class YieldMetricsManager:
         self.bridge = bridge
         self.our_pubkey: Optional[str] = None
 
+        # Lock protecting in-memory caches
+        self._lock = threading.Lock()
+
         # Cache for velocity calculations
         self._velocity_cache: Dict[str, Dict] = {}
         self._velocity_cache_ttl = 300  # 5 minutes
@@ -615,12 +619,16 @@ class YieldMetricsManager:
         """
         # Check cache first
         now = time.time()
-        cached = self._velocity_cache.get(channel_id)
-        if cached and now - cached.get("timestamp", 0) < self._velocity_cache_ttl:
-            return cached
+        with self._lock:
+            cached = self._velocity_cache.get(channel_id)
+            if cached and now - cached.get("timestamp", 0) < self._velocity_cache_ttl:
+                return dict(cached)
 
         try:
             # Query channel history from advisor database
+            # get_channel_history may not exist on all database implementations
+            if not hasattr(self.database, 'get_channel_history'):
+                return None
             history = self.database.get_channel_history(channel_id, hours=48)
 
             if not history or len(history) < 2:
@@ -649,7 +657,8 @@ class YieldMetricsManager:
             }
 
             # Cache result
-            self._velocity_cache[channel_id] = result
+            with self._lock:
+                self._velocity_cache[channel_id] = result
 
             return result
 
@@ -863,10 +872,6 @@ class YieldMetricsManager:
         if not peer_id:
             return False
 
-        # Initialize remote metrics storage if needed
-        if not hasattr(self, "_remote_yield_metrics"):
-            self._remote_yield_metrics = {}
-
         entry = {
             "reporter_id": reporter_id,
             "roi_pct": metrics_data.get("roi_pct", 0),
@@ -877,27 +882,28 @@ class YieldMetricsManager:
             "timestamp": time.time()
         }
 
-        if peer_id not in self._remote_yield_metrics:
-            self._remote_yield_metrics[peer_id] = []
+        with self._lock:
+            if peer_id not in self._remote_yield_metrics:
+                self._remote_yield_metrics[peer_id] = []
 
-        # Keep only recent reports per peer (last 5 reporters)
-        self._remote_yield_metrics[peer_id].append(entry)
-        if len(self._remote_yield_metrics[peer_id]) > 5:
-            self._remote_yield_metrics[peer_id] = self._remote_yield_metrics[peer_id][-5:]
+            # Keep only recent reports per peer (last 5 reporters)
+            self._remote_yield_metrics[peer_id].append(entry)
+            if len(self._remote_yield_metrics[peer_id]) > 5:
+                self._remote_yield_metrics[peer_id] = self._remote_yield_metrics[peer_id][-5:]
 
-        # Evict least-recently-updated peer if dict exceeds limit
-        max_peers = 200
-        if len(self._remote_yield_metrics) > max_peers:
-            oldest_pid = min(
-                (p for p in self._remote_yield_metrics if p != peer_id),
-                key=lambda p: max(
-                    (e.get("timestamp", 0) for e in self._remote_yield_metrics[p]),
-                    default=0
-                ),
-                default=None
-            )
-            if oldest_pid:
-                del self._remote_yield_metrics[oldest_pid]
+            # Evict least-recently-updated peer if dict exceeds limit
+            max_peers = 200
+            if len(self._remote_yield_metrics) > max_peers:
+                oldest_pid = min(
+                    (p for p in self._remote_yield_metrics if p != peer_id),
+                    key=lambda p: max(
+                        (e.get("timestamp", 0) for e in self._remote_yield_metrics[p]),
+                        default=0
+                    ),
+                    default=None
+                )
+                if oldest_pid:
+                    del self._remote_yield_metrics[oldest_pid]
 
         return True
 
@@ -913,10 +919,8 @@ class YieldMetricsManager:
         Returns:
             Dict with consensus metrics or None if no data
         """
-        if not hasattr(self, "_remote_yield_metrics"):
-            return None
-
-        reports = self._remote_yield_metrics.get(peer_id, [])
+        with self._lock:
+            reports = list(self._remote_yield_metrics.get(peer_id, []))
         if not reports:
             return None
 
@@ -962,21 +966,19 @@ class YieldMetricsManager:
 
     def cleanup_old_remote_yield_metrics(self, max_age_days: float = 7) -> int:
         """Remove old remote yield data."""
-        if not hasattr(self, "_remote_yield_metrics"):
-            return 0
-
         cutoff = time.time() - (max_age_days * 86400)
         cleaned = 0
 
-        for peer_id in list(self._remote_yield_metrics.keys()):
-            before = len(self._remote_yield_metrics[peer_id])
-            self._remote_yield_metrics[peer_id] = [
-                r for r in self._remote_yield_metrics[peer_id]
-                if r.get("timestamp", 0) > cutoff
-            ]
-            cleaned += before - len(self._remote_yield_metrics[peer_id])
+        with self._lock:
+            for peer_id in list(self._remote_yield_metrics.keys()):
+                before = len(self._remote_yield_metrics[peer_id])
+                self._remote_yield_metrics[peer_id] = [
+                    r for r in self._remote_yield_metrics[peer_id]
+                    if r.get("timestamp", 0) > cutoff
+                ]
+                cleaned += before - len(self._remote_yield_metrics[peer_id])
 
-            if not self._remote_yield_metrics[peer_id]:
-                del self._remote_yield_metrics[peer_id]
+                if not self._remote_yield_metrics[peer_id]:
+                    del self._remote_yield_metrics[peer_id]
 
         return cleaned
