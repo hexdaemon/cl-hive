@@ -237,6 +237,14 @@ class StateManager:
             if not isinstance(entry, str) or not entry or len(entry) > MAX_PEER_ID_LEN:
                 return False
 
+        # Validate capabilities field (prevent unbounded arrays or non-string entries)
+        capabilities = data.get("capabilities", [])
+        if not isinstance(capabilities, list) or len(capabilities) > 20:
+            return False
+        for cap in capabilities:
+            if not isinstance(cap, str) or len(cap) > 32:
+                return False
+
         # Cap available at capacity (don't mutate caller's dict — caller handles it)
         if data.get('available_sats', 0) > data.get('capacity_sats', 0):
             return False
