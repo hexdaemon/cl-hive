@@ -7,7 +7,7 @@
 FROM ubuntu:24.04
 
 LABEL maintainer="Lightning Goats Team"
-LABEL version="2.2.7"
+LABEL version="2.2.8"
 LABEL description="Production Lightning node with cl-hive coordination"
 
 # Prevent interactive prompts during install
