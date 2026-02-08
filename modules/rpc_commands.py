@@ -2729,6 +2729,12 @@ def execute_hive_circular_rebalance(
     if not ctx.cost_reduction_mgr:
         return {"error": "Cost reduction not initialized"}
 
+    # Permission check: fund movements require member tier
+    if not dry_run:
+        perm_err = check_permission(ctx, "member")
+        if perm_err:
+            return perm_err
+
     try:
         return ctx.cost_reduction_mgr.execute_hive_circular_rebalance(
             from_channel=from_channel,
@@ -3259,7 +3265,7 @@ def rebalance_hubs(
         for hub in hubs:
             hub_dict = hub.to_dict()
             # Get alias if available from state manager
-            if ctx.state_manager:
+            if getattr(ctx, 'state_manager', None):
                 state = ctx.state_manager.get_peer_state(hub.member_id)
                 if state and hasattr(state, 'alias') and state.alias:
                     hub_dict['alias'] = state.alias
@@ -3321,7 +3327,7 @@ def rebalance_path(
         enriched_path = []
         for peer_id in path:
             node_info = {"peer_id": peer_id}
-            if ctx.state_manager:
+            if getattr(ctx, 'state_manager', None):
                 state = ctx.state_manager.get_peer_state(peer_id)
                 if state and hasattr(state, 'alias') and state.alias:
                     node_info['alias'] = state.alias

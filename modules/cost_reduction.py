@@ -1755,6 +1755,7 @@ class CostReductionManager:
                 assignments = self._mcf_coordinator.get_our_assignments()
                 for assignment in assignments:
                     if (assignment.from_channel == from_channel and
+                        assignment.to_channel == to_channel and
                         assignment.amount_sats >= amount_sats):
                         return {
                             "source": "mcf",

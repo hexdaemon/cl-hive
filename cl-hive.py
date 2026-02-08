@@ -8291,13 +8291,7 @@ def _broadcast_mcf_completion(assignment_id: str, success: bool,
         return 0
 
     completion_msg = liquidity_coord.create_mcf_completion_message(
-        our_pubkey,
-        assignment_id,
-        success,
-        actual_amount_sats,
-        actual_cost_sats,
-        failure_reason,
-        safe_plugin.rpc
+        assignment_id
     )
 
     if not completion_msg:
@@ -9717,12 +9711,7 @@ def _process_mcf_assignments():
             pending = liquidity_coord.get_pending_mcf_assignments()
             if pending:
                 solution_timestamp = pending[0].solution_timestamp
-                ack_msg = liquidity_coord.create_mcf_ack_message(
-                    our_pubkey,
-                    solution_timestamp,
-                    pending_count,
-                    safe_plugin.rpc
-                )
+                ack_msg = liquidity_coord.create_mcf_ack_message()
                 if ack_msg:
                     _broadcast_mcf_ack(ack_msg)
 
@@ -9747,30 +9736,10 @@ def _check_stuck_mcf_assignments():
     if not liquidity_coord:
         return
 
-    # Get assignments in executing state
-    if not hasattr(liquidity_coord, '_mcf_assignments'):
-        return
-
-    now = int(time.time())
-    max_execution_time = 1800  # 30 minutes max for execution
-
-    stuck_assignments = []
-    for assignment in liquidity_coord._mcf_assignments.values():
-        if assignment.status == "executing":
-            # Check if executing for too long
-            age = now - assignment.received_at
-            if age > max_execution_time:
-                stuck_assignments.append(assignment)
-
-    # Mark stuck assignments as failed
-    for assignment in stuck_assignments:
-        liquidity_coord.update_mcf_assignment_status(
-            assignment.assignment_id,
-            "failed",
-            error_message="execution_timeout"
-        )
+    timed_out = liquidity_coord.timeout_stuck_assignments(max_execution_time=1800)
+    if timed_out:
         safe_plugin.log(
-            f"cl-hive: MCF assignment {assignment.assignment_id[:20]}... timed out",
+            f"cl-hive: Timed out {len(timed_out)} stuck MCF assignments",
             level='warn'
         )
 

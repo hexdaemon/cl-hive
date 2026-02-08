@@ -1723,6 +1723,34 @@ class LiquidityCoordinator:
         if expired:
             self._log(f"Cleaned up {len(expired)} old MCF assignments", "debug")
 
+    def timeout_stuck_assignments(self, max_execution_time: int = 1800) -> List[str]:
+        """
+        Check for and timeout assignments stuck in 'executing' state.
+
+        Args:
+            max_execution_time: Max seconds in executing state (default: 30 min)
+
+        Returns:
+            List of assignment IDs that were timed out
+        """
+        now = int(time.time())
+        timed_out = []
+
+        with self._lock:
+            for assignment in list(self._mcf_assignments.values()):
+                if assignment.status == "executing":
+                    age = now - assignment.received_at
+                    if age > max_execution_time:
+                        assignment.status = "failed"
+                        assignment.error_message = "execution_timeout"
+                        assignment.completed_at = now
+                        timed_out.append(assignment.assignment_id)
+
+        for aid in timed_out:
+            self._log(f"MCF assignment {aid[:20]}... timed out after {max_execution_time}s", "warn")
+
+        return timed_out
+
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
         if self.plugin:
