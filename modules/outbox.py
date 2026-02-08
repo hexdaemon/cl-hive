@@ -173,12 +173,21 @@ class OutboxManager:
             try:
                 payload = json.loads(payload_json)
                 msg_bytes = serialize(HiveMessageType(msg_type), payload)
+            except Exception as e:
+                # Parse/serialize errors are permanent — retrying won't help
+                self._db.fail_outbox(msg_id, peer_id,
+                                     f"parse_error: {str(e)[:100]}")
+                stats["failed"] += 1
+                self._log(
+                    f"Outbox: permanent parse error for {msg_id[:16]}...: {e}",
+                    level='warn'
+                )
+                continue
+
+            try:
                 success = self._send_fn(peer_id, msg_bytes)
             except Exception as e:
-                next_retry = self._calculate_next_retry(retry_count)
-                self._db.update_outbox_sent(msg_id, peer_id, next_retry)
-                stats["skipped"] += 1
-                continue
+                success = False
 
             if success:
                 next_retry = self._calculate_next_retry(retry_count)

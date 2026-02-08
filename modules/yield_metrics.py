@@ -885,6 +885,20 @@ class YieldMetricsManager:
         if len(self._remote_yield_metrics[peer_id]) > 5:
             self._remote_yield_metrics[peer_id] = self._remote_yield_metrics[peer_id][-5:]
 
+        # Evict least-recently-updated peer if dict exceeds limit
+        max_peers = 200
+        if len(self._remote_yield_metrics) > max_peers:
+            oldest_pid = min(
+                (p for p in self._remote_yield_metrics if p != peer_id),
+                key=lambda p: max(
+                    (e.get("timestamp", 0) for e in self._remote_yield_metrics[p]),
+                    default=0
+                ),
+                default=None
+            )
+            if oldest_pid:
+                del self._remote_yield_metrics[oldest_pid]
+
         return True
 
     def get_fleet_yield_consensus(self, peer_id: str) -> Optional[Dict[str, Any]]:

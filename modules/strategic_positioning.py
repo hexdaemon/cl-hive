@@ -1102,8 +1102,9 @@ class PhysarumChannelManager:
         self.yield_metrics = yield_metrics_mgr
         self._our_pubkey: Optional[str] = None
 
-        # Channel flow history
+        # Channel flow history (bounded: max 500 channels, TTL 7 days)
         self._flow_history: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+        self._max_flow_channels = 500
 
     def set_our_pubkey(self, pubkey: str) -> None:
         """Set our node's pubkey."""
@@ -1917,14 +1918,26 @@ class StrategicPositioningManager:
             Dict with acknowledgment
         """
         # Store in flow history
-        self.physarum_mgr._flow_history[channel_id].append((time.time(), intensity))
+        fh = self.physarum_mgr._flow_history
+        fh[channel_id].append((time.time(), intensity))
 
         # Trim old entries
         cutoff = time.time() - (7 * 24 * 3600)  # Keep 7 days
-        self.physarum_mgr._flow_history[channel_id] = [
-            (t, i) for t, i in self.physarum_mgr._flow_history[channel_id]
+        fh[channel_id] = [
+            (t, i) for t, i in fh[channel_id]
             if t >= cutoff
         ]
+
+        # Evict oldest channel if dict exceeds limit
+        max_ch = getattr(self.physarum_mgr, '_max_flow_channels', 500)
+        if len(fh) > max_ch:
+            oldest_cid = min(
+                (c for c in fh if c != channel_id),
+                key=lambda c: fh[c][-1][0] if fh[c] else 0,
+                default=None
+            )
+            if oldest_cid:
+                del fh[oldest_cid]
 
         return {
             "recorded": True,

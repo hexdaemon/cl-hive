@@ -19,6 +19,7 @@ Author: Lightning Goats Team
 """
 
 import ipaddress
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -125,8 +126,8 @@ class VPNTransportManager:
     - Track VPN connectivity status
 
     Thread Safety:
-    - All state is local to this manager instance
-    - Dictionary operations are atomic in CPython
+    - Lock protects stats, peer connections, and config state
+    - Configure uses snapshot-swap pattern for atomic reconfiguration
     """
 
     def __init__(self, plugin=None):
@@ -137,6 +138,9 @@ class VPNTransportManager:
             plugin: Optional plugin reference for logging and RPC
         """
         self.plugin = plugin
+
+        # Lock protecting mutable state
+        self._lock = threading.Lock()
 
         # Transport mode
         self._mode: TransportMode = TransportMode.ANY
@@ -199,71 +203,71 @@ class VPNTransportManager:
             "warnings": []
         }
 
-        # Parse mode
+        # Build config in local variables, then atomic swap
+        new_mode = TransportMode.ANY
         try:
-            self._mode = TransportMode(mode.lower().strip())
-            result["mode"] = self._mode.value
+            new_mode = TransportMode(mode.lower().strip())
+            result["mode"] = new_mode.value
         except ValueError:
             self._log(f"Invalid transport mode '{mode}', using 'any'", level='warn')
-            self._mode = TransportMode.ANY
             result["mode"] = "any"
             result["warnings"].append(f"Invalid mode '{mode}', defaulting to 'any'")
 
         # Parse required messages
-        self._required_messages = set()
+        new_required: Set[MessageRequirement] = set()
         if required_messages:
             for req in required_messages.lower().split(','):
                 req = req.strip()
                 try:
-                    self._required_messages.add(MessageRequirement(req))
+                    new_required.add(MessageRequirement(req))
                 except ValueError:
                     result["warnings"].append(f"Invalid message requirement '{req}'")
 
         # Default to ALL if nothing specified and mode is not ANY
-        if not self._required_messages and self._mode != TransportMode.ANY:
-            self._required_messages.add(MessageRequirement.ALL)
+        if not new_required and new_mode != TransportMode.ANY:
+            new_required.add(MessageRequirement.ALL)
 
         # Parse VPN subnets
-        self._vpn_subnets = []
+        new_subnets: List[ipaddress.IPv4Network] = []
         if vpn_subnets:
             for subnet in vpn_subnets.split(','):
                 subnet = subnet.strip()
                 if not subnet:
                     continue
-                if len(self._vpn_subnets) >= MAX_VPN_SUBNETS:
+                if len(new_subnets) >= MAX_VPN_SUBNETS:
                     result["warnings"].append(f"Max {MAX_VPN_SUBNETS} subnets, ignoring extras")
                     break
                 try:
                     network = ipaddress.IPv4Network(subnet, strict=False)
-                    self._vpn_subnets.append(network)
+                    new_subnets.append(network)
                     result["subnets"].append(str(network))
                 except ValueError as e:
                     self._log(f"Invalid VPN subnet '{subnet}': {e}", level='warn')
                     result["warnings"].append(f"Invalid subnet '{subnet}'")
 
         # Parse VPN bind
-        self._vpn_bind = None
+        new_bind: Optional[Tuple[str, int]] = None
         if vpn_bind:
             try:
                 vpn_bind = vpn_bind.strip()
                 if ':' in vpn_bind:
                     ip, port = vpn_bind.rsplit(':', 1)
-                    self._vpn_bind = (ip, int(port))
+                    new_bind = (ip, int(port))
                 else:
-                    self._vpn_bind = (vpn_bind, DEFAULT_VPN_PORT)
-                result["bind"] = f"{self._vpn_bind[0]}:{self._vpn_bind[1]}"
+                    new_bind = (vpn_bind, DEFAULT_VPN_PORT)
+                result["bind"] = f"{new_bind[0]}:{new_bind[1]}"
             except ValueError as e:
                 self._log(f"Invalid VPN bind '{vpn_bind}': {e}", level='warn')
                 result["warnings"].append(f"Invalid bind '{vpn_bind}'")
 
         # Parse peer mappings
-        self._vpn_peers = {}
+        new_peers: Dict[str, VPNPeerMapping] = {}
         if vpn_peers:
             for mapping in vpn_peers.split(','):
                 mapping = mapping.strip()
                 if not mapping or '@' not in mapping:
                     continue
-                if len(self._vpn_peers) >= MAX_VPN_PEERS:
+                if len(new_peers) >= MAX_VPN_PEERS:
                     result["warnings"].append(f"Max {MAX_VPN_PEERS} peers, ignoring extras")
                     break
                 try:
@@ -279,17 +283,17 @@ class VPNTransportManager:
                         port = DEFAULT_VPN_PORT
 
                     # Validate IP is in VPN subnet (if subnets configured)
-                    if self._vpn_subnets:
+                    if new_subnets:
                         try:
                             ip_addr = ipaddress.IPv4Address(ip)
-                            if not any(ip_addr in subnet for subnet in self._vpn_subnets):
+                            if not any(ip_addr in subnet for subnet in new_subnets):
                                 result["warnings"].append(
                                     f"Peer {pubkey[:16]}... IP {ip} not in VPN subnets"
                                 )
                         except ValueError:
                             pass
 
-                    self._vpn_peers[pubkey] = VPNPeerMapping(
+                    new_peers[pubkey] = VPNPeerMapping(
                         pubkey=pubkey,
                         vpn_ip=ip,
                         vpn_port=port
@@ -298,8 +302,16 @@ class VPNTransportManager:
                     self._log(f"Invalid VPN peer mapping '{mapping}': {e}", level='warn')
                     result["warnings"].append(f"Invalid peer mapping '{mapping}'")
 
-        result["peers"] = len(self._vpn_peers)
-        self._configured = True
+        # Atomic swap under lock
+        with self._lock:
+            self._mode = new_mode
+            self._required_messages = new_required
+            self._vpn_subnets = new_subnets
+            self._vpn_bind = new_bind
+            self._vpn_peers = new_peers
+            self._configured = True
+
+        result["peers"] = len(new_peers)
 
         self._log(
             f"VPN transport configured: mode={self._mode.value}, "
@@ -411,12 +423,14 @@ class VPNTransportManager:
         """
         # Always accept in ANY mode
         if self._mode == TransportMode.ANY:
-            self._stats["messages_accepted"] += 1
+            with self._lock:
+                self._stats["messages_accepted"] += 1
             return (True, "any transport allowed")
 
         # Check if this message type requires VPN
         if not self._message_requires_vpn(message_type):
-            self._stats["messages_accepted"] += 1
+            with self._lock:
+                self._stats["messages_accepted"] += 1
             return (True, f"message type '{message_type}' does not require VPN")
 
         # Get or update connection info
@@ -443,10 +457,12 @@ class VPNTransportManager:
         # Apply transport mode policy
         if self._mode == TransportMode.VPN_ONLY:
             if is_vpn:
-                self._stats["messages_accepted"] += 1
+                with self._lock:
+                    self._stats["messages_accepted"] += 1
                 return (True, "vpn transport verified")
             else:
-                self._stats["messages_rejected"] += 1
+                with self._lock:
+                    self._stats["messages_rejected"] += 1
                 self._log(
                     f"Rejected {message_type} from {peer_id[:16]}...: non-VPN connection",
                     level='debug'
@@ -454,15 +470,16 @@ class VPNTransportManager:
                 return (False, "vpn-only mode: non-VPN connection rejected")
 
         if self._mode == TransportMode.VPN_PREFERRED:
-            if is_vpn:
+            with self._lock:
                 self._stats["messages_accepted"] += 1
+            if is_vpn:
                 return (True, "vpn transport (preferred)")
             else:
-                self._stats["messages_accepted"] += 1
                 return (True, "vpn-preferred: allowing non-VPN fallback")
 
         # Default accept
-        self._stats["messages_accepted"] += 1
+        with self._lock:
+            self._stats["messages_accepted"] += 1
         return (True, "transport check passed")
 
     def _message_requires_vpn(self, message_type: str) -> bool:
@@ -526,15 +543,16 @@ class VPNTransportManager:
         Returns:
             True if added successfully
         """
-        if len(self._vpn_peers) >= MAX_VPN_PEERS and pubkey not in self._vpn_peers:
-            self._log(f"Cannot add peer {pubkey[:16]}...: max peers reached", level='warn')
-            return False
+        with self._lock:
+            if len(self._vpn_peers) >= MAX_VPN_PEERS and pubkey not in self._vpn_peers:
+                self._log(f"Cannot add peer {pubkey[:16]}...: max peers reached", level='warn')
+                return False
 
-        self._vpn_peers[pubkey] = VPNPeerMapping(
-            pubkey=pubkey,
-            vpn_ip=vpn_ip,
-            vpn_port=vpn_port
-        )
+            self._vpn_peers[pubkey] = VPNPeerMapping(
+                pubkey=pubkey,
+                vpn_ip=vpn_ip,
+                vpn_port=vpn_port
+            )
         self._log(f"Added VPN peer mapping: {pubkey[:16]}... -> {vpn_ip}:{vpn_port}")
         return True
 
@@ -548,17 +566,19 @@ class VPNTransportManager:
         Returns:
             True if removed
         """
-        if pubkey in self._vpn_peers:
-            del self._vpn_peers[pubkey]
-            self._log(f"Removed VPN peer mapping: {pubkey[:16]}...")
-            return True
-        return False
+        with self._lock:
+            if pubkey in self._vpn_peers:
+                del self._vpn_peers[pubkey]
+                self._log(f"Removed VPN peer mapping: {pubkey[:16]}...")
+                return True
+            return False
 
     def _get_or_create_connection_info(self, peer_id: str) -> VPNConnectionInfo:
         """Get or create connection info for a peer."""
-        if peer_id not in self._peer_connections:
-            self._peer_connections[peer_id] = VPNConnectionInfo(peer_id=peer_id)
-        return self._peer_connections[peer_id]
+        with self._lock:
+            if peer_id not in self._peer_connections:
+                self._peer_connections[peer_id] = VPNConnectionInfo(peer_id=peer_id)
+            return self._peer_connections[peer_id]
 
     # =========================================================================
     # CONNECTION EVENTS
@@ -576,22 +596,23 @@ class VPNTransportManager:
             Connection info dictionary
         """
         conn_info = self._get_or_create_connection_info(peer_id)
-        conn_info.connection_count += 1
-        conn_info.last_verified = int(time.time())
+        with self._lock:
+            conn_info.connection_count += 1
+            conn_info.last_verified = int(time.time())
 
-        is_vpn = False
-        if address:
-            ip = self.extract_ip_from_address(address)
-            if ip:
-                is_vpn = self.is_vpn_address(ip)
-                if is_vpn:
-                    conn_info.vpn_ip = ip
-                    conn_info.connected_via_vpn = True
-                    self._stats["vpn_connections"] += 1
-                    self._log(f"Peer {peer_id[:16]}... connected via VPN ({ip})")
-                else:
-                    conn_info.connected_via_vpn = False
-                    self._stats["non_vpn_connections"] += 1
+            is_vpn = False
+            if address:
+                ip = self.extract_ip_from_address(address)
+                if ip:
+                    is_vpn = self.is_vpn_address(ip)
+                    if is_vpn:
+                        conn_info.vpn_ip = ip
+                        conn_info.connected_via_vpn = True
+                        self._stats["vpn_connections"] += 1
+                        self._log(f"Peer {peer_id[:16]}... connected via VPN ({ip})")
+                    else:
+                        conn_info.connected_via_vpn = False
+                        self._stats["non_vpn_connections"] += 1
 
         return {
             "peer_id": peer_id,
@@ -606,8 +627,9 @@ class VPNTransportManager:
         Args:
             peer_id: Disconnected peer's pubkey
         """
-        if peer_id in self._peer_connections:
-            self._peer_connections[peer_id].connected_via_vpn = False
+        with self._lock:
+            if peer_id in self._peer_connections:
+                self._peer_connections[peer_id].connected_via_vpn = False
 
     # =========================================================================
     # STATUS AND DIAGNOSTICS
@@ -620,26 +642,27 @@ class VPNTransportManager:
         Returns:
             Status dictionary
         """
-        vpn_connected = [
-            pid for pid, info in self._peer_connections.items()
-            if info.connected_via_vpn
-        ]
+        with self._lock:
+            vpn_connected = [
+                pid for pid, info in self._peer_connections.items()
+                if info.connected_via_vpn
+            ]
 
-        return {
-            "configured": self._configured,
-            "mode": self._mode.value,
-            "required_messages": [r.value for r in self._required_messages],
-            "vpn_subnets": [str(s) for s in self._vpn_subnets],
-            "vpn_bind": f"{self._vpn_bind[0]}:{self._vpn_bind[1]}" if self._vpn_bind else None,
-            "configured_peers": len(self._vpn_peers),
-            "vpn_connected_peers": vpn_connected,
-            "vpn_connected_count": len(vpn_connected),
-            "statistics": self._stats.copy(),
-            "peer_mappings": {
-                k[:16] + "...": v.vpn_address
-                for k, v in self._vpn_peers.items()
+            return {
+                "configured": self._configured,
+                "mode": self._mode.value,
+                "required_messages": [r.value for r in self._required_messages],
+                "vpn_subnets": [str(s) for s in self._vpn_subnets],
+                "vpn_bind": f"{self._vpn_bind[0]}:{self._vpn_bind[1]}" if self._vpn_bind else None,
+                "configured_peers": len(self._vpn_peers),
+                "vpn_connected_peers": vpn_connected,
+                "vpn_connected_count": len(vpn_connected),
+                "statistics": self._stats.copy(),
+                "peer_mappings": {
+                    k[:16] + "...": v.vpn_address
+                    for k, v in self._vpn_peers.items()
+                }
             }
-        }
 
     def get_peer_vpn_info(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -678,11 +701,12 @@ class VPNTransportManager:
 
     def reset_statistics(self) -> Dict[str, int]:
         """Reset and return statistics."""
-        old_stats = self._stats.copy()
-        self._stats = {
-            "messages_accepted": 0,
-            "messages_rejected": 0,
-            "vpn_connections": 0,
-            "non_vpn_connections": 0
-        }
+        with self._lock:
+            old_stats = self._stats.copy()
+            self._stats = {
+                "messages_accepted": 0,
+                "messages_rejected": 0,
+                "vpn_connections": 0,
+                "non_vpn_connections": 0
+            }
         return old_stats

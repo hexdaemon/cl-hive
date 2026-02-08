@@ -125,11 +125,17 @@ class PeerReputationManager:
         max_count, period = limit
         now = time.time()
 
-        # Clean old entries
+        # Clean old entries for this sender
         rate_tracker[sender] = [
             ts for ts in rate_tracker[sender]
             if now - ts < period
         ]
+
+        # Periodically evict empty/stale keys (every 100th sender check)
+        if len(rate_tracker) > 200:
+            stale = [k for k, v in rate_tracker.items() if not v]
+            for k in stale:
+                del rate_tracker[k]
 
         return len(rate_tracker[sender]) < max_count
 
