@@ -733,19 +733,21 @@ class LiquidityCoordinator:
         """
         nnlb_status = self.get_nnlb_assistance_status()
 
-        # Count need types
-        inbound_needs = sum(
-            1 for n in self._liquidity_needs.values()
-            if n.need_type == NEED_INBOUND
-        )
-        outbound_needs = sum(
-            1 for n in self._liquidity_needs.values()
-            if n.need_type == NEED_OUTBOUND
-        )
+        # Count need types under lock to prevent RuntimeError during iteration
+        with self._lock:
+            inbound_needs = sum(
+                1 for n in self._liquidity_needs.values()
+                if n.need_type == NEED_INBOUND
+            )
+            outbound_needs = sum(
+                1 for n in self._liquidity_needs.values()
+                if n.need_type == NEED_OUTBOUND
+            )
+            pending_count = len(self._liquidity_needs)
 
         return {
             "status": "active",
-            "pending_needs": len(self._liquidity_needs),
+            "pending_needs": pending_count,
             "inbound_needs": inbound_needs,
             "outbound_needs": outbound_needs,
             "nnlb_status": nnlb_status
@@ -1529,7 +1531,7 @@ class LiquidityCoordinator:
         # Enforce limits
         with self._lock:
             if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
-                self._cleanup_old_mcf_assignments()
+                self._cleanup_old_mcf_assignments_unlocked()
                 # If still at limit after cleanup, reject
                 if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
                     return False
@@ -1553,18 +1555,19 @@ class LiquidityCoordinator:
         Returns:
             List of pending assignments (status='pending'), sorted by priority
         """
-        self._cleanup_old_mcf_assignments()
-
-        pending = [
-            a for a in self._mcf_assignments.values()
-            if a.status == "pending"
-        ]
+        with self._lock:
+            self._cleanup_old_mcf_assignments_unlocked()
+            pending = [
+                a for a in self._mcf_assignments.values()
+                if a.status == "pending"
+            ]
 
         return sorted(pending, key=lambda a: a.priority)
 
     def get_mcf_assignment(self, assignment_id: str) -> Optional[MCFAssignment]:
         """Get a specific MCF assignment by ID."""
-        return self._mcf_assignments.get(assignment_id)
+        with self._lock:
+            return self._mcf_assignments.get(assignment_id)
 
     def update_mcf_assignment_status(
         self,
@@ -1587,17 +1590,18 @@ class LiquidityCoordinator:
         Returns:
             True if assignment was found and updated
         """
-        assignment = self._mcf_assignments.get(assignment_id)
-        if not assignment:
-            return False
+        with self._lock:
+            assignment = self._mcf_assignments.get(assignment_id)
+            if not assignment:
+                return False
 
-        assignment.status = status
-        assignment.actual_amount_sats = actual_amount_sats
-        assignment.actual_cost_sats = actual_cost_sats
-        assignment.error_message = error_message
+            assignment.status = status
+            assignment.actual_amount_sats = actual_amount_sats
+            assignment.actual_cost_sats = actual_cost_sats
+            assignment.error_message = error_message
 
-        if status in ("completed", "failed", "rejected"):
-            assignment.completed_at = int(time.time())
+            if status in ("completed", "failed", "rejected"):
+                assignment.completed_at = int(time.time())
 
         self._log(
             f"MCF assignment {assignment_id} status updated to {status}",
@@ -1606,6 +1610,45 @@ class LiquidityCoordinator:
 
         return True
 
+    def claim_pending_assignment(self, assignment_id: str = None) -> Optional[MCFAssignment]:
+        """
+        Atomically find and claim a pending MCF assignment.
+
+        Prevents TOCTOU race by doing lookup + status update in a single lock.
+
+        Args:
+            assignment_id: Specific assignment to claim, or None for highest priority
+
+        Returns:
+            The claimed MCFAssignment (now status='executing'), or None
+        """
+        with self._lock:
+            self._cleanup_old_mcf_assignments_unlocked()
+
+            if assignment_id:
+                # Claim specific assignment
+                assignment = self._mcf_assignments.get(assignment_id)
+                if not assignment or assignment.status != "pending":
+                    return None
+            else:
+                # Claim highest priority pending assignment
+                pending = [
+                    a for a in self._mcf_assignments.values()
+                    if a.status == "pending"
+                ]
+                if not pending:
+                    return None
+                assignment = min(pending, key=lambda a: a.priority)
+
+            # Atomically mark as executing
+            assignment.status = "executing"
+
+        self._log(
+            f"MCF assignment {assignment.assignment_id} claimed (executing)",
+            "info"
+        )
+        return assignment
+
     def create_mcf_ack_message(self) -> Optional[bytes]:
         """
         Create MCF_ASSIGNMENT_ACK message for current solution.
@@ -1613,24 +1656,26 @@ class LiquidityCoordinator:
         Returns:
             Serialized message or None if no pending solution
         """
-        if self._mcf_ack_sent:
-            return None
-
-        if not self._last_mcf_solution_timestamp:
-            return None
+        with self._lock:
+            if self._mcf_ack_sent:
+                return None
+            if not self._last_mcf_solution_timestamp:
+                return None
+            solution_ts = self._last_mcf_solution_timestamp
 
         pending = self.get_pending_mcf_assignments()
         assignment_count = len(pending)
 
         try:
             msg = create_mcf_assignment_ack(
-                solution_timestamp=self._last_mcf_solution_timestamp,
+                solution_timestamp=solution_ts,
                 assignment_count=assignment_count,
                 rpc=self.plugin.rpc,
                 our_pubkey=self.our_pubkey
             )
             if msg:
-                self._mcf_ack_sent = True
+                with self._lock:
+                    self._mcf_ack_sent = True
             return msg
         except Exception as e:
             self._log(f"Error creating MCF ACK: {e}", "warn")
@@ -1649,20 +1694,25 @@ class LiquidityCoordinator:
         Returns:
             Serialized message or None on error
         """
-        assignment = self._mcf_assignments.get(assignment_id)
-        if not assignment:
-            return None
-
-        if assignment.status not in ("completed", "failed", "rejected"):
-            return None
+        with self._lock:
+            assignment = self._mcf_assignments.get(assignment_id)
+            if not assignment:
+                return None
+            if assignment.status not in ("completed", "failed", "rejected"):
+                return None
+            # Snapshot fields under lock
+            success = (assignment.status == "completed")
+            actual_amount = assignment.actual_amount_sats
+            actual_cost = assignment.actual_cost_sats
+            error_msg = assignment.error_message
 
         try:
             return create_mcf_completion_report(
                 assignment_id=assignment_id,
-                success=(assignment.status == "completed"),
-                actual_amount_sats=assignment.actual_amount_sats,
-                actual_cost_sats=assignment.actual_cost_sats,
-                error_message=assignment.error_message,
+                success=success,
+                actual_amount_sats=actual_amount,
+                actual_cost_sats=actual_cost,
+                error_message=error_msg,
                 rpc=self.plugin.rpc,
                 our_pubkey=self.our_pubkey
             )
@@ -1677,17 +1727,21 @@ class LiquidityCoordinator:
         Returns:
             Dict with assignment counts and details
         """
-        self._cleanup_old_mcf_assignments()
+        with self._lock:
+            self._cleanup_old_mcf_assignments_unlocked()
 
-        all_assignments = list(self._mcf_assignments.values())
+            all_assignments = list(self._mcf_assignments.values())
+            solution_ts = self._last_mcf_solution_timestamp
+            ack_sent = self._mcf_ack_sent
+
         pending = [a for a in all_assignments if a.status == "pending"]
         executing = [a for a in all_assignments if a.status == "executing"]
         completed = [a for a in all_assignments if a.status == "completed"]
         failed = [a for a in all_assignments if a.status in ("failed", "rejected")]
 
         return {
-            "last_solution_timestamp": self._last_mcf_solution_timestamp,
-            "ack_sent": self._mcf_ack_sent,
+            "last_solution_timestamp": solution_ts,
+            "ack_sent": ack_sent,
             "assignment_counts": {
                 "total": len(all_assignments),
                 "pending": len(pending),
@@ -1699,8 +1753,8 @@ class LiquidityCoordinator:
             "total_pending_amount_sats": sum(a.amount_sats for a in pending),
         }
 
-    def _cleanup_old_mcf_assignments(self) -> None:
-        """Remove old/expired MCF assignments."""
+    def _cleanup_old_mcf_assignments_unlocked(self) -> None:
+        """Remove old/expired MCF assignments. Caller MUST hold self._lock."""
         now = time.time()
         expired = []
 
@@ -1722,6 +1776,11 @@ class LiquidityCoordinator:
 
         if expired:
             self._log(f"Cleaned up {len(expired)} old MCF assignments", "debug")
+
+    def _cleanup_old_mcf_assignments(self) -> None:
+        """Remove old/expired MCF assignments (acquires lock)."""
+        with self._lock:
+            self._cleanup_old_mcf_assignments_unlocked()
 
     def get_all_assignments(self) -> List:
         """Return a snapshot of all MCF assignments (thread-safe)."""

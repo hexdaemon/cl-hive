@@ -532,9 +532,11 @@ class IntentManager:
         Returns:
             Dict with intent metrics
         """
+        with self._remote_lock:
+            remote_count = len(self._remote_intents)
         return {
             'hold_seconds': self.hold_seconds,
             'our_pubkey': self.our_pubkey[:16] + '...' if self.our_pubkey else None,
-            'remote_intents_cached': len(self._remote_intents),
+            'remote_intents_cached': remote_count,
             'registered_callbacks': list(self._commit_callbacks.keys())
         }

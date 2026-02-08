@@ -3376,7 +3376,7 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
         sig_result = safe_plugin.rpc.signmessage(signing_payload)
         abort_payload['signature'] = sig_result['zbase']
     except Exception as e:
-        plugin.log(f"cl-hive: Failed to sign INTENT_ABORT: {e}", level='error')
+        safe_plugin.log(f"cl-hive: Failed to sign INTENT_ABORT: {e}", level='error')
         return
 
     abort_msg = serialize(HiveMessageType.INTENT_ABORT, abort_payload)
@@ -8169,6 +8169,10 @@ def handle_mcf_completion_report(peer_id: str, payload: Dict, plugin: Plugin) ->
     if not database or not cost_reduction_mgr:
         return {"result": "continue"}
 
+    # Only the coordinator should process completion reports
+    if our_pubkey != cost_reduction_mgr.get_current_mcf_coordinator():
+        return {"result": "continue"}
+
     # Validate payload structure
     if not validate_mcf_completion_report(payload):
         plugin.log(
@@ -8253,18 +8257,16 @@ def _send_mcf_ack(coordinator_id: str, solution_timestamp: int, assignment_count
     if not liquidity_coord or not safe_plugin:
         return False
 
-    ack_msg = liquidity_coord.create_mcf_ack_message(
-        our_pubkey,
-        solution_timestamp,
-        assignment_count,
-        safe_plugin.rpc
-    )
+    ack_msg = liquidity_coord.create_mcf_ack_message()
 
     if not ack_msg:
         return False
 
     try:
-        safe_plugin.rpc.sendcustommsg(coordinator_id, ack_msg.hex())
+        safe_plugin.rpc.sendcustommsg(
+            node_id=coordinator_id,
+            msg=ack_msg.hex()
+        )
         return True
     except Exception as e:
         safe_plugin.log(f"cl-hive: Failed to send MCF ACK: {e}", level='debug')
@@ -16223,45 +16225,24 @@ def hive_claim_mcf_assignment(plugin: Plugin, assignment_id: str = None):
         return {"success": False, "error": "Liquidity coordinator not initialized"}
 
     try:
-        # Get pending assignments
-        pending = liquidity_coord.get_pending_mcf_assignments()
+        # Atomically find and claim assignment (prevents TOCTOU race)
+        claimed = liquidity_coord.claim_pending_assignment(assignment_id)
 
-        if not pending:
-            return {"success": False, "error": "No pending assignments"}
-
-        # Find assignment to claim
-        to_claim = None
-        if assignment_id:
-            for a in pending:
-                if a.assignment_id == assignment_id:
-                    to_claim = a
-                    break
-            if not to_claim:
-                return {"success": False, "error": f"Assignment {assignment_id} not found or not pending"}
-        else:
-            # Claim highest priority (lowest number)
-            to_claim = min(pending, key=lambda a: a.priority)
-
-        # Mark as executing
-        updated = liquidity_coord.update_mcf_assignment_status(
-            assignment_id=to_claim.assignment_id,
-            status="executing"
-        )
-
-        if not updated:
-            return {"success": False, "error": "Failed to claim assignment"}
+        if not claimed:
+            error_msg = f"Assignment {assignment_id} not found or not pending" if assignment_id else "No pending assignments"
+            return {"success": False, "error": error_msg}
 
         return {
             "success": True,
             "assignment": {
-                "assignment_id": to_claim.assignment_id,
-                "from_channel": to_claim.from_channel,
-                "to_channel": to_claim.to_channel,
-                "amount_sats": to_claim.amount_sats,
-                "expected_cost_sats": to_claim.expected_cost_sats,
-                "priority": to_claim.priority,
-                "path": to_claim.path,
-                "via_fleet": to_claim.via_fleet,
+                "assignment_id": claimed.assignment_id,
+                "from_channel": claimed.from_channel,
+                "to_channel": claimed.to_channel,
+                "amount_sats": claimed.amount_sats,
+                "expected_cost_sats": claimed.expected_cost_sats,
+                "priority": claimed.priority,
+                "path": claimed.path,
+                "via_fleet": claimed.via_fleet,
             }
         }
 

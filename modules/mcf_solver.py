@@ -125,19 +125,23 @@ class MCFCircuitBreaker:
     def can_execute(self) -> bool:
         """Check if MCF operation should be attempted."""
         with self._lock:
-            if self.state == self.CLOSED:
-                return True
+            return self._can_execute_unlocked()
 
-            if self.state == self.OPEN:
-                # Check if recovery timeout has passed
-                elapsed = time.time() - self.last_state_change
-                if elapsed >= MCF_CIRCUIT_RECOVERY_TIMEOUT:
-                    self._transition_to(self.HALF_OPEN)
-                    return True
-                return False
-
-            # HALF_OPEN - allow one attempt
+    def _can_execute_unlocked(self) -> bool:
+        """Check if MCF operation should be attempted. Caller must hold self._lock."""
+        if self.state == self.CLOSED:
             return True
+
+        if self.state == self.OPEN:
+            # Check if recovery timeout has passed
+            elapsed = time.time() - self.last_state_change
+            if elapsed >= MCF_CIRCUIT_RECOVERY_TIMEOUT:
+                self._transition_to(self.HALF_OPEN)
+                return True
+            return False
+
+        # HALF_OPEN - allow one attempt
+        return True
 
     def _transition_to(self, new_state: str) -> None:
         """Transition to a new state. Caller must hold self._lock."""
@@ -151,8 +155,8 @@ class MCFCircuitBreaker:
 
     def get_status(self) -> Dict[str, Any]:
         """Get circuit breaker status."""
-        can_exec = self.can_execute()
         with self._lock:
+            can_exec = self._can_execute_unlocked()
             now = time.time()
             return {
                 "state": self.state,

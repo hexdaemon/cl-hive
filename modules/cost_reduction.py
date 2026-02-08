@@ -13,6 +13,7 @@ reactively when desperate and fees are high.
 Author: Lightning Goats Team
 """
 
+import threading
 import time
 import math
 from dataclasses import dataclass, field
@@ -808,7 +809,7 @@ class FleetRebalanceRouter:
         # Return best path
         best_path = scored_paths[0][0]
         hub_scores = self.get_member_hub_scores()
-        avg_hub = sum(hub_scores.get(m, 0.0) for m in best_path) / len(best_path)
+        avg_hub = sum(hub_scores.get(m, 0.0) for m in best_path) / max(1, len(best_path))
 
         return FleetPath(
             path=best_path,
@@ -1219,7 +1220,7 @@ class CircularFlowDetector:
                     "members_involved": cf.members,
                     "total_amount_sats": cf.total_amount_sats,
                     "total_cost_sats": cf.total_cost_sats,
-                    "cycle_count": cf.members_count,
+                    "cycle_count": cf.cycle_count,
                     "detection_window_hours": cf.detection_window_hours,
                     "recommendation": recommendation
                 })
@@ -1294,7 +1295,7 @@ class CircularFlowDetector:
                     "members_involved": cf.members,
                     "total_amount_sats": cf.total_amount_sats,
                     "total_cost_sats": cf.total_cost_sats,
-                    "cycle_count": cf.members_count,
+                    "cycle_count": cf.cycle_count,
                     "recommendation": self._get_circular_flow_recommendation(
                         cf.members, cf.total_amount_sats, cf.total_cost_sats
                     )
@@ -1407,6 +1408,10 @@ class CostReductionManager:
         self._mcf_enabled: bool = True  # Can be disabled via config
 
         self._our_pubkey: Optional[str] = None
+
+        # MCF ACK tracking (thread-safe)
+        self._mcf_acks: Dict[str, Dict[str, Any]] = {}
+        self._mcf_acks_lock = threading.Lock()
 
     def set_our_pubkey(self, pubkey: str) -> None:
         """Set our node's pubkey."""
@@ -1806,27 +1811,26 @@ class CostReductionManager:
         if not self._mcf_coordinator:
             return
 
-        # Track ACK for monitoring
+        # Track ACK for monitoring (thread-safe)
         ack_key = f"{member_id}:{solution_timestamp}"
-        if not hasattr(self, "_mcf_acks"):
-            self._mcf_acks: Dict[str, Dict[str, Any]] = {}
 
-        self._mcf_acks[ack_key] = {
-            "member_id": member_id,
-            "solution_timestamp": solution_timestamp,
-            "assignment_count": assignment_count,
-            "received_at": int(time.time())
-        }
+        with self._mcf_acks_lock:
+            self._mcf_acks[ack_key] = {
+                "member_id": member_id,
+                "solution_timestamp": solution_timestamp,
+                "assignment_count": assignment_count,
+                "received_at": int(time.time())
+            }
 
-        # Limit cache size
-        if len(self._mcf_acks) > 500:
-            # Remove oldest entries
-            sorted_acks = sorted(
-                self._mcf_acks.items(),
-                key=lambda x: x[1].get("received_at", 0)
-            )
-            for k, _ in sorted_acks[:100]:
-                del self._mcf_acks[k]
+            # Limit cache size
+            if len(self._mcf_acks) > 500:
+                # Remove oldest entries
+                sorted_acks = sorted(
+                    self._mcf_acks.items(),
+                    key=lambda x: x[1].get("received_at", 0)
+                )
+                for k, _ in sorted_acks[:100]:
+                    del self._mcf_acks[k]
 
         self._log(f"Recorded MCF ACK from {member_id[:16]}... for solution {solution_timestamp}")
 
