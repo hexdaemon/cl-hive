@@ -157,8 +157,9 @@ RUN git clone --depth 1 https://github.com/ksedgwic/clboss.git \
 # =============================================================================
 # VITALITY PLUGIN (REQUIRED)
 # =============================================================================
-# Plugin vitality monitors CLN plugin health and auto-restarts failed plugins.
-# Essential for production deployments to maintain uptime.
+# Vitality monitors channel health, gossip health, and pings Amboss for online status.
+# Essential for production deployments to maintain uptime and Amboss visibility.
+# Config: vitality-amboss=true (set in docker-entrypoint.sh)
 
 ARG VITALITY_VERSION=v0.4.5
 RUN ARCH=$(uname -m) \
