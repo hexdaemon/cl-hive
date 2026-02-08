@@ -473,6 +473,14 @@ class TaskManager:
         target = task_params.get('target')
         amount_sats = task_params.get('amount_sats')
 
+        if not target or amount_sats is None:
+            self._log("Invalid expand task params: missing target or amount_sats", level='error')
+            self.db.update_incoming_task_status(
+                request_id, 'failed',
+                result_data=json.dumps({"error": "missing target or amount_sats"})
+            )
+            return
+
         self._log(f"Executing expand_to task: {target[:16]}... for {amount_sats} sats")
 
         try:

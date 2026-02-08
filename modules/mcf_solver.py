@@ -320,6 +320,7 @@ class MCFEdge:
     reverse_edge_idx: int = -1  # Index of reverse edge in adjacency list
     channel_id: str = ""        # SCID for identification
     is_hive_internal: bool = False  # True if between hive members
+    is_reverse: bool = False        # True if this is a reverse (residual) edge
 
     def unit_cost(self, amount: int) -> int:
         """Calculate cost for flowing `amount` sats."""
@@ -551,6 +552,7 @@ class MCFNetwork:
             residual_capacity=0,
             channel_id=channel_id,
             is_hive_internal=is_hive_internal,
+            is_reverse=True,
         )
         self.edges.append(reverse_edge)
         self.nodes[to_node].outgoing_edges.append(reverse_idx)
@@ -1296,8 +1298,8 @@ class MCFCoordinator:
             if edge.to_node in (network.super_source, network.super_sink):
                 continue
 
-            # Skip reverse edges (negative cost)
-            if edge.cost_ppm < 0:
+            # Skip reverse edges (negative or zero-cost reverse edges)
+            if edge.cost_ppm < 0 or edge.is_reverse:
                 continue
 
             # Determine which member executes this
@@ -1353,7 +1355,7 @@ class MCFCoordinator:
             "coordinator_id": coordinator_id[:16] + "..." if coordinator_id else None,
             "last_solution": self._last_solution.to_dict() if self._last_solution else None,
             "solution_age_seconds": solution_age,
-            "solution_valid": solution_age < MAX_SOLUTION_AGE,
+            "solution_valid": self._last_solution is not None and solution_age < MAX_SOLUTION_AGE,
             "our_assignments": [a.to_dict() for a in self.get_our_assignments()],
             "pending_count": len(self.get_our_assignments()),
             # Phase 5: Circuit breaker and health metrics

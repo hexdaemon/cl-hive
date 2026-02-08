@@ -499,7 +499,7 @@ class ChannelSizer:
 
         if weighted_score <= 1.0:
             # Below average: scale between min and default
-            ratio = (weighted_score - 0.5) / 0.5  # 0.0 to 1.0
+            ratio = max(0.0, (weighted_score - 0.5) / 0.5)  # 0.0 to 1.0
             size_range = default_channel_sats - min_channel_sats
             recommended_size = min_channel_sats + int(size_range * ratio)
         else:
@@ -1201,7 +1201,7 @@ class Planner:
             return (False, None, None)
 
         try:
-            peer_channels = self.plugin.rpc.listpeerchannels(target)
+            peer_channels = self.plugin.rpc.listpeerchannels(id=target)
             channels = peer_channels.get('channels', [])
             for ch in channels:
                 state = ch.get('state', '')
@@ -2059,6 +2059,10 @@ class Planner:
                 intent_type=IntentType.CHANNEL_OPEN.value if hasattr(IntentType.CHANNEL_OPEN, 'value') else IntentType.CHANNEL_OPEN,
                 target=selected_target.target
             )
+
+            if intent is None:
+                self._log("create_intent returned None (pubkey not set?)", level='warn')
+                return decisions
 
             self._expansions_this_cycle += 1
 

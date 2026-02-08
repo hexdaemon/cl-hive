@@ -386,7 +386,7 @@ class FeeIntelligenceManager:
                 continue
 
             # Get unique reporters
-            reporters = list(set(r.get("reporter_id") for r in reports))
+            reporters = list(set(r.get("reporter_id") for r in reports if r.get("reporter_id")))
 
             # Calculate fee statistics
             fees = [r.get("our_fee_ppm", 0) for r in reports if r.get("our_fee_ppm", 0) > 0]

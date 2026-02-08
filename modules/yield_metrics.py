@@ -90,7 +90,7 @@ class ChannelYieldMetrics:
         """Calculate all derived metrics from base values."""
         # Net revenue
         self.total_cost_sats = self.open_cost_sats + self.rebalance_cost_sats
-        self.net_revenue_sats = self.routing_revenue_sats - self.rebalance_cost_sats
+        self.net_revenue_sats = self.routing_revenue_sats - self.total_cost_sats
 
         # ROI calculation
         if self.capacity_sats > 0 and self.period_days > 0:
@@ -354,6 +354,9 @@ class YieldMetricsManager:
         self._velocity_cache: Dict[str, Dict] = {}
         self._velocity_cache_ttl = 300  # 5 minutes
 
+        # Remote yield metrics from fleet members
+        self._remote_yield_metrics: Dict[str, List[Dict[str, Any]]] = {}
+
     def set_our_pubkey(self, pubkey: str) -> None:
         """Set our node's pubkey after initialization."""
         self.our_pubkey = pubkey
@@ -558,12 +561,12 @@ class YieldMetricsManager:
                 # Risk increases as depletion approaches
                 depletion_risk = max(0.0, min(1.0, 1.0 - hours_to_depletion / 48))
             elif local_pct < DEPLETION_RISK_THRESHOLD:
-                depletion_risk = 0.5 + (DEPLETION_RISK_THRESHOLD - local_pct) * 2
+                depletion_risk = min(1.0, 0.5 + (DEPLETION_RISK_THRESHOLD - local_pct) * 2)
 
             if hours_to_saturation is not None and hours_to_saturation < 48:
                 saturation_risk = max(0.0, min(1.0, 1.0 - hours_to_saturation / 48))
             elif local_pct > SATURATION_RISK_THRESHOLD:
-                saturation_risk = 0.5 + (local_pct - SATURATION_RISK_THRESHOLD) * 2
+                saturation_risk = min(1.0, 0.5 + (local_pct - SATURATION_RISK_THRESHOLD) * 2)
 
             # Determine recommended action
             recommended_action = "none"
@@ -862,7 +865,7 @@ class YieldMetricsManager:
 
         # Initialize remote metrics storage if needed
         if not hasattr(self, "_remote_yield_metrics"):
-            self._remote_yield_metrics: Dict[str, List[Dict[str, Any]]] = {}
+            self._remote_yield_metrics = {}
 
         entry = {
             "reporter_id": reporter_id,

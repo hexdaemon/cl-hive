@@ -1105,7 +1105,7 @@ class StigmergicCoordinator:
             success=success,
             volume_sats=volume_sats,
             timestamp=time.time(),
-            strength=volume_sats / 100_000  # Larger payments = stronger signal
+            strength=max(0.1, volume_sats / 100_000)  # Larger payments = stronger signal, min floor preserves signal
         )
 
         key = (source, destination)
@@ -1913,14 +1913,17 @@ class TimeBasedFeeAdjuster:
 
         for pattern in patterns:
             # Check hour match (allow ±1 hour tolerance)
-            hour_match = abs(pattern.hour_of_day - current_hour) <= 1
-            if pattern.hour_of_day == 23 and current_hour == 0:
-                hour_match = True
-            if pattern.hour_of_day == 0 and current_hour == 23:
-                hour_match = True
+            if pattern.hour_of_day is None:
+                hour_match = True  # None means any hour
+            else:
+                hour_match = abs(pattern.hour_of_day - current_hour) <= 1
+                if pattern.hour_of_day == 23 and current_hour == 0:
+                    hour_match = True
+                if pattern.hour_of_day == 0 and current_hour == 23:
+                    hour_match = True
 
             # Check day match (if pattern is day-specific)
-            day_match = pattern.day_of_week == -1 or pattern.day_of_week == current_day
+            day_match = pattern.day_of_week is None or pattern.day_of_week == current_day
 
             if hour_match and day_match and pattern.confidence > best_confidence:
                 matching_pattern = pattern
@@ -2026,7 +2029,7 @@ class TimeBasedFeeAdjuster:
                     "hour": pattern.hour_of_day,
                     "day": pattern.day_of_week,
                     "day_name": self.DAY_NAMES[pattern.day_of_week]
-                        if pattern.day_of_week >= 0 else "Any",
+                        if pattern.day_of_week is not None and pattern.day_of_week >= 0 else "Any",
                     "intensity": round(pattern.intensity, 2),
                     "direction": pattern.direction,
                     "confidence": round(pattern.confidence, 2),
@@ -2059,7 +2062,7 @@ class TimeBasedFeeAdjuster:
                     "hour": pattern.hour_of_day,
                     "day": pattern.day_of_week,
                     "day_name": self.DAY_NAMES[pattern.day_of_week]
-                        if pattern.day_of_week >= 0 else "Any",
+                        if pattern.day_of_week is not None and pattern.day_of_week >= 0 else "Any",
                     "intensity": round(pattern.intensity, 2),
                     "direction": pattern.direction,
                     "confidence": round(pattern.confidence, 2),

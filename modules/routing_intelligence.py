@@ -519,7 +519,7 @@ class HiveRoutingMap:
                 if stats.avg_capacity_sats == 0:
                     stats.avg_capacity_sats = capacity_sats
                 else:
-                    stats.avg_capacity_sats = (
+                    stats.avg_capacity_sats = int(
                         stats.avg_capacity_sats * 0.7 + capacity_sats * 0.3
                     )
         else:

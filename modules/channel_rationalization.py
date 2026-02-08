@@ -507,7 +507,7 @@ class ChannelRationalizer:
                     # Return estimated data
                     return {
                         "channel_id": "unknown",
-                        "capacity_sats": getattr(state, 'capacity_sats', 0) // len(getattr(state, 'topology', [1])),
+                        "capacity_sats": getattr(state, 'capacity_sats', 0) // max(1, len(getattr(state, 'topology', [1]) or [1])),
                         "local_balance_sats": 0,
                         "state": "CHANNELD_NORMAL"
                     }
@@ -543,7 +543,7 @@ class ChannelRationalizer:
         hive_peer_count = metrics.hive_peer_count
 
         # Check if the peer being closed is a hive member
-        topology = calculator._get_topology_snapshot()
+        topology = calculator.get_topology_snapshot()
         if not topology:
             return {
                 "impact_level": "none",
@@ -909,6 +909,8 @@ class RationalizationManager:
         )
 
         self._our_pubkey: Optional[str] = None
+        self._remote_coverage: Dict[str, List[Dict[str, Any]]] = {}
+        self._remote_close_proposals: List[Dict[str, Any]] = []
 
     def set_our_pubkey(self, pubkey: str) -> None:
         """Set our node's pubkey."""
@@ -1043,7 +1045,7 @@ class RationalizationManager:
         shareable = []
 
         try:
-            all_coverage = self.analyzer.analyze_all_coverage()
+            all_coverage = self.rationalizer.redundancy_analyzer.analyze_all_coverage()
 
             for peer_id, coverage in all_coverage.items():
                 # Only share if we have meaningful ownership data
@@ -1094,9 +1096,9 @@ class RationalizationManager:
                     "member_id": r.member_id,
                     "peer_id": r.peer_id,
                     "channel_id": r.channel_id,
-                    "owner_id": r.owner_id,
+                    "owner_id": r.owner_member,
                     "reason": r.reason,
-                    "freed_capacity_sats": r.freed_capacity_sats,
+                    "freed_capacity_sats": r.freed_capital_sats,
                     "member_marker_strength": round(r.member_marker_strength, 3),
                     "owner_marker_strength": round(r.owner_marker_strength, 3)
                 })
@@ -1257,7 +1259,7 @@ class RationalizationManager:
             if now - p.get("timestamp", 0) > 7 * 86400:
                 continue
             # Only proposals for us
-            if p.get("member_id") == self.our_pubkey:
+            if p.get("member_id") == self._our_pubkey:
                 our_proposals.append(p)
 
         return our_proposals

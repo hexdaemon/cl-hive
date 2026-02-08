@@ -355,7 +355,7 @@ class PeerReputationManager:
         htlc_rates = [r.get("htlc_success_rate", 1.0) for r in weighted_reports]
         fee_stabilities = [r.get("fee_stability", 1.0) for r in weighted_reports]
         response_times = [r.get("response_time_ms", 0) for r in weighted_reports]
-        force_closes = sum(r.get("force_close_count", 0) for r in filtered)
+        force_closes = max((r.get("force_close_count", 0) for r in filtered), default=0)
 
         # Aggregate warnings
         warnings_count: Dict[str, int] = defaultdict(int)
@@ -365,7 +365,7 @@ class PeerReputationManager:
                     warnings_count[warning] += 1
 
         # Determine confidence
-        unique_reporters = set(r.get("reporter_id") for r in filtered)
+        unique_reporters = set(r.get("reporter_id") for r in filtered if r.get("reporter_id"))
         if len(unique_reporters) >= MIN_REPORTERS_FOR_CONFIDENCE:
             confidence = "high"
         elif len(unique_reporters) >= 2:

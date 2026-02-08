@@ -16,7 +16,7 @@ The overall quality score is a weighted combination of these components.
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, List, TYPE_CHECKING
+from typing import Dict, Any, Optional, List, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .database import HiveDatabase
@@ -552,7 +552,7 @@ class PeerQualityScorer:
 
     def should_open_channel(
         self, peer_id: str, days: int = 90, min_score: float = 0.45
-    ) -> tuple[bool, str]:
+    ) -> Tuple[bool, str]:
         """
         Quick check if we should consider opening a channel to a peer.
 

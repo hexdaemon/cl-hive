@@ -118,8 +118,8 @@ class HealthScoreAggregator:
         }.get(revenue_trend, 5)
 
         # Calculate total
-        total = int(profitable_score + underwater_score +
-                   liquidity_contribution + trend_bonus)
+        total = round(profitable_score + underwater_score +
+                     liquidity_contribution + trend_bonus)
         total = max(0, min(100, total))
 
         # Determine tier
