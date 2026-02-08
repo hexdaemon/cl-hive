@@ -2,6 +2,18 @@
 
 All notable changes to cl-hive will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- vitality plugin v0.4.5 for automatic plugin health monitoring and restart
+- Docker image version 2.2.7
+
+### Removed
+- trustedcoin plugin (explorer-only Bitcoin backend no longer needed)
+
+### Changed
+- Updated .env.example documentation to reflect vitality instead of trustedcoin
+
 ## [1.9.0] - 2026-01-24
 
 ### Added
