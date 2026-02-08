@@ -4,9 +4,21 @@ All notable changes to cl-hive will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.8] - 2026-02-07
+
 ### Added
-- vitality plugin v0.4.5 for automatic plugin health monitoring and restart
-- Docker image version 2.2.7
+- vitality plugin v0.2.3 for automatic plugin health monitoring and restart
+- Thread safety locks in 7 coordination modules (AdaptiveFeeController, StigmergicCoordinator, MyceliumDefenseSystem, TimeBasedFeeAdjuster, FeeCoordinationManager, VPNTransportManager)
+- Cache bounds to prevent memory bloat (500-1000 entry limits on peer/route caches)
+- Docker image version 2.2.8
+
+### Fixed
+- **Thread Safety**: Fixed race conditions in concurrent modification of shared state
+- **Governance Bypass**: task_manager expansion now routes through governance engine (security)
+- **Outbox Retry**: Parse/serialization errors now fail permanently instead of infinite retry
+- **P0 Crashes**: Fixed AttributeError on _get_topology_snapshot() and None handling in task execution
+- **P1 Logic Errors**: Fixed analyzer references, field names, method calls across 12 modules
+- **P2 Edge Cases**: MCF solution validation, force_close counting, yield metric clamping
 
 ### Removed
 - trustedcoin plugin (explorer-only Bitcoin backend no longer needed)
