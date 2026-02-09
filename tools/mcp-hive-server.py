@@ -3779,20 +3779,21 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
     try:
         profitability = await node.call("revenue-profitability")
         channels_by_class = profitability.get("channels_by_class", {})
-        for class_name in ("bleeder", "zombie"):
+        for class_name in ("underwater", "zombie", "stagnant_candidate"):
+            severity = "warning" if class_name == "underwater" else "info"
             for ch in channels_by_class.get(class_name, [])[:3]:
                 issues.append({
                     "type": class_name,
-                    "severity": "warning" if class_name == "bleeder" else "info",
+                    "severity": severity,
                     "channel_id": ch.get("channel_id"),
-                    "peer_id": ch.get("peer_id"),
                     "details": {
                         "net_profit_sats": ch.get("net_profit_sats"),
-                        "roi_percentage": ch.get("roi_percentage")
+                        "roi_percentage": ch.get("roi_percentage"),
+                        "flow_profile": ch.get("flow_profile"),
                     }
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Could not fetch profitability issues: {e}")
 
     for ch in low_balance_channels:
         issues.append({
@@ -4081,17 +4082,22 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
     profitability = {}
     try:
         prof = await node.call("revenue-profitability", {"channel_id": channel_id})
-        for ch in prof.get("channels", []):
-            if ch.get("channel_id") == channel_id:
-                profitability = {
-                    "lifetime_revenue_sats": ch.get("revenue_sats"),
-                    "lifetime_cost_sats": ch.get("cost_sats"),
-                    "net_profit_sats": ch.get("net_profit_sats"),
-                    "roi_percentage": ch.get("roi_percentage"),
-                    "classification": ch.get("classification")
-                }
-                break
-    except Exception:
+        # Single-channel response has {channel_id, profitability: {...}}
+        prof_data = prof.get("profitability", {})
+        if prof_data:
+            profitability = {
+                "lifetime_revenue_sats": prof_data.get("total_contribution_sats", 0),
+                "lifetime_cost_sats": prof_data.get("total_costs_sats", 0),
+                "net_profit_sats": prof_data.get("net_profit_sats", 0),
+                "roi_percentage": prof_data.get("roi_percentage", 0),
+                "classification": prof_data.get("profitability_class", "unknown"),
+                "forward_count": prof_data.get("forward_count", 0),
+                "volume_routed_sats": prof_data.get("volume_routed_sats", 0),
+                "flow_profile": prof_data.get("flow_profile", "unknown"),
+                "days_active": prof_data.get("days_active", 0),
+            }
+    except Exception as e:
+        logger.debug(f"Could not fetch profitability for {channel_id}: {e}")
         profitability = {}
 
     # Flow analysis + velocity
@@ -4120,9 +4126,10 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
     }
 
     # Fee history (best-effort)
+    local_updates = target_channel.get("updates", {}).get("local", {})
     fee_history = {
-        "current_fee_ppm": target_channel.get("fee_proportional_millionths"),
-        "current_base_fee_msat": target_channel.get("fee_base_msat"),
+        "current_fee_ppm": local_updates.get("fee_proportional_millionths", 0),
+        "current_base_fee_msat": local_updates.get("fee_base_msat", 0),
         "recent_changes": None
     }
     try:
@@ -4763,6 +4770,9 @@ async def handle_channels(args: Dict) -> Dict:
                             channel["profitability_class"] = class_name
                             channel["net_profit_sats"] = ch.get("net_profit_sats", 0)
                             channel["roi_percentage"] = ch.get("roi_percentage", 0)
+                            channel["forward_count"] = ch.get("forward_count", 0)
+                            channel["fees_earned_sats"] = ch.get("fees_earned_sats", 0)
+                            channel["volume_routed_sats"] = ch.get("volume_routed_sats", 0)
                             break
 
     return channels_result
@@ -5797,7 +5807,11 @@ async def handle_revenue_profitability(args: Dict) -> Dict:
 
     # Try to add market context from competitor intelligence
     try:
-        channels = profitability.get("channels", [])
+        channels_by_class = profitability.get("channels_by_class", {})
+        channels = []
+        for class_channels in channels_by_class.values():
+            if isinstance(class_channels, list):
+                channels.extend(class_channels)
 
         # Build a map of peer_id -> intel for quick lookup
         intel_map = {}
@@ -5896,15 +5910,14 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
         combined_margin_pct = financial_health.get("operating_margin_pct", 0.0)
 
     # Build enhanced P&L structure
-    # Note: opex_breakdown not exposed in dashboard API, set to 0
     pnl["routing"] = {
         "revenue_sats": routing_revenue,
         "opex_sats": routing_opex,
         "net_profit_sats": routing_net,
         "opex_breakdown": {
-            "rebalance_cost_sats": 0,
-            "closure_cost_sats": 0,
-            "splice_cost_sats": 0
+            "rebalance_cost_sats": period.get("rebalance_cost_sats", 0),
+            "closure_cost_sats": period.get("closure_cost_sats", 0),
+            "splice_cost_sats": period.get("splice_cost_sats", 0),
         }
     }
 
@@ -6493,7 +6506,8 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
             dashboard = await node.call("revenue-dashboard", {"window_days": 30})
             profitability = await node.call("revenue-profitability")
             history = await node.call("revenue-history")
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Revenue data unavailable for {node_name}: {e}")
             dashboard = {}
             profitability = {}
             history = {}
@@ -6532,7 +6546,13 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
 
         # Process channel details for history
         channels_data = await node.call("listpeerchannels")
-        prof_data = profitability.get("channels", [])
+        channels_by_class = profitability.get("channels_by_class", {})
+        prof_data = []
+        for class_name, class_channels in channels_by_class.items():
+            if isinstance(class_channels, list):
+                for ch in class_channels:
+                    ch["profitability_class"] = class_name
+                    prof_data.append(ch)
         prof_by_id = {c.get("channel_id"): c for c in prof_data}
 
         for ch in channels_data.get("channels", []):
@@ -6565,9 +6585,9 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
                 "remote_sats": remote_sats,
                 "balance_ratio": round(balance_ratio, 4),
                 "flow_state": prof_ch.get("profitability_class", "unknown"),
-                "flow_ratio": prof_ch.get("roi_annual_pct", 0),
+                "flow_ratio": prof_ch.get("roi_percentage", 0),
                 "confidence": 1.0,
-                "forward_count": 0,
+                "forward_count": prof_ch.get("forward_count", 0),
                 "fee_ppm": fee_ppm,
                 "fee_base_msat": fee_base,
                 "needs_inbound": balance_ratio > 0.8,

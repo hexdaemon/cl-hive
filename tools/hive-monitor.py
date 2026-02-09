@@ -365,8 +365,8 @@ class FleetMonitor:
                 "remote_sats": total_sats - our_sats,
                 "balance_ratio": round(balance_ratio, 3),
                 # Fee info
-                "fee_base_msat": ch.get("fee_base_msat", 0),
-                "fee_ppm": ch.get("fee_proportional_millionths", 0),
+                "fee_base_msat": ch.get("updates", {}).get("local", {}).get("fee_base_msat", 0),
+                "fee_ppm": ch.get("updates", {}).get("local", {}).get("fee_proportional_millionths", 0),
                 # Flow state from revenue-ops
                 "flow_state": flow.get("state", "unknown"),
                 "flow_ratio": round(flow.get("flow_ratio", 0), 3),
