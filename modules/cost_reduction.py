@@ -655,6 +655,27 @@ class FleetRebalanceRouter:
                 if savings >= FLEET_PATH_SAVINGS_THRESHOLD:
                     result["recommendation"] = "use_fleet_path"
 
+            # Find source-eligible fleet members: our direct peers that are
+            # also connected to to_peer.  These make ideal sling source
+            # candidates because the route us -> member -> to_peer is 2-hop
+            # and zero-fee through fleet channels.
+            topology = self._get_fleet_topology()
+            try:
+                our_peers = set()
+                channels = self.plugin.rpc.listpeerchannels()
+                for ch in channels.get("channels", []):
+                    pid = ch.get("peer_id")
+                    if pid and ch.get("short_channel_id"):
+                        our_peers.add(pid)
+            except Exception:
+                our_peers = set()
+
+            source_eligible = []
+            for member, peers in topology.items():
+                if member in our_peers and to_peer in peers:
+                    source_eligible.append(member)
+            result["source_eligible_members"] = source_eligible
+
         return result
 
     def _get_peer_for_channel(self, channel_id: str) -> Optional[str]:

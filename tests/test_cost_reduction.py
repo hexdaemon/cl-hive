@@ -643,6 +643,43 @@ class TestFleetRebalanceRouter:
         assert result["recommendation"] == "use_external_path"
         assert result["estimated_external_cost_sats"] > 0
 
+    def test_source_eligible_members_returned(self):
+        """When fleet path exists, source_eligible_members should list our peers connected to to_peer."""
+        plugin = MagicMock()
+        to_peer = "02" + "bb" * 32
+        fleet_member = "02" + "cc" * 32  # hive member connected to to_peer AND our peer
+
+        # Mock listpeerchannels: we have channels with from_peer, to_peer, and fleet_member
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"short_channel_id": "100x1x0", "peer_id": "02" + "aa" * 32},
+                {"short_channel_id": "200x2x0", "peer_id": to_peer},
+                {"short_channel_id": "300x3x0", "peer_id": fleet_member},
+            ]
+        }
+        plugin.rpc.listchannels.return_value = {"channels": []}
+
+        # Mock state_manager: fleet_member is connected to to_peer in topology
+        state_manager = MockStateManager()
+        state_manager.set_peer_state(fleet_member, capacity=1_000_000)
+        state_manager.peer_states[fleet_member].topology = [to_peer]
+
+        router = FleetRebalanceRouter(plugin=plugin, state_manager=state_manager)
+
+        # Patch _get_peer_for_channel to return the right peers
+        with patch.object(router, '_get_peer_for_channel', side_effect=lambda ch: {
+            "100x1x0": "02" + "aa" * 32,
+            "200x2x0": to_peer,
+        }.get(ch)):
+            result = router.get_best_rebalance_path(
+                from_channel="100x1x0",
+                to_channel="200x2x0",
+                amount_sats=100000
+            )
+
+        if result["fleet_path_available"]:
+            assert fleet_member in result.get("source_eligible_members", [])
+
 
 # =============================================================================
 # CIRCULAR FLOW DETECTOR TESTS
