@@ -1424,34 +1424,59 @@ class HiveDatabase:
                           available_sats: int, fee_policy: Dict,
                           topology: List[str], state_hash: str,
                           version: Optional[int] = None) -> None:
-        """Update local cache of a peer's Hive state."""
+        """Update local cache of a peer's Hive state.
+
+        Uses version-guarded writes: only writes if the new version is
+        higher than what's already in the DB, preventing late-arriving
+        writes from overwriting newer state after concurrent updates.
+        """
         conn = self._get_connection()
         now = int(time.time())
 
+        fee_json = json.dumps(fee_policy)
+        topo_json = json.dumps(topology)
+
         if version is not None:
-            # Use the provided version (from state_manager)
+            # Insert if new, or update only if our version is higher
             conn.execute("""
-                INSERT OR REPLACE INTO hive_state
+                INSERT INTO hive_state
                 (peer_id, capacity_sats, available_sats, fee_policy, topology,
                  last_gossip, state_hash, version)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    capacity_sats = excluded.capacity_sats,
+                    available_sats = excluded.available_sats,
+                    fee_policy = excluded.fee_policy,
+                    topology = excluded.topology,
+                    last_gossip = excluded.last_gossip,
+                    state_hash = excluded.state_hash,
+                    version = excluded.version
+                WHERE excluded.version > hive_state.version
             """, (
                 peer_id, capacity_sats, available_sats,
-                json.dumps(fee_policy), json.dumps(topology),
+                fee_json, topo_json,
                 now, state_hash, version
             ))
         else:
             # Auto-increment for backward compatibility
             conn.execute("""
-                INSERT OR REPLACE INTO hive_state
+                INSERT INTO hive_state
                 (peer_id, capacity_sats, available_sats, fee_policy, topology,
                  last_gossip, state_hash, version)
                 VALUES (?, ?, ?, ?, ?, ?, ?,
                         COALESCE((SELECT version FROM hive_state WHERE peer_id = ?), 0) + 1)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    capacity_sats = excluded.capacity_sats,
+                    available_sats = excluded.available_sats,
+                    fee_policy = excluded.fee_policy,
+                    topology = excluded.topology,
+                    last_gossip = excluded.last_gossip,
+                    state_hash = excluded.state_hash,
+                    version = COALESCE((SELECT version FROM hive_state WHERE peer_id = ?), 0) + 1
             """, (
                 peer_id, capacity_sats, available_sats,
-                json.dumps(fee_policy), json.dumps(topology),
-                now, state_hash, peer_id
+                fee_json, topo_json,
+                now, state_hash, peer_id, peer_id
             ))
     
     def get_hive_state(self, peer_id: str) -> Optional[Dict]:
@@ -1474,7 +1499,7 @@ class HiveDatabase:
         """Get cached state for all Hive peers."""
         conn = self._get_connection()
         rows = conn.execute("SELECT * FROM hive_state LIMIT 1000").fetchall()
-        
+
         results = []
         for row in rows:
             result = dict(row)
@@ -1482,7 +1507,12 @@ class HiveDatabase:
             result['topology'] = json.loads(result['topology'] or '[]')
             results.append(result)
         return results
-    
+
+    def delete_hive_state(self, peer_id: str) -> None:
+        """Delete a peer's cached Hive state from the database."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM hive_state WHERE peer_id = ?", (peer_id,))
+
     # =========================================================================
     # CONTRIBUTION TRACKING
     # =========================================================================

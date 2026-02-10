@@ -636,13 +636,52 @@ class TestDatabasePersistence:
                 "state_hash": "abc"
             }
         ]
-        
+
         sm = StateManager(mock_db, mock_plugin)
-        loaded = sm.load_from_database()
-        
-        assert loaded == 1
+
+        # State should be loaded by __init__'s _load_state_from_db
         assert "db_peer_1" in sm._local_state
         assert sm._local_state["db_peer_1"].version == 3
+
+        # Calling load_from_database again with same data returns 0
+        # (version check prevents redundant reload)
+        loaded = sm.load_from_database()
+        assert loaded == 0
+
+        # State still present from init
+        assert "db_peer_1" in sm._local_state
+        assert sm._local_state["db_peer_1"].version == 3
+
+    def test_load_from_database_skips_stale(self, mock_plugin):
+        """load_from_database should not overwrite newer in-memory state."""
+        mock_db = MagicMock()
+        mock_db.get_all_hive_states.return_value = [
+            {
+                "peer_id": "db_peer_1",
+                "capacity_sats": 5000000,
+                "available_sats": 2500000,
+                "fee_policy": {"base_fee": 1000},
+                "topology": ["ext_1"],
+                "version": 3,
+                "last_gossip": 9999,
+                "state_hash": "abc"
+            }
+        ]
+
+        sm = StateManager(mock_db, mock_plugin)
+
+        # Simulate newer gossip arriving (version 5)
+        sm._local_state["db_peer_1"] = HivePeerState(
+            peer_id="db_peer_1", capacity_sats=6000000,
+            available_sats=3000000, fee_policy={"base_fee": 2000},
+            topology=["ext_2"], version=5, last_update=99999
+        )
+
+        # DB still returns version 3, should not overwrite version 5
+        loaded = sm.load_from_database()
+        assert loaded == 0
+        assert sm._local_state["db_peer_1"].version == 5
+        assert sm._local_state["db_peer_1"].capacity_sats == 6000000
 
 
 if __name__ == "__main__":

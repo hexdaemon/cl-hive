@@ -253,9 +253,14 @@ class TestLoadFromDatabaseUsesFromDict:
         ]
 
         sm = StateManager(mock_database, mock_plugin)
-        loaded = sm.load_from_database()
 
-        assert loaded == 1
+        # Valid entry loaded by __init__, invalid entry skipped
+        assert "02" + "c" * 64 in sm._local_state
+        assert "" not in sm._local_state
+
+        # Calling load_from_database again returns 0 (same versions)
+        loaded = sm.load_from_database()
+        assert loaded == 0
 
 
 # =============================================================================
