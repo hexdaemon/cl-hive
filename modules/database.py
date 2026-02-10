@@ -2448,6 +2448,26 @@ class HiveDatabase:
 
         return row['cnt'] if row else 0
 
+    def count_outbox_pending(self) -> int:
+        """
+        Count outbox entries ready for sending or retry.
+
+        More efficient than get_outbox_pending() when only a count is needed.
+
+        Returns:
+            Count of pending entries.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        row = conn.execute(
+            """SELECT COUNT(*) as cnt FROM proto_outbox
+               WHERE status IN ('queued', 'sent')
+                 AND next_retry_at <= ?
+                 AND expires_at > ?""",
+            (now, now)
+        ).fetchone()
+        return row['cnt'] if row else 0
+
     def has_recent_action_for_channel(
         self,
         channel_id: str,
@@ -6370,6 +6390,32 @@ class HiveDatabase:
         )
         return result.rowcount > 0
 
+    def update_outbox_retry(self, msg_id: str, peer_id: str,
+                            next_retry_at: int) -> bool:
+        """
+        Schedule next retry for a failed send WITHOUT incrementing retry_count.
+
+        Used when send_fn fails (peer unreachable) — the message was never
+        transmitted, so retry budget should not be consumed.
+
+        Args:
+            msg_id: Message identifier
+            peer_id: Target peer pubkey
+            next_retry_at: Unix timestamp for next retry attempt
+
+        Returns:
+            True if updated, False otherwise.
+        """
+        conn = self._get_connection()
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET next_retry_at = ?
+               WHERE msg_id = ? AND peer_id = ?
+                 AND status IN ('queued', 'sent')""",
+            (next_retry_at, msg_id, peer_id)
+        )
+        return result.rowcount > 0
+
     def ack_outbox(self, msg_id: str, peer_id: str) -> bool:
         """
         Mark an outbox entry as acknowledged.
@@ -6425,14 +6471,16 @@ class HiveDatabase:
             return result.rowcount
         except Exception:
             # Fallback: match using LIKE pattern for older SQLite
-            pattern = f'"{match_field}":"{match_value}"'
+            # Escape LIKE metacharacters in match_value to prevent over-matching
+            safe_value = match_value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+            pattern = f'"{match_field}":"{safe_value}"'
             try:
                 result = conn.execute(
                     """UPDATE proto_outbox
                        SET status = 'acked', acked_at = ?
                        WHERE peer_id = ? AND msg_type = ?
                          AND status IN ('queued', 'sent')
-                         AND payload_json LIKE ?""",
+                         AND payload_json LIKE ? ESCAPE '\\'""",
                     (now, peer_id, msg_type, f'%{pattern}%')
                 )
                 return result.rowcount

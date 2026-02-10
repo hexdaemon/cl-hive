@@ -3589,8 +3589,10 @@ def handle_msg_ack(peer_id: str, payload: Dict, plugin) -> Dict:
     ack_msg_id = payload.get("ack_msg_id")
     status = payload.get("status", "ok")
 
+    # Use verified sender_id (not transport peer_id) to match outbox entries,
+    # since outbox keys on the target peer_id we originally sent to.
     if outbox_mgr:
-        outbox_mgr.process_ack(peer_id, ack_msg_id, status)
+        outbox_mgr.process_ack(sender_id, ack_msg_id, status)
 
     return {"result": "continue"}
 
@@ -3948,6 +3950,7 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     is_new, event_id = check_and_record(database, "PROMOTION_REQUEST", payload, target_pubkey)
     if not is_new:
         plugin.log(f"cl-hive: PROMOTION_REQUEST duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.PROMOTION_REQUEST, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -4032,6 +4035,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "VOUCH", payload, voucher_pubkey)
     if not is_new:
         plugin.log(f"cl-hive: VOUCH duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.VOUCH, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -4147,6 +4151,7 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "PROMOTION", payload, peer_id)
     if not is_new:
         plugin.log(f"cl-hive: PROMOTION duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.PROMOTION, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -4263,6 +4268,7 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "MEMBER_LEFT", payload, leaving_peer_id)
     if not is_new:
         plugin.log(f"cl-hive: MEMBER_LEFT duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.MEMBER_LEFT, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -4367,6 +4373,7 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "BAN_PROPOSAL", payload, proposer_peer_id)
     if not is_new:
         plugin.log(f"cl-hive: BAN_PROPOSAL duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.BAN_PROPOSAL, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -4451,6 +4458,7 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "BAN_VOTE", payload, voter_peer_id)
     if not is_new:
         plugin.log(f"cl-hive: BAN_VOTE duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.BAN_VOTE, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -7115,6 +7123,7 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "FEE_REPORT", payload, report_peer_id or peer_id)
     if not is_new:
         plugin.log(f"cl-hive: FEE_REPORT duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.FEE_REPORT, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -7251,6 +7260,7 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     is_new, event_id = check_and_record(database, "SETTLEMENT_PROPOSE", payload, proposer_peer_id or peer_id)
     if not is_new:
         plugin.log(f"cl-hive: SETTLEMENT_PROPOSE duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.SETTLEMENT_PROPOSE, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -7371,6 +7381,7 @@ def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     is_new, event_id = check_and_record(database, "SETTLEMENT_READY", payload, voter_peer_id or peer_id)
     if not is_new:
         plugin.log(f"cl-hive: SETTLEMENT_READY duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.SETTLEMENT_READY, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -7484,6 +7495,7 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
     is_new, event_id = check_and_record(database, "SETTLEMENT_EXECUTED", payload, executor_peer_id or peer_id)
     if not is_new:
         plugin.log(f"cl-hive: SETTLEMENT_EXECUTED duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         _relay_message(HiveMessageType.SETTLEMENT_EXECUTED, payload, peer_id)
         return {"result": "continue"}
     if event_id:
@@ -7595,6 +7607,7 @@ def handle_task_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "TASK_REQUEST", payload, peer_id)
     if not is_new:
         plugin.log(f"cl-hive: TASK_REQUEST duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         return {"result": "continue"}
     if event_id:
         payload["_event_id"] = event_id
@@ -7666,6 +7679,7 @@ def handle_task_response(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "TASK_RESPONSE", payload, peer_id)
     if not is_new:
         plugin.log(f"cl-hive: TASK_RESPONSE duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         return {"result": "continue"}
     if event_id:
         payload["_event_id"] = event_id
@@ -7739,6 +7753,7 @@ def handle_splice_init_request(peer_id: str, payload: Dict, plugin: Plugin) -> D
     is_new, event_id = check_and_record(database, "SPLICE_INIT_REQUEST", payload, peer_id)
     if not is_new:
         plugin.log(f"cl-hive: SPLICE_INIT_REQUEST duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         return {"result": "continue"}
 
     # Delegate to splice manager
@@ -7798,6 +7813,13 @@ def handle_splice_init_response(peer_id: str, payload: Dict, plugin: Plugin) -> 
         plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "SPLICE_INIT_RESPONSE", payload, responder_id)
+    if not is_new:
+        plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
+        return {"result": "continue"}
+
     # Delegate to splice manager
     result = splice_mgr.handle_splice_init_response(peer_id, payload, safe_plugin.rpc)
 
@@ -7812,7 +7834,8 @@ def handle_splice_init_response(peer_id: str, payload: Dict, plugin: Plugin) -> 
             level='debug'
         )
 
-    # Phase D: Implicit ack (SPLICE_INIT_RESPONSE implies SPLICE_INIT_REQUEST received)
+    # Phase D: Acknowledge receipt + implicit ack (SPLICE_INIT_RESPONSE implies SPLICE_INIT_REQUEST received)
+    _emit_ack(peer_id, event_id)
     if outbox_mgr:
         outbox_mgr.process_implicit_ack(peer_id, HiveMessageType.SPLICE_INIT_RESPONSE, payload)
 
@@ -7857,6 +7880,7 @@ def handle_splice_update(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "SPLICE_UPDATE", payload, peer_id)
     if not is_new:
         plugin.log(f"cl-hive: SPLICE_UPDATE duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         return {"result": "continue"}
 
     # Delegate to splice manager
@@ -7912,6 +7936,7 @@ def handle_splice_signed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "SPLICE_SIGNED", payload, peer_id)
     if not is_new:
         plugin.log(f"cl-hive: SPLICE_SIGNED duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         return {"result": "continue"}
 
     # Delegate to splice manager
@@ -7972,6 +7997,7 @@ def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_new, event_id = check_and_record(database, "SPLICE_ABORT", payload, peer_id)
     if not is_new:
         plugin.log(f"cl-hive: SPLICE_ABORT duplicate event {event_id}, skipping", level='debug')
+        _emit_ack(peer_id, event_id)
         return {"result": "continue"}
 
     # Delegate to splice manager
