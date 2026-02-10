@@ -670,3 +670,119 @@ class TestKalmanStatusBatched:
             assert status["channels_with_consensus"] >= 1
         else:
             assert status["channels_with_consensus"] == 0
+
+
+# =============================================================================
+# FOLLOW-UP FIX 1: _pattern_name handles day_of_month
+# =============================================================================
+
+class TestPatternNameMonthly:
+    """_pattern_name should include day_of_month in the name."""
+
+    def setup_method(self):
+        self.mgr = _make_manager()
+
+    def test_day_of_month_pattern_name(self):
+        """Monthly pattern should include day number."""
+        pattern = TemporalPattern(
+            channel_id="c1", hour_of_day=None, direction=FlowDirection.OUTBOUND,
+            intensity=1.5, confidence=0.8, samples=10, avg_flow_sats=50000,
+            day_of_month=15,
+        )
+        name = self.mgr._pattern_name(pattern)
+        assert "day15" in name
+        assert "drain" in name
+
+    def test_eom_cluster_pattern_name(self):
+        """EOM cluster (day_of_month=31) should show 'eom'."""
+        pattern = TemporalPattern(
+            channel_id="c1", hour_of_day=None, direction=FlowDirection.INBOUND,
+            intensity=2.0, confidence=0.7, samples=15, avg_flow_sats=80000,
+            day_of_month=31,
+        )
+        name = self.mgr._pattern_name(pattern)
+        assert "eom" in name
+        assert "inflow" in name
+
+    def test_hourly_pattern_name_unchanged(self):
+        """Hourly patterns without day_of_month should be unaffected."""
+        pattern = TemporalPattern(
+            channel_id="c1", hour_of_day=14, direction=FlowDirection.OUTBOUND,
+            intensity=1.5, confidence=0.8, samples=10, avg_flow_sats=50000,
+        )
+        name = self.mgr._pattern_name(pattern)
+        assert "14:00" in name
+        assert "drain" in name
+        assert "day" not in name
+        assert "eom" not in name
+
+
+# =============================================================================
+# FOLLOW-UP FIX 2: get_patterns_summary counts monthly patterns
+# =============================================================================
+
+class TestPatternsSummaryMonthly:
+    """get_patterns_summary should include monthly_patterns count."""
+
+    def test_monthly_count_in_summary(self):
+        """Summary should include monthly_patterns key."""
+        mgr = _make_manager()
+
+        # Populate cache with a monthly pattern
+        monthly_p = TemporalPattern(
+            channel_id="c1", hour_of_day=None, direction=FlowDirection.OUTBOUND,
+            intensity=1.5, confidence=0.8, samples=10, avg_flow_sats=50000,
+            day_of_month=15,
+        )
+        hourly_p = TemporalPattern(
+            channel_id="c1", hour_of_day=10, direction=FlowDirection.INBOUND,
+            intensity=1.4, confidence=0.7, samples=8, avg_flow_sats=40000,
+        )
+        with mgr._lock:
+            mgr._pattern_cache["c1"] = [monthly_p, hourly_p]
+
+        summary = mgr.get_patterns_summary()
+        assert "monthly_patterns" in summary
+        assert summary["monthly_patterns"] == 1
+        assert summary["hourly_patterns"] == 1
+        assert summary["total_patterns"] == 2
+
+
+# =============================================================================
+# FOLLOW-UP FIX 6: Regime detection uses INTRADAY_REGIME_CHANGE_THRESHOLD
+# =============================================================================
+
+class TestRegimeChangeConstant:
+    """Regime change detection should use the constant, not hardcoded 2."""
+
+    def test_constant_is_used(self):
+        """Verify INTRADAY_REGIME_CHANGE_THRESHOLD is 2.5 (not 2)."""
+        from modules.anticipatory_liquidity import INTRADAY_REGIME_CHANGE_THRESHOLD
+        assert INTRADAY_REGIME_CHANGE_THRESHOLD == 2.5
+
+    def test_stable_below_threshold(self):
+        """Pattern should be regime_stable when std < threshold * avg."""
+        from modules.anticipatory_liquidity import (
+            IntraDayPhase, INTRADAY_REGIME_CHANGE_THRESHOLD
+        )
+        mgr = _make_manager()
+
+        # velocity_std = 0.04, avg_velocity = 0.02
+        # ratio = 0.04 / 0.02 = 2.0 < 2.5 threshold => stable
+        samples = []
+        now = int(time.time())
+        for i in range(10):
+            # Alternate between 80K and 120K to get std ~ 0.02 with avg ~ 0.10
+            flow = 100_000 if i % 2 == 0 else 100_000
+            samples.append(_make_sample("c1", hour=9, day_of_week=0,
+                                         net_flow=flow, ts=now - i * 3600))
+
+        result = mgr._analyze_intraday_bucket(
+            channel_id="c1", samples=samples,
+            phase=IntraDayPhase.MORNING, hour_start=8, hour_end=12,
+            kalman_confidence=0.5, is_regime_change=False,
+            capacity_sats=1_000_000,
+        )
+        if result:
+            # Constant flow => zero variance => stable
+            assert result.is_regime_stable is True

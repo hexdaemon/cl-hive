@@ -52,7 +52,6 @@ KALMAN_MIN_REPORTERS = 1              # Minimum reporters for consensus
 KALMAN_UNCERTAINTY_SCALING = 1.5      # Scale factor for uncertainty in confidence
 
 # Prediction settings
-PREDICTION_HORIZONS = [6, 12, 24]     # Hours to look ahead
 DEFAULT_PREDICTION_HOURS = 12         # Default prediction window
 
 # Urgency thresholds
@@ -87,7 +86,6 @@ INTRADAY_BUCKETS = {
 INTRADAY_MIN_SAMPLES_PER_BUCKET = 5           # Min samples per time bucket
 INTRADAY_VELOCITY_ONSET_HOURS = 2             # Predict pattern onset this far ahead
 INTRADAY_REGIME_CHANGE_THRESHOLD = 2.5        # Std devs for regime change detection
-INTRADAY_PATTERN_DECAY_DAYS = 7               # Half-life for pattern confidence decay
 INTRADAY_KALMAN_WEIGHT = 0.6                  # Weight for Kalman confidence vs sample count
 
 # Pattern classification thresholds
@@ -1335,7 +1333,7 @@ class AnticipatoryLiquidityManager:
 
         # Detect regime instability
         regime_stable = not is_regime_change
-        if velocity_std > abs(avg_velocity) * 2:
+        if velocity_std > abs(avg_velocity) * INTRADAY_REGIME_CHANGE_THRESHOLD:
             # High variance relative to mean suggests unstable pattern
             regime_stable = False
 
@@ -1558,8 +1556,26 @@ class AnticipatoryLiquidityManager:
             forecasts = []
             with self._lock:
                 channel_ids = list(self._flow_history.keys())[:20]  # Limit to 20
+
+            # Batch-fetch channel capacities with a single RPC call
+            capacity_map: Dict[str, int] = {}
+            if self.plugin:
+                try:
+                    all_ch = self.plugin.rpc.listpeerchannels()
+                    for ch in all_ch.get("channels", []):
+                        scid = ch.get("short_channel_id")
+                        if scid:
+                            total = ch.get("total_msat", 0)
+                            if isinstance(total, str):
+                                total = int(total.replace("msat", ""))
+                            capacity_map[scid] = total // 1000
+                except Exception:
+                    pass
+
             for cid in channel_ids:
-                channel_patterns = self.detect_intraday_patterns(cid)
+                channel_patterns = self.detect_intraday_patterns(
+                    cid, capacity_sats=capacity_map.get(cid)
+                )
                 patterns.extend(channel_patterns)
                 forecast = self.get_intraday_forecast(cid)
                 if forecast:
@@ -2070,6 +2086,12 @@ class AnticipatoryLiquidityManager:
         """Generate human-readable pattern name."""
         parts = []
 
+        if pattern.day_of_month is not None:
+            if pattern.day_of_month == 31:
+                parts.append("eom")
+            else:
+                parts.append(f"day{pattern.day_of_month}")
+
         if pattern.day_of_week is not None:
             days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
             parts.append(days[pattern.day_of_week])
@@ -2082,13 +2104,17 @@ class AnticipatoryLiquidityManager:
 
         return "_".join(parts) if parts else "unknown"
 
-    def _get_channel_info(self, channel_id: str) -> Optional[Dict]:
-        """Get channel info from RPC."""
+    def _get_channel_info(self, channel_id: str, peer_id: str = None) -> Optional[Dict]:
+        """Get channel info from RPC. Uses peer_id filter when available."""
         if not self.plugin:
             return None
 
         try:
-            channels = self.plugin.rpc.listpeerchannels()
+            # Filter server-side when peer_id is known to avoid iterating all channels
+            if peer_id:
+                channels = self.plugin.rpc.listpeerchannels(id=peer_id)
+            else:
+                channels = self.plugin.rpc.listpeerchannels()
             for ch in channels.get("channels", []):
                 scid = ch.get("short_channel_id")
                 if scid == channel_id:
@@ -2245,7 +2271,7 @@ class AnticipatoryLiquidityManager:
                     for p in preds:
                         if p.depletion_risk > 0.5 and p.velocity_pct_per_hour < 0:
                             # Demand = velocity * hours * capacity (rough)
-                            channel_info = self._get_channel_info(p.channel_id)
+                            channel_info = self._get_channel_info(p.channel_id, peer_id=peer_id)
                             cap = channel_info.get("capacity_sats", 0) if channel_info else 0
                             total_demand += int(abs(p.velocity_pct_per_hour) * p.hours_ahead * cap)
 
@@ -2316,15 +2342,17 @@ class AnticipatoryLiquidityManager:
                 all_patterns.append(p.to_dict())
 
         # Group by type
-        hourly = [p for p in all_patterns if p["hour_of_day"] is not None and p["day_of_week"] is None]
-        daily = [p for p in all_patterns if p["hour_of_day"] is None and p["day_of_week"] is not None]
+        hourly = [p for p in all_patterns if p["hour_of_day"] is not None and p["day_of_week"] is None and p.get("day_of_month") is None]
+        daily = [p for p in all_patterns if p["hour_of_day"] is None and p["day_of_week"] is not None and p.get("day_of_month") is None]
         combined = [p for p in all_patterns if p["hour_of_day"] is not None and p["day_of_week"] is not None]
+        monthly = [p for p in all_patterns if p.get("day_of_month") is not None]
 
         return {
             "total_patterns": len(all_patterns),
             "hourly_patterns": len(hourly),
             "daily_patterns": len(daily),
             "combined_patterns": len(combined),
+            "monthly_patterns": len(monthly),
             "patterns": all_patterns[:20]  # Limit for display
         }
 
