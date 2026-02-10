@@ -2840,6 +2840,7 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
                 "msg": full_sync_msg.hex()
             })
             sent_count += 1
+            shutdown_event.wait(0.02)  # Yield for incoming RPC
             plugin.log(f"cl-hive: Sent FULL_SYNC to {member_id[:16]}...", level='debug')
         except Exception as e:
             plugin.log(f"cl-hive: Failed to send FULL_SYNC to {member_id[:16]}...: {e}", level='info')
@@ -3110,6 +3111,7 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
                     "msg": fee_report_msg.hex()
                 })
                 broadcast_count += 1
+                shutdown_event.wait(0.02)  # Yield for incoming RPC
             except Exception:
                 pass  # Peer may be offline
 
@@ -3462,6 +3464,7 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
             })
         except Exception as e:
             safe_plugin.log(f"Failed to send INTENT_ABORT to {member_id[:16]}...: {e}", level='debug')
+        shutdown_event.wait(0.02)  # Yield for incoming RPC
 
 
 # =============================================================================
@@ -3493,6 +3496,7 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
                 "msg": message_bytes.hex()
             })
             sent_count += 1
+            shutdown_event.wait(0.02)  # Yield for incoming RPC
         except Exception as e:
             safe_plugin.log(f"Failed to send message to {member_id[:16]}...: {e}", level='debug')
 
@@ -3939,6 +3943,7 @@ def _sync_membership_on_startup(plugin: Plugin) -> None:
                 "msg": full_sync_msg.hex()
             })
             sent_count += 1
+            shutdown_event.wait(0.02)  # Yield for incoming RPC
         except Exception as e:
             plugin.log(f"cl-hive: Startup sync to {member_id[:16]}...: {e}", level='debug')
 
@@ -9639,6 +9644,7 @@ def gossip_loop():
                                 "msg": gossip_msg.hex()
                             })
                             broadcast_count += 1
+                            shutdown_event.wait(0.02)  # Yield for incoming RPC
                         except Exception:
                             pass  # Peer may be offline
 
@@ -9763,6 +9769,7 @@ def _broadcast_mcf_solution(solution):
                     msg=msg.hex()
                 )
                 broadcast_count += 1
+                shutdown_event.wait(0.02)  # Yield for incoming RPC
             except Exception as e:
                 safe_plugin.log(
                     f"cl-hive: Failed to send MCF solution to {peer_id[:16]}...: {e}",
@@ -10077,6 +10084,7 @@ def _broadcast_our_fee_intelligence():
                             "msg": msg.hex()
                         })
                         broadcast_count += 1
+                        shutdown_event.wait(0.02)  # Yield for incoming RPC
                     except Exception:
                         pass  # Peer might be offline
 
@@ -10171,6 +10179,7 @@ def _broadcast_our_stigmergic_markers():
                     "msg": msg.hex()
                 })
                 broadcast_count += 1
+                shutdown_event.wait(0.02)  # Yield for incoming RPC
             except Exception:
                 pass  # Peer might be offline
 
@@ -10258,6 +10267,7 @@ def _broadcast_our_pheromones():
                     "msg": msg.hex()
                 })
                 broadcast_count += 1
+                shutdown_event.wait(0.02)  # Yield for incoming RPC
             except Exception:
                 pass  # Peer might be offline
 
@@ -10325,6 +10335,7 @@ def _broadcast_our_yield_metrics():
                     "msg": msg.hex()
                 })
                 broadcast_count += 1
+                shutdown_event.wait(0.02)  # Yield for incoming RPC
             except Exception:
                 pass  # Peer might be offline
 
@@ -10398,6 +10409,7 @@ def _broadcast_circular_flow_alerts():
                         "msg": msg.hex()
                     })
                     total_broadcast += 1
+                    shutdown_event.wait(0.02)  # Yield for incoming RPC
                 except Exception:
                     pass
 
@@ -10469,6 +10481,7 @@ def _broadcast_our_temporal_patterns():
                     "msg": msg.hex()
                 })
                 broadcast_count += 1
+                shutdown_event.wait(0.02)  # Yield for incoming RPC
             except Exception:
                 pass  # Peer might be offline
 
@@ -10540,6 +10553,7 @@ def _broadcast_our_corridor_values():
                     "msg": msg.hex()
                 })
                 broadcast_count += 1
+                shutdown_event.wait(0.02)  # Yield for incoming RPC
             except Exception:
                 pass
 
@@ -10606,6 +10620,7 @@ def _broadcast_our_positioning_proposals():
                         "msg": msg.hex()
                     })
                     total_broadcast += 1
+                    shutdown_event.wait(0.02)  # Yield for incoming RPC
                 except Exception:
                     pass
 
@@ -10677,6 +10692,7 @@ def _broadcast_our_physarum_recommendations():
                         "msg": msg.hex()
                     })
                     total_broadcast += 1
+                    shutdown_event.wait(0.02)  # Yield for incoming RPC
                 except Exception:
                     pass
 
@@ -10743,6 +10759,7 @@ def _broadcast_our_coverage_analysis():
                     "msg": msg.hex()
                 })
                 broadcast_count += 1
+                shutdown_event.wait(0.02)  # Yield for incoming RPC
             except Exception:
                 pass
 
@@ -10810,6 +10827,7 @@ def _broadcast_our_close_proposals():
                         "msg": msg.hex()
                     })
                     total_broadcast += 1
+                    shutdown_event.wait(0.02)  # Yield for incoming RPC
                 except Exception:
                     pass
 
@@ -10925,6 +10943,7 @@ def _broadcast_health_report():
                         "msg": msg.hex()
                     })
                     broadcast_count += 1
+                    shutdown_event.wait(0.02)  # Yield for incoming RPC
                 except Exception:
                     pass
 
@@ -10993,6 +11012,7 @@ def _broadcast_liquidity_needs():
                             "msg": msg.hex()
                         })
                         broadcast_count += 1
+                        shutdown_event.wait(0.02)  # Yield for incoming RPC
                     except Exception:
                         pass
 
