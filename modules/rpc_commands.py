@@ -357,13 +357,14 @@ def pending_actions(ctx: HiveContext) -> Dict[str, Any]:
     }
 
 
-def reject_action(ctx: HiveContext, action_id) -> Dict[str, Any]:
+def reject_action(ctx: HiveContext, action_id, reason=None) -> Dict[str, Any]:
     """
     Reject pending action(s).
 
     Args:
         ctx: HiveContext
         action_id: ID of the action to reject, or "all" to reject all pending actions
+        reason: Optional reason for rejection (stored for learning)
 
     Returns:
         Dict with rejection result.
@@ -380,7 +381,7 @@ def reject_action(ctx: HiveContext, action_id) -> Dict[str, Any]:
 
     # Handle "all" option
     if action_id == "all":
-        return _reject_all_actions(ctx)
+        return _reject_all_actions(ctx, reason=reason)
 
     # Single action rejection - validate action_id
     try:
@@ -402,23 +403,27 @@ def reject_action(ctx: HiveContext, action_id) -> Dict[str, Any]:
     if intent_id:
         ctx.database.update_intent_status(intent_id, 'aborted')
 
-    # Update action status
-    ctx.database.update_action_status(action_id, 'rejected')
+    # Update action status with optional reason
+    ctx.database.update_action_status(action_id, 'rejected', reason=reason)
 
     if ctx.log:
-        ctx.log(f"cl-hive: Rejected action {action_id}", 'info')
+        reason_str = f" (reason: {reason})" if reason else ""
+        ctx.log(f"cl-hive: Rejected action {action_id}{reason_str}", 'info')
 
-    return {
+    result = {
         "status": "rejected",
         "action_id": action_id,
         "action_type": action['action_type'],
     }
+    if reason:
+        result["reason"] = reason
+    return result
 
 
 MAX_BULK_ACTIONS = 100  # CLAUDE.md: "Bound everything"
 
 
-def _reject_all_actions(ctx: HiveContext) -> Dict[str, Any]:
+def _reject_all_actions(ctx: HiveContext, reason=None) -> Dict[str, Any]:
     """Reject all pending actions (up to MAX_BULK_ACTIONS)."""
     actions = ctx.database.get_pending_actions()
 
@@ -441,8 +446,8 @@ def _reject_all_actions(ctx: HiveContext) -> Dict[str, Any]:
             if intent_id:
                 ctx.database.update_intent_status(intent_id, 'aborted')
 
-            # Update action status
-            ctx.database.update_action_status(action_id, 'rejected')
+            # Update action status with optional reason
+            ctx.database.update_action_status(action_id, 'rejected', reason=reason)
             rejected.append({
                 "action_id": action_id,
                 "action_type": action['action_type']

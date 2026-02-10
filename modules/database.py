@@ -392,7 +392,8 @@ class HiveDatabase:
                 payload TEXT NOT NULL,
                 proposed_at INTEGER NOT NULL,
                 expires_at INTEGER,
-                status TEXT DEFAULT 'pending'
+                status TEXT DEFAULT 'pending',
+                rejection_reason TEXT
             )
         """)
 
@@ -1110,6 +1111,14 @@ class HiveDatabase:
         try:
             conn.execute(
                 "ALTER TABLE fee_reports ADD COLUMN rebalance_costs_sats INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Add rejection_reason column if upgrading from older schema
+        try:
+            conn.execute(
+                "ALTER TABLE pending_actions ADD COLUMN rejection_reason TEXT"
             )
         except sqlite3.OperationalError:
             pass  # Column already exists
@@ -2156,13 +2165,19 @@ class HiveDatabase:
         result['payload'] = json.loads(result['payload'])
         return result
 
-    def update_action_status(self, action_id: int, status: str) -> bool:
+    def update_action_status(self, action_id: int, status: str, reason: str = None) -> bool:
         """Update action status: 'pending', 'approved', 'rejected', 'expired'."""
         conn = self._get_connection()
-        result = conn.execute(
-            "UPDATE pending_actions SET status = ? WHERE id = ?",
-            (status, action_id)
-        )
+        if reason:
+            result = conn.execute(
+                "UPDATE pending_actions SET status = ?, rejection_reason = ? WHERE id = ?",
+                (status, reason, action_id)
+            )
+        else:
+            result = conn.execute(
+                "UPDATE pending_actions SET status = ? WHERE id = ?",
+                (status, action_id)
+            )
         return result.rowcount > 0
     
     def cleanup_expired_actions(self) -> int:
@@ -2405,7 +2420,7 @@ class HiveDatabase:
         cutoff = int(time.time()) - (hours * 3600)
 
         rows = conn.execute("""
-            SELECT id, action_type, payload, proposed_at, status
+            SELECT id, action_type, payload, proposed_at, status, rejection_reason
             FROM pending_actions
             WHERE status = 'rejected'
             AND action_type IN ('channel_open', 'expansion')

@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Database Schema
 # =============================================================================
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 -- Schema version tracking
@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS channel_history (
     flow_ratio REAL,
     confidence REAL,
     forward_count INTEGER,
+    fees_earned_sats INTEGER DEFAULT 0,
 
     -- Fees
     fee_ppm INTEGER,
@@ -490,6 +491,11 @@ class AdvisorDB:
             if current_version < SCHEMA_VERSION:
                 # Apply schema
                 conn.executescript(SCHEMA)
+                # Migrations for existing databases
+                try:
+                    conn.execute("ALTER TABLE channel_history ADD COLUMN fees_earned_sats INTEGER DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
                     (SCHEMA_VERSION, int(datetime.now().timestamp()))
@@ -564,9 +570,10 @@ class AdvisorDB:
                             timestamp, node_name, channel_id, peer_id,
                             capacity_sats, local_sats, remote_sats, balance_ratio,
                             flow_state, flow_ratio, confidence, forward_count,
+                            fees_earned_sats,
                             fee_ppm, fee_base_msat,
                             needs_inbound, needs_outbound, is_balanced
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         timestamp,
                         node_name,
@@ -580,6 +587,7 @@ class AdvisorDB:
                         ch.get("flow_ratio", 0),
                         ch.get("confidence", 0),
                         ch.get("forward_count", 0),
+                        ch.get("fees_earned_sats", 0),
                         ch.get("fee_ppm", 0),
                         ch.get("fee_base_msat", 0),
                         1 if ch.get("needs_inbound") else 0,

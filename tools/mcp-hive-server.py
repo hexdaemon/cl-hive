@@ -4461,10 +4461,10 @@ async def handle_reject_action(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Note: reason is for logging only, not passed to plugin
-    return await node.call("hive-reject-action", {
-        "action_id": action_id
-    })
+    params = {"action_id": action_id}
+    if reason:
+        params["reason"] = reason
+    return await node.call("hive-reject-action", params)
 
 
 async def handle_members(args: Dict) -> Dict:
@@ -6860,6 +6860,7 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
                 "flow_ratio": prof_ch.get("roi_percentage", 0),
                 "confidence": 1.0,
                 "forward_count": prof_ch.get("forward_count", 0),
+                "fees_earned_sats": prof_ch.get("fees_earned_sats", 0),
                 "fee_ppm": fee_ppm,
                 "fee_base_msat": fee_base,
                 "needs_inbound": balance_ratio > 0.8,

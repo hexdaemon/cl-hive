@@ -1882,6 +1882,10 @@ class Planner:
 
         return False, ""
 
+    # Hard cap: after this many consecutive rejections, disable expansions
+    # entirely until an approval occurs or operator intervenes
+    MAX_CONSECUTIVE_REJECTIONS = 50
+
     def _should_pause_expansions_globally(self, cfg) -> tuple[bool, str]:
         """
         Check if expansions should be paused due to global constraints.
@@ -1893,6 +1897,7 @@ class Planner:
         The planner will pause expansions if:
         1. There have been N consecutive rejections without any approvals
         2. Uses exponential backoff based on rejection count
+        3. Hard cap at MAX_CONSECUTIVE_REJECTIONS disables entirely
 
         Args:
             cfg: Config snapshot
@@ -1905,6 +1910,13 @@ class Planner:
 
         # Get consecutive rejection count
         consecutive_rejections = self.db.count_consecutive_expansion_rejections()
+
+        # Hard cap: too many rejections means manual intervention needed
+        if consecutive_rejections >= self.MAX_CONSECUTIVE_REJECTIONS:
+            return True, (
+                f"expansion_disabled ({consecutive_rejections} consecutive rejections, "
+                f"manual intervention needed)"
+            )
 
         # Configurable threshold (default: 3 consecutive rejections triggers pause)
         pause_threshold = getattr(cfg, 'expansion_pause_threshold', 3)
@@ -1963,9 +1975,12 @@ class Planner:
         # Check for global constraints (e.g., consecutive rejections due to liquidity)
         should_pause, pause_reason = self._should_pause_expansions_globally(cfg)
         if should_pause:
+            # Include recent rejection reasons for operator visibility
+            recent = self.db.get_recent_expansion_rejections(hours=24)
+            reasons = [r.get('rejection_reason', 'unknown') for r in recent[:5]]
             self._log(
-                f"Expansions paused due to global constraint: {pause_reason}",
-                level='debug'
+                f"Expansions paused: {pause_reason}. Recent reasons: {reasons}",
+                level='info'
             )
             self.db.log_planner_action(
                 action_type='expansion',
@@ -1973,6 +1988,7 @@ class Planner:
                 details={
                     'reason': 'global_constraint',
                     'detail': pause_reason,
+                    'recent_rejection_reasons': reasons,
                     'run_id': run_id
                 }
             )

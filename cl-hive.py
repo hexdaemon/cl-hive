@@ -12305,20 +12305,21 @@ def hive_approve_action(plugin: Plugin, action_id="all", amount_sats: int = None
 
 
 @plugin.method("hive-reject-action")
-def hive_reject_action(plugin: Plugin, action_id="all"):
+def hive_reject_action(plugin: Plugin, action_id="all", reason=None):
     """
     Reject pending action(s).
 
     Args:
         action_id: ID of the action to reject, or "all" to reject all pending actions.
             Defaults to "all" if not specified.
+        reason: Optional reason for rejection (stored for learning).
 
     Returns:
         Dict with rejection result.
 
     Permission: Member or Admin only
     """
-    return rpc_reject_action(_get_hive_context(), action_id)
+    return rpc_reject_action(_get_hive_context(), action_id, reason=reason)
 
 
 @plugin.method("hive-budget-summary")
