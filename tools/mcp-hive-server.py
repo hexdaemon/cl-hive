@@ -1733,6 +1733,117 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         # =====================================================================
+        # Diagnostic Tools - Data pipeline health checks and validation
+        # =====================================================================
+        Tool(
+            name="hive_node_diagnostic",
+            description="""Run a comprehensive diagnostic on a single node.
+
+**Returns in one call:**
+- Channel balances (total capacity, local/remote, balance ratios)
+- 24h forwarding stats (count, volume, revenue, avg fee)
+- Sling rebalancer status (if available)
+- Installed plugin list
+
+**When to use:** First tool to call when investigating node issues or verifying data pipeline health.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_ops_health",
+            description="""Validate cl-revenue-ops data pipeline health.
+
+**Checks 4 RPC endpoints:**
+- revenue-dashboard: P&L data availability
+- revenue-profitability: Channel classification data
+- revenue-rebalance-debug: Rebalance subsystem state
+- revenue-status: Plugin operational status
+
+**Returns:** Per-check pass/fail/error/warn status + overall health (healthy/warning/unhealthy/degraded).
+
+**When to use:** After deploying changes or when advisor reports unexpected data.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="advisor_validate_data",
+            description="""Validate advisor snapshot data quality.
+
+**Checks:**
+- Zero-value detection: channels with 0 capacity or 0 local balance
+- Missing IDs: channels without short_channel_id or peer_id
+- Flow state consistency: balance ratios outside 0-1 range
+- Live comparison: snapshot balances vs current listpeerchannels data
+
+**When to use:** After recording a snapshot, to verify data integrity. Catches the zero-balance and missing-data bugs that were previously found.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="advisor_dedup_status",
+            description="""Check for duplicate and stale pending decisions.
+
+**Returns:**
+- Pending decision count grouped by (decision_type, node, channel)
+- Duplicate groups (same type+node+channel with multiple pending decisions)
+- Stale decisions (pending > 48 hours)
+- Outcome measurement coverage (decisions with measured outcomes vs total)
+
+**When to use:** Before running advisor cycle, to clean up stale recommendations.""",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        Tool(
+            name="rebalance_diagnostic",
+            description="""Diagnose rebalancing subsystem health.
+
+**Checks:**
+- Sling plugin availability
+- Active sling jobs and their status
+- Rebalance rejection reasons from revenue-rebalance-debug
+- Capital controls state
+- Budget availability
+
+**When to use:** When rebalances are failing or not executing as expected.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # =====================================================================
         # Advisor Database Tools - Historical tracking and trend analysis
         # =====================================================================
         Tool(
@@ -6193,6 +6304,408 @@ def _analyze_market_position(our_fee: int, their_avg_fee: int, intel: Dict) -> D
 
 
 # =============================================================================
+# Diagnostic Tool Handlers
+# =============================================================================
+
+
+async def handle_hive_node_diagnostic(args: Dict) -> Dict:
+    """Comprehensive single-node diagnostic."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    import time
+    now = int(time.time())
+    since_24h = now - 86400
+
+    result: Dict[str, Any] = {"node": node_name}
+
+    # Channel balances
+    try:
+        channels_result = await node.call("listpeerchannels")
+        channels = channels_result.get("channels", [])
+        total_capacity_msat = 0
+        total_local_msat = 0
+        channel_count = 0
+        zero_balance_channels = []
+        for ch in channels:
+            state = ch.get("state", "")
+            if "CHANNELD_NORMAL" not in state:
+                continue
+            channel_count += 1
+            totals = _channel_totals(ch)
+            total_capacity_msat += totals["total_msat"]
+            total_local_msat += totals["local_msat"]
+            if totals["total_msat"] == 0:
+                zero_balance_channels.append(ch.get("short_channel_id", "unknown"))
+        result["channels"] = {
+            "count": channel_count,
+            "total_capacity_sats": total_capacity_msat // 1000,
+            "total_local_sats": total_local_msat // 1000,
+            "total_remote_sats": (total_capacity_msat - total_local_msat) // 1000,
+            "avg_balance_ratio": round(total_local_msat / total_capacity_msat, 3) if total_capacity_msat else 0,
+            "zero_balance_channels": zero_balance_channels,
+        }
+    except Exception as e:
+        result["channels"] = {"error": str(e)}
+
+    # 24h forwarding stats
+    try:
+        forwards = await node.call("listforwards", {"status": "settled"})
+        stats = _forward_stats(forwards.get("forwards", []), since_24h, now)
+        result["forwards_24h"] = stats
+    except Exception as e:
+        result["forwards_24h"] = {"error": str(e)}
+
+    # Sling status
+    try:
+        sling = await node.call("sling-status")
+        result["sling_status"] = sling
+    except Exception as e:
+        result["sling_status"] = {"error": str(e), "note": "sling plugin may not be installed"}
+
+    # Plugin list
+    try:
+        plugins = await node.call("plugin", {"subcommand": "list"})
+        plugin_names = []
+        for p in plugins.get("plugins", []):
+            name = p.get("name", "")
+            # Extract just the filename from the path
+            plugin_names.append(name.split("/")[-1] if "/" in name else name)
+        result["plugins"] = plugin_names
+    except Exception as e:
+        result["plugins"] = {"error": str(e)}
+
+    return result
+
+
+async def handle_revenue_ops_health(args: Dict) -> Dict:
+    """Validate cl-revenue-ops data pipeline health."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    checks: Dict[str, Dict[str, Any]] = {}
+
+    # Check 1: revenue-dashboard
+    try:
+        dashboard = await node.call("revenue-dashboard", {"window_days": 7})
+        if "error" in dashboard:
+            checks["dashboard"] = {"status": "error", "detail": dashboard["error"]}
+        else:
+            has_revenue = dashboard.get("total_revenue_sats", 0) is not None
+            has_channels = dashboard.get("active_channels", 0) is not None
+            if has_revenue and has_channels:
+                checks["dashboard"] = {"status": "pass", "active_channels": dashboard.get("active_channels"), "total_revenue_sats": dashboard.get("total_revenue_sats")}
+            else:
+                checks["dashboard"] = {"status": "warn", "detail": "Dashboard returned but missing expected fields"}
+    except Exception as e:
+        checks["dashboard"] = {"status": "error", "detail": str(e)}
+
+    # Check 2: revenue-profitability
+    try:
+        prof = await node.call("revenue-profitability")
+        if "error" in prof:
+            checks["profitability"] = {"status": "error", "detail": prof["error"]}
+        else:
+            channel_count = len(prof.get("channels", prof.get("channels_by_class", {}).get("all", [])))
+            checks["profitability"] = {"status": "pass", "channels_analyzed": channel_count}
+    except Exception as e:
+        checks["profitability"] = {"status": "error", "detail": str(e)}
+
+    # Check 3: revenue-rebalance-debug
+    try:
+        rebal = await node.call("revenue-rebalance-debug")
+        if "error" in rebal:
+            checks["rebalance_debug"] = {"status": "error", "detail": rebal["error"]}
+        else:
+            checks["rebalance_debug"] = {"status": "pass", "keys": list(rebal.keys())[:10]}
+    except Exception as e:
+        checks["rebalance_debug"] = {"status": "error", "detail": str(e)}
+
+    # Check 4: revenue-status
+    try:
+        status = await node.call("revenue-status")
+        if "error" in status:
+            checks["status"] = {"status": "error", "detail": status["error"]}
+        else:
+            checks["status"] = {"status": "pass", "detail": status}
+    except Exception as e:
+        checks["status"] = {"status": "error", "detail": str(e)}
+
+    # Overall health
+    statuses = [c["status"] for c in checks.values()]
+    if all(s == "pass" for s in statuses):
+        overall = "healthy"
+    elif all(s == "error" for s in statuses):
+        overall = "unhealthy"
+    elif "error" in statuses:
+        overall = "degraded"
+    else:
+        overall = "warning"
+
+    return {
+        "node": node_name,
+        "overall_health": overall,
+        "checks": checks,
+    }
+
+
+async def handle_advisor_validate_data(args: Dict) -> Dict:
+    """Validate advisor snapshot data quality."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    import time
+    issues = []
+    stats: Dict[str, Any] = {}
+
+    # Get recent snapshot data from advisor DB
+    try:
+        db = ensure_advisor_db()
+        snapshots = db.get_recent_snapshots(limit=1)
+        if not snapshots:
+            return {"node": node_name, "issues": [{"severity": "warn", "detail": "No snapshots found in advisor DB"}], "stats": {}}
+        stats["latest_snapshot_age_secs"] = int(time.time()) - snapshots[0].get("timestamp", 0)
+        stats["latest_snapshot_type"] = snapshots[0].get("snapshot_type", "unknown")
+    except Exception as e:
+        issues.append({"severity": "error", "detail": f"Cannot read advisor DB: {e}"})
+
+    # Get channel_history records for this node
+    channel_records = []
+    try:
+        db = ensure_advisor_db()
+        with db._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT channel_id, peer_id, capacity_sats, local_sats, remote_sats, balance_ratio
+                FROM channel_history
+                WHERE node_name = ?
+                AND timestamp > ?
+                ORDER BY timestamp DESC
+                LIMIT 200
+            """, (node_name, int(time.time()) - 3600)).fetchall()
+            channel_records = [dict(r) for r in rows]
+    except Exception as e:
+        issues.append({"severity": "error", "detail": f"Cannot query channel_history: {e}"})
+
+    stats["channel_records_last_hour"] = len(channel_records)
+
+    # Check for zero-value issues
+    zero_capacity = [r for r in channel_records if r.get("capacity_sats", 0) == 0]
+    zero_local = [r for r in channel_records if r.get("local_sats", 0) == 0 and r.get("remote_sats", 0) == 0]
+    if zero_capacity:
+        issues.append({
+            "severity": "critical",
+            "detail": f"{len(zero_capacity)} channel records with zero capacity",
+            "channels": [r.get("channel_id", "?") for r in zero_capacity[:5]],
+        })
+    if zero_local:
+        issues.append({
+            "severity": "warn",
+            "detail": f"{len(zero_local)} channel records with both local and remote = 0",
+            "channels": [r.get("channel_id", "?") for r in zero_local[:5]],
+        })
+
+    # Check for missing IDs
+    missing_channel_id = [r for r in channel_records if not r.get("channel_id")]
+    missing_peer_id = [r for r in channel_records if not r.get("peer_id")]
+    if missing_channel_id:
+        issues.append({"severity": "critical", "detail": f"{len(missing_channel_id)} records missing channel_id"})
+    if missing_peer_id:
+        issues.append({"severity": "warn", "detail": f"{len(missing_peer_id)} records missing peer_id"})
+
+    # Check balance ratio consistency
+    bad_ratio = [r for r in channel_records if r.get("balance_ratio") is not None and (r["balance_ratio"] < 0 or r["balance_ratio"] > 1)]
+    if bad_ratio:
+        issues.append({
+            "severity": "warn",
+            "detail": f"{len(bad_ratio)} records with balance_ratio outside 0-1 range",
+            "examples": [{"channel_id": r.get("channel_id"), "ratio": r.get("balance_ratio")} for r in bad_ratio[:3]],
+        })
+
+    # Compare snapshot vs live data
+    try:
+        channels_result = await node.call("listpeerchannels")
+        live_channels = {}
+        for ch in channels_result.get("channels", []):
+            scid = ch.get("short_channel_id")
+            if scid and "CHANNELD_NORMAL" in ch.get("state", ""):
+                totals = _channel_totals(ch)
+                live_channels[scid] = {
+                    "capacity_sats": totals["total_msat"] // 1000,
+                    "local_sats": totals["local_msat"] // 1000,
+                }
+
+        # Deduplicate channel_records to most recent per channel_id
+        seen_channels: Dict[str, Dict] = {}
+        for r in channel_records:
+            cid = r.get("channel_id")
+            if cid and cid not in seen_channels:
+                seen_channels[cid] = r
+
+        mismatches = []
+        for cid, snapshot in seen_channels.items():
+            live = live_channels.get(cid)
+            if not live:
+                continue
+            snap_cap = snapshot.get("capacity_sats", 0)
+            live_cap = live.get("capacity_sats", 0)
+            if live_cap > 0 and snap_cap == 0:
+                mismatches.append({"channel_id": cid, "issue": "snapshot has 0 capacity, live has data", "live_capacity_sats": live_cap})
+
+        stats["live_channels"] = len(live_channels)
+        stats["snapshot_channels_matched"] = len(seen_channels)
+        if mismatches:
+            issues.append({
+                "severity": "critical",
+                "detail": f"{len(mismatches)} channels with snapshot=0 but live data exists",
+                "mismatches": mismatches[:5],
+            })
+    except Exception as e:
+        issues.append({"severity": "warn", "detail": f"Could not compare with live data: {e}"})
+
+    return {
+        "node": node_name,
+        "issue_count": len(issues),
+        "critical_count": len([i for i in issues if i.get("severity") == "critical"]),
+        "issues": issues,
+        "stats": stats,
+    }
+
+
+async def handle_advisor_dedup_status(args: Dict) -> Dict:
+    """Check for duplicate and stale pending decisions."""
+    import time
+    now = int(time.time())
+    stale_threshold = now - (48 * 3600)
+
+    try:
+        db = ensure_advisor_db()
+    except Exception as e:
+        return {"error": f"Cannot initialize advisor DB: {e}"}
+
+    pending = db.get_pending_decisions()
+
+    # Group by (decision_type, node_name, channel_id)
+    groups: Dict[str, list] = {}
+    stale_count = 0
+    for d in pending:
+        key = f"{d.get('decision_type', '?')}|{d.get('node_name', '?')}|{d.get('channel_id', '?')}"
+        groups.setdefault(key, []).append(d)
+        if d.get("timestamp", now) < stale_threshold:
+            stale_count += 1
+
+    duplicates = []
+    for key, decisions in groups.items():
+        if len(decisions) > 1:
+            parts = key.split("|")
+            duplicates.append({
+                "decision_type": parts[0],
+                "node_name": parts[1],
+                "channel_id": parts[2],
+                "count": len(decisions),
+                "oldest_timestamp": min(d.get("timestamp", 0) for d in decisions),
+                "newest_timestamp": max(d.get("timestamp", 0) for d in decisions),
+            })
+
+    # Outcome coverage stats
+    try:
+        db_stats = db.get_stats()
+        total_decisions = db_stats.get("ai_decisions", 0)
+        total_outcomes = db.count_outcomes()
+    except Exception:
+        total_decisions = 0
+        total_outcomes = 0
+
+    return {
+        "pending_total": len(pending),
+        "unique_groups": len(groups),
+        "duplicate_groups": duplicates,
+        "stale_count_48h": stale_count,
+        "outcome_coverage": {
+            "total_decisions": total_decisions,
+            "total_outcomes": total_outcomes,
+            "coverage_pct": round(total_outcomes / total_decisions * 100, 1) if total_decisions else 0,
+        },
+    }
+
+
+async def handle_rebalance_diagnostic(args: Dict) -> Dict:
+    """Diagnose rebalancing subsystem health."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result: Dict[str, Any] = {"node": node_name}
+    diagnosis = []
+
+    # Check sling plugin availability
+    sling_available = False
+    try:
+        plugins = await node.call("plugin", {"subcommand": "list"})
+        for p in plugins.get("plugins", []):
+            name = p.get("name", "")
+            if "sling" in name.lower():
+                sling_available = True
+                break
+        result["sling_installed"] = sling_available
+        if not sling_available:
+            diagnosis.append("Sling plugin is NOT installed — rebalancing unavailable")
+    except Exception as e:
+        result["sling_installed"] = None
+        diagnosis.append(f"Cannot check plugin list: {e}")
+
+    # Get revenue-rebalance-debug for structured diagnostics
+    try:
+        rebal = await node.call("revenue-rebalance-debug")
+        if "error" in rebal:
+            result["rebalance_debug"] = {"error": rebal["error"]}
+            diagnosis.append(f"revenue-rebalance-debug error: {rebal['error']}")
+        else:
+            result["rebalance_debug"] = rebal
+
+            # Extract key diagnostic info
+            rejections = rebal.get("rejection_reasons", rebal.get("rejections", {}))
+            if rejections:
+                result["rejection_reasons"] = rejections
+                for reason, count in rejections.items() if isinstance(rejections, dict) else []:
+                    if count > 0:
+                        diagnosis.append(f"Rejection: {reason} ({count} channels)")
+
+            capital_controls = rebal.get("capital_controls", {})
+            if capital_controls:
+                result["capital_controls"] = capital_controls
+
+            budget = rebal.get("budget", rebal.get("budget_state", {}))
+            if budget:
+                result["budget_state"] = budget
+    except Exception as e:
+        result["rebalance_debug"] = {"error": str(e)}
+        diagnosis.append(f"Cannot call revenue-rebalance-debug: {e}")
+
+    # Try sling-status for active jobs
+    if sling_available:
+        try:
+            sling = await node.call("sling-status")
+            result["sling_status"] = sling
+        except Exception as e:
+            result["sling_status"] = {"error": str(e)}
+            diagnosis.append(f"sling-status call failed: {e}")
+
+    result["diagnosis"] = diagnosis if diagnosis else ["All rebalance subsystems operational"]
+    return result
+
+
+# =============================================================================
 # Advisor Database Tool Handlers
 # =============================================================================
 
@@ -8780,6 +9293,12 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_debug": handle_revenue_debug,
     "revenue_history": handle_revenue_history,
     "revenue_competitor_analysis": handle_revenue_competitor_analysis,
+    # Diagnostic tools
+    "hive_node_diagnostic": handle_hive_node_diagnostic,
+    "revenue_ops_health": handle_revenue_ops_health,
+    "advisor_validate_data": handle_advisor_validate_data,
+    "advisor_dedup_status": handle_advisor_dedup_status,
+    "rebalance_diagnostic": handle_rebalance_diagnostic,
     # Advisor database
     "advisor_record_snapshot": handle_advisor_record_snapshot,
     "advisor_get_trends": handle_advisor_get_trends,
