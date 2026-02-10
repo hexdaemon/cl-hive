@@ -24,6 +24,7 @@ Complexity: O(V * E * flow) - under 1 second for typical fleets
 Author: Lightning Goats Team
 """
 
+import heapq
 import time
 import threading
 from dataclasses import dataclass, field
@@ -336,7 +337,7 @@ class MCFEdge:
 
     def unit_cost(self, amount: int) -> int:
         """Calculate cost for flowing `amount` sats."""
-        return (amount * self.cost_ppm) // 1_000_000
+        return (amount * self.cost_ppm + 500_000) // 1_000_000
 
 
 @dataclass
@@ -656,6 +657,9 @@ class SSPSolver:
         """
         self.network = network
         self.iterations = 0
+        self.warnings: List[str] = []
+        self._potentials: Dict[str, float] = {}
+        self._first_iteration = True
 
     def solve(self) -> Tuple[int, int, List[Tuple[int, int]]]:
         """
@@ -675,8 +679,13 @@ class SSPSolver:
         while self.iterations < MAX_MCF_ITERATIONS:
             self.iterations += 1
 
-            # Find shortest path from source to sink
-            path, path_cost = self._bellman_ford_shortest_path(source, sink)
+            # First iteration: Bellman-Ford (handles negative costs, sets potentials)
+            # Subsequent: Dijkstra with Johnson potentials (O(E log V) vs O(V*E))
+            if self._first_iteration:
+                path, path_cost = self._bellman_ford_shortest_path(source, sink)
+                self._first_iteration = False
+            else:
+                path, path_cost = self._dijkstra_shortest_path(source, sink)
 
             if not path:
                 # No more augmenting paths
@@ -692,7 +701,7 @@ class SSPSolver:
             self._augment_flow(path, bottleneck)
 
             total_flow += bottleneck
-            total_cost += bottleneck * path_cost // 1_000_000
+            total_cost += (bottleneck * path_cost + 500_000) // 1_000_000
 
         # Collect edge flows
         edge_flows = []
@@ -737,8 +746,9 @@ class SSPSolver:
 
         dist[source_idx] = 0
 
-        # Bellman-Ford relaxation
-        for iteration in range(n):
+        # Bellman-Ford relaxation (capped for safety)
+        bf_limit = min(n, MAX_BELLMAN_FORD_ITERATIONS)
+        for iteration in range(bf_limit):
             updated = False
 
             for edge_idx, edge in enumerate(self.network.edges):
@@ -765,13 +775,22 @@ class SSPSolver:
                 break
 
             # Detect negative cycle (shouldn't happen with proper setup)
-            if iteration == n - 1 and updated:
+            if iteration == bf_limit - 1 and updated:
                 # Negative cycle detected - stop to prevent infinite loop
+                self.warnings.append(
+                    f"Negative cycle detected in residual network "
+                    f"({n} nodes, {len(self.network.edges)} edges)"
+                )
                 return [], 0
 
         # Check if sink is reachable
         if dist[sink_idx] == INFINITY:
             return [], 0
+
+        # Initialize Johnson potentials from Bellman-Ford distances
+        for i, node_id in enumerate(nodes):
+            if dist[i] < INFINITY:
+                self._potentials[node_id] = dist[i]
 
         # Reconstruct path
         path = []
@@ -836,6 +855,92 @@ class SSPSolver:
             if reverse_idx >= 0:
                 reverse_edge = self.network.edges[reverse_idx]
                 reverse_edge.residual_capacity += amount
+
+    def _dijkstra_shortest_path(
+        self,
+        source: str,
+        sink: str
+    ) -> Tuple[List[int], int]:
+        """
+        Find shortest (min-cost) path using Dijkstra with Johnson potentials.
+
+        Uses reduced costs c'(u,v) = cost(u,v) + h[u] - h[v] which are
+        guaranteed non-negative after Bellman-Ford initialization.
+
+        Args:
+            source: Source node ID
+            sink: Sink node ID
+
+        Returns:
+            Tuple of (path_edge_indices, original_total_cost_ppm)
+            Empty path if no augmenting path exists
+        """
+        h = self._potentials
+        dist: Dict[str, float] = {}
+        pred_edge: Dict[str, int] = {}
+        visited: Set[str] = set()
+
+        dist[source] = 0
+        pq: List[Tuple[float, str]] = [(0, source)]
+
+        while pq:
+            d_u, u = heapq.heappop(pq)
+            if u in visited:
+                continue
+            visited.add(u)
+            if u == sink:
+                break
+
+            node = self.network.nodes.get(u)
+            if not node:
+                continue
+
+            h_u = h.get(u, 0)
+            for edge_idx in node.outgoing_edges:
+                edge = self.network.edges[edge_idx]
+                if edge.residual_capacity <= 0:
+                    continue
+
+                v = edge.to_node
+                if v in visited:
+                    continue
+
+                # Reduced cost (clamp to 0 for floating point safety)
+                reduced_cost = max(0, edge.cost_ppm + h_u - h.get(v, 0))
+                new_dist = d_u + reduced_cost
+
+                if v not in dist or new_dist < dist[v]:
+                    dist[v] = new_dist
+                    pred_edge[v] = edge_idx
+                    heapq.heappush(pq, (new_dist, v))
+
+        if sink not in dist:
+            return [], 0
+
+        # Update potentials: h[v] += dist_reduced[v]
+        for node_id, d in dist.items():
+            h[node_id] = h.get(node_id, 0) + d
+
+        # Reconstruct path and compute original cost
+        path: List[int] = []
+        current = sink
+
+        while current != source:
+            if current not in pred_edge:
+                return [], 0
+            idx = pred_edge[current]
+            path.append(idx)
+            current = self.network.edges[idx].from_node
+
+            # Safety check to prevent infinite loops
+            if len(path) > len(self.network.nodes):
+                return [], 0
+
+        path.reverse()
+
+        # Return original cost (sum of actual edge costs, not reduced)
+        original_cost = sum(self.network.edges[i].cost_ppm for i in path)
+        return path, original_cost
 
 
 # =============================================================================
@@ -926,26 +1031,36 @@ class MCFNetworkBuilder:
         all_states: List,
         member_ids: Set[str]
     ) -> None:
-        """Add edges between fleet members based on topology."""
-        for state in all_states:
-            from_node = state.peer_id
-            topology = getattr(state, 'topology', []) or []
-            capacity = getattr(state, 'capacity_sats', 0) or 0
+        """
+        Add edges between fleet members based on gossip state.
 
-            for to_node in topology:
-                # Skip if not a fleet member (we only know about hive channels)
-                if to_node not in member_ids:
-                    continue
+        Since gossip provides each member's available_sats (hive outbound
+        liquidity) but not per-channel breakdown, we infer connectivity
+        by distributing available_sats across edges to all other known
+        hive members (conservative full-mesh assumption).
+        """
+        MAX_ESTIMATED_EDGE_CAPACITY = 16_777_215  # standard channel cap
+        state_by_id = {s.peer_id: s for s in all_states}
+        member_list = sorted(member_ids)
 
-                # Estimate per-channel capacity
-                # In practice, we'd get actual channel data
-                estimated_capacity = capacity // max(1, len(topology))
-
-                # Hive internal channels have zero fees
+        for from_node in member_list:
+            state = state_by_id.get(from_node)
+            if not state:
+                continue
+            available = getattr(state, 'available_sats', 0) or 0
+            if available <= 0:
+                continue
+            other_members = [m for m in member_list if m != from_node]
+            if not other_members:
+                continue
+            per_edge = min(available // len(other_members), MAX_ESTIMATED_EDGE_CAPACITY)
+            if per_edge <= 0:
+                continue
+            for to_node in other_members:
                 network.add_edge(
                     from_node=from_node,
                     to_node=to_node,
-                    capacity=estimated_capacity,
+                    capacity=per_edge,
                     cost_ppm=HIVE_INTERNAL_COST_PPM,
                     is_hive_internal=True
                 )
@@ -1052,11 +1167,17 @@ class MCFCoordinator:
 
         # Builder and solution cache
         self._builder = MCFNetworkBuilder(plugin)
+        self._solution_lock = threading.Lock()
         self._last_solution: Optional[MCFSolution] = None
         self._last_solution_time: float = 0
 
         # Pending assignments for us
         self._our_assignments: List[RebalanceAssignment] = []
+
+        # Election cache
+        self._cached_coordinator: Optional[str] = None
+        self._election_cache_time: float = 0
+        self._election_cache_ttl: float = 60  # seconds
 
         # Completion tracking
         self._completed_assignments: Dict[str, Dict[str, Any]] = {}
@@ -1138,8 +1259,20 @@ class MCFCoordinator:
         return elected
 
     def is_coordinator(self) -> bool:
-        """Check if we are the elected coordinator."""
-        return self.elect_coordinator() == self.our_pubkey
+        """Check if we are the elected coordinator (uses cached result)."""
+        now = time.time()
+        if (self._cached_coordinator is not None
+                and (now - self._election_cache_time) < self._election_cache_ttl):
+            return self._cached_coordinator == self.our_pubkey
+        result = self.elect_coordinator()
+        self._cached_coordinator = result
+        self._election_cache_time = now
+        return result == self.our_pubkey
+
+    def invalidate_election_cache(self) -> None:
+        """Invalidate the coordinator election cache (e.g. on membership change)."""
+        self._cached_coordinator = None
+        self._election_cache_time = 0
 
     def collect_fleet_needs(self) -> List[RebalanceNeed]:
         """
@@ -1235,6 +1368,10 @@ class MCFCoordinator:
             solver = SSPSolver(network)
             total_flow, total_cost, edge_flows = solver.solve()
 
+            # Log any solver warnings
+            for warning in solver.warnings:
+                self._log(f"Solver warning: {warning}", level="warn")
+
             computation_time = int((time.time() - start_time) * 1000)
 
             # Extract assignments
@@ -1254,8 +1391,9 @@ class MCFCoordinator:
                 coordinator_id=self.our_pubkey,
             )
 
-            self._last_solution = solution
-            self._last_solution_time = time.time()
+            with self._solution_lock:
+                self._last_solution = solution
+                self._last_solution_time = time.time()
 
             # Record success to circuit breaker and metrics
             self._circuit_breaker.record_success()
@@ -1341,6 +1479,11 @@ class MCFCoordinator:
 
     def get_our_assignments(self) -> List[RebalanceAssignment]:
         """Get assignments for our node from the latest solution."""
+        with self._solution_lock:
+            return self._get_our_assignments_unlocked()
+
+    def _get_our_assignments_unlocked(self) -> List[RebalanceAssignment]:
+        """Get assignments without acquiring lock. Caller must hold _solution_lock."""
         if not self._last_solution:
             return []
 
@@ -1354,23 +1497,26 @@ class MCFCoordinator:
         is_coord = self.is_coordinator()
         coordinator_id = self.elect_coordinator()
 
-        solution_age = 0
-        if self._last_solution:
-            solution_age = int(time.time() - self._last_solution_time)
+        with self._solution_lock:
+            solution_age = 0
+            if self._last_solution:
+                solution_age = int(time.time() - self._last_solution_time)
 
-        return {
-            "enabled": True,
-            "is_coordinator": is_coord,
-            "coordinator_id": coordinator_id[:16] + "..." if coordinator_id else None,
-            "last_solution": self._last_solution.to_dict() if self._last_solution else None,
-            "solution_age_seconds": solution_age,
-            "solution_valid": self._last_solution is not None and solution_age < MAX_SOLUTION_AGE,
-            "our_assignments": [a.to_dict() for a in self.get_our_assignments()],
-            "pending_count": len(self.get_our_assignments()),
-            # Phase 5: Circuit breaker and health metrics
-            "circuit_breaker": self._circuit_breaker.get_status(),
-            "health_metrics": self._health_metrics.to_dict(),
-        }
+            our_assignments = self._get_our_assignments_unlocked()
+
+            return {
+                "enabled": True,
+                "is_coordinator": is_coord,
+                "coordinator_id": coordinator_id[:16] + "..." if coordinator_id else None,
+                "last_solution": self._last_solution.to_dict() if self._last_solution else None,
+                "solution_age_seconds": solution_age,
+                "solution_valid": self._last_solution is not None and solution_age < MAX_SOLUTION_AGE,
+                "our_assignments": [a.to_dict() for a in our_assignments],
+                "pending_count": len(our_assignments),
+                # Phase 5: Circuit breaker and health metrics
+                "circuit_breaker": self._circuit_breaker.get_status(),
+                "health_metrics": self._health_metrics.to_dict(),
+            }
 
     def get_health_summary(self) -> Dict[str, Any]:
         """
@@ -1464,6 +1610,16 @@ class MCFCoordinator:
             coordinator_id=solution_data.get("coordinator_id", ""),
         )
 
+        # Validate timestamp freshness
+        now = int(time.time())
+        if solution.timestamp > 0 and abs(now - solution.timestamp) > MAX_SOLUTION_AGE:
+            self._log(
+                f"Solution timestamp too old or too far in future: "
+                f"age={now - solution.timestamp}s, max={MAX_SOLUTION_AGE}s",
+                level="warn"
+            )
+            return False
+
         # Validate coordinator
         expected_coordinator = self.elect_coordinator()
         if solution.coordinator_id != expected_coordinator:
@@ -1475,8 +1631,9 @@ class MCFCoordinator:
             return False
 
         # Accept solution
-        self._last_solution = solution
-        self._last_solution_time = time.time()
+        with self._solution_lock:
+            self._last_solution = solution
+            self._last_solution_time = time.time()
 
         self._log(f"Accepted MCF solution with {len(assignments)} assignments")
         return True

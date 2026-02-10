@@ -8086,6 +8086,17 @@ def handle_mcf_solution_broadcast(peer_id: str, payload: Dict, plugin: Plugin) -
     signature = payload.get("signature", "")
     assignments = payload.get("assignments", [])
 
+    # Reject stale or replayed solutions
+    from modules.mcf_solver import MAX_SOLUTION_AGE as _MCF_MAX_SOL_AGE
+    now = int(time.time())
+    if timestamp > 0 and abs(now - timestamp) > _MCF_MAX_SOL_AGE:
+        plugin.log(
+            f"cl-hive: MCF_SOLUTION_BROADCAST stale/future timestamp from {peer_id[:16]}... "
+            f"(age={now - timestamp}s, max={_MCF_MAX_SOL_AGE}s)",
+            level='warn'
+        )
+        return {"result": "continue"}
+
     # Identity binding: peer_id must match claimed coordinator
     if peer_id != coordinator_id:
         plugin.log(
