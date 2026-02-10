@@ -1630,6 +1630,9 @@ def on_peer_connected(peer: dict, plugin: Plugin, **kwargs):
     try:
         from modules.protocol import create_hello
         hello_msg = create_hello(local_pubkey)
+        if hello_msg is None:
+            plugin.log("cl-hive: HELLO message too large, skipping autodiscovery", level='warning')
+            return {"result": "continue"}
 
         safe_plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
@@ -3511,6 +3514,10 @@ def _reliable_send(msg_type: HiveMessageType, payload: Dict,
     else:
         try:
             msg_bytes = serialize(msg_type, payload)
+            if msg_bytes is None:
+                if safe_plugin:
+                    safe_plugin.log(f"cl-hive: message too large, skipping send to {peer_id[:16]}", level='warning')
+                return
             if safe_plugin:
                 safe_plugin.rpc.call("sendcustommsg", {
                     "node_id": peer_id,
@@ -8451,6 +8458,7 @@ def intent_monitor_loop():
             if intent_mgr and database and config:
                 process_ready_intents()
                 intent_mgr.cleanup_expired_intents()
+                intent_mgr.recover_stuck_intents(max_age_seconds=300)
         except Exception as e:
             if safe_plugin:
                 safe_plugin.log(f"Intent monitor error: {e}", level='warn')
@@ -8602,6 +8610,12 @@ def membership_maintenance_loop():
 
                 # Phase C: Proto events cleanup (30-day retention)
                 database.cleanup_proto_events(max_age_seconds=30 * 86400)
+
+                # Prune old peer events (180-day retention)
+                database.prune_peer_events(older_than_days=180)
+
+                # Prune old budget tracking (90-day retention)
+                database.prune_budget_tracking(older_than_days=90)
 
                 # Issue #38: Auto-connect to hive members we're not connected to
                 reconnected = _auto_connect_to_all_members()
@@ -13462,36 +13476,22 @@ def hive_bump_version(plugin: Plugin, version: int):
     # Get current versions
     our_state = state_manager.get_peer_state(our_pubkey)
     old_db_version = our_state.version if our_state else 0
-    old_gossip_version = gossip_mgr._last_broadcast_state.version
+    with gossip_mgr._lock:
+        old_gossip_version = gossip_mgr._last_broadcast_state.version
 
-    # Update database
-    database.update_hive_state(
-        peer_id=our_pubkey,
+    # Update in-memory state and database via proper locked API
+    state_manager.update_local_state(
         capacity_sats=our_state.capacity_sats if our_state else 0,
         available_sats=our_state.available_sats if our_state else 0,
         fee_policy=our_state.fee_policy if our_state else {},
         topology=our_state.topology if our_state else [],
-        state_hash="",
-        version=version
+        our_pubkey=our_pubkey,
+        force_version=version
     )
 
-    # Update in-memory state
-    if our_state:
-        # Create new state with updated version
-        new_state = HivePeerState(
-            peer_id=our_pubkey,
-            capacity_sats=our_state.capacity_sats,
-            available_sats=our_state.available_sats,
-            fee_policy=our_state.fee_policy,
-            topology=our_state.topology,
-            version=version,
-            last_update=our_state.last_update,
-            state_hash=our_state.state_hash
-        )
-        state_manager._local_state[our_pubkey] = new_state
-
     # Update gossip manager version
-    gossip_mgr._last_broadcast_state.version = version
+    with gossip_mgr._lock:
+        gossip_mgr._last_broadcast_state.version = version
 
     return {
         "old_db_version": old_db_version,
@@ -16705,7 +16705,9 @@ def hive_join(plugin: Plugin, ticket: str, peer_id: str = None):
     from modules.protocol import create_hello
     our_pubkey = handshake_mgr.get_our_pubkey()
     hello_msg = create_hello(our_pubkey)
-    
+    if hello_msg is None:
+        return {"error": "HELLO message too large to serialize"}
+
     try:
         safe_plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,

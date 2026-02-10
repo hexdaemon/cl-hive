@@ -438,6 +438,12 @@ class ProactiveAdvisor:
         # Store cycle result
         self.db.save_cycle_result(result.to_dict())
 
+        # Housekeeping: clean up old historical data (runs once per cycle)
+        try:
+            self.db.cleanup_old_data(days_to_keep=30)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old advisor data: {e}")
+
         # Final summary
         logger.info("-" * 60)
         logger.info("CYCLE COMPLETE")

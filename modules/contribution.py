@@ -30,6 +30,7 @@ class ContributionManager:
         self.plugin = plugin
         self.config = config
         self._lock = threading.Lock()
+        self._map_lock = threading.Lock()
         self._channel_map: Dict[str, str] = {}
         self._last_refresh = 0
         self._rate_limits: Dict[str, Tuple[int, int]] = {}
@@ -92,8 +93,10 @@ class ContributionManager:
 
     def _refresh_channel_map(self) -> None:
         now = int(time.time())
-        if now - self._last_refresh < CHANNEL_MAP_REFRESH_SECONDS:
-            return
+        with self._map_lock:
+            if now - self._last_refresh < CHANNEL_MAP_REFRESH_SECONDS:
+                return
+
         try:
             data = self.rpc.listpeerchannels()
         except Exception as exc:
@@ -111,12 +114,14 @@ class ContributionManager:
                 if chan_id:
                     mapping[str(chan_id)] = peer_id
 
-        self._channel_map = mapping
-        self._last_refresh = now
+        with self._map_lock:
+            self._channel_map = mapping
+            self._last_refresh = now
 
     def _lookup_peer(self, channel_id: str) -> Optional[str]:
         self._refresh_channel_map()
-        return self._channel_map.get(channel_id)
+        with self._map_lock:
+            return self._channel_map.get(channel_id)
 
     def _allow_daily_global(self) -> bool:
         """

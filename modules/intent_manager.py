@@ -562,10 +562,35 @@ class IntentManager:
         
         return count + len(stale_keys)
     
+    def recover_stuck_intents(self, max_age_seconds: int = 300) -> int:
+        """
+        Recover intents stuck in 'committed' state.
+
+        Intents that remain in 'committed' for longer than max_age_seconds
+        are marked as 'failed', freeing up the target for new intents.
+
+        Args:
+            max_age_seconds: Max age in seconds before marking as failed
+
+        Returns:
+            Number of intents recovered
+        """
+        conn = self.db._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        result = conn.execute(
+            "UPDATE intent_locks SET status = 'failed' "
+            "WHERE status = 'committed' AND created_at < ?",
+            (cutoff,)
+        )
+        count = result.rowcount
+        if count > 0:
+            self._log(f"Recovered {count} stuck committed intent(s) older than {max_age_seconds}s")
+        return count
+
     # =========================================================================
     # STATISTICS
     # =========================================================================
-    
+
     def get_intent_stats(self) -> Dict[str, Any]:
         """
         Get statistics about current intents.

@@ -80,8 +80,6 @@ class HiveDatabase:
 
             # Enable Write-Ahead Logging for better multi-thread concurrency
             self._local.conn.execute("PRAGMA journal_mode=WAL;")
-            # Ensure foreign keys are enforced
-            self._local.conn.execute("PRAGMA foreign_keys=ON;")
             
             self.plugin.log(
                 f"HiveDatabase: Created thread-local connection (thread={threading.current_thread().name})",
@@ -396,6 +394,10 @@ class HiveDatabase:
                 rejection_reason TEXT
             )
         """)
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_pending_actions_status_expires
+            ON pending_actions(status, expires_at)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_pending_actions_type_proposed
+            ON pending_actions(action_type, proposed_at)""")
 
         # =====================================================================
         # PLANNER LOG TABLE (Phase 6)
@@ -1890,35 +1892,42 @@ class HiveDatabase:
                         window_seconds: int) -> None:
         """
         Update presence using a rolling accumulator.
+
+        Wrapped in a transaction to prevent TOCTOU race between the
+        existence check and the subsequent INSERT/UPDATE.
         """
-        conn = self._get_connection()
-        existing = self.get_presence(peer_id)
-        if not existing:
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM peer_presence WHERE peer_id = ?",
+                (peer_id,)
+            ).fetchone()
+
+            if not existing:
+                conn.execute("""
+                    INSERT INTO peer_presence
+                    (peer_id, last_change_ts, is_online, online_seconds_rolling, window_start_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (peer_id, now_ts, 1 if is_online else 0, 0, now_ts))
+                return
+
+            last_change_ts = existing["last_change_ts"]
+            online_seconds = existing["online_seconds_rolling"]
+            window_start_ts = existing["window_start_ts"]
+            was_online = bool(existing["is_online"])
+
+            if was_online:
+                online_seconds += max(0, now_ts - last_change_ts)
+
+            if now_ts - window_start_ts > window_seconds:
+                window_start_ts = now_ts - window_seconds
+                if online_seconds > window_seconds:
+                    online_seconds = window_seconds
+
             conn.execute("""
-                INSERT INTO peer_presence
-                (peer_id, last_change_ts, is_online, online_seconds_rolling, window_start_ts)
-                VALUES (?, ?, ?, ?, ?)
-            """, (peer_id, now_ts, 1 if is_online else 0, 0, now_ts))
-            return
-
-        last_change_ts = existing["last_change_ts"]
-        online_seconds = existing["online_seconds_rolling"]
-        window_start_ts = existing["window_start_ts"]
-        was_online = bool(existing["is_online"])
-
-        if was_online:
-            online_seconds += max(0, now_ts - last_change_ts)
-
-        if now_ts - window_start_ts > window_seconds:
-            window_start_ts = now_ts - window_seconds
-            if online_seconds > window_seconds:
-                online_seconds = window_seconds
-
-        conn.execute("""
-            UPDATE peer_presence
-            SET last_change_ts = ?, is_online = ?, online_seconds_rolling = ?, window_start_ts = ?
-            WHERE peer_id = ?
-        """, (now_ts, 1 if is_online else 0, online_seconds, window_start_ts, peer_id))
+                UPDATE peer_presence
+                SET last_change_ts = ?, is_online = ?, online_seconds_rolling = ?, window_start_ts = ?
+                WHERE peer_id = ?
+            """, (now_ts, 1 if is_online else 0, online_seconds, window_start_ts, peer_id))
 
     def prune_presence(self, window_seconds: int) -> int:
         """Clamp rolling windows to the configured window length."""
@@ -1940,6 +1949,8 @@ class HiveDatabase:
         """
         Calculate uptime percentage from peer_presence and update hive_members.
 
+        Uses a single JOIN query instead of N+1 individual lookups.
+
         For each member with presence data, calculates:
         uptime_pct = online_seconds_rolling / elapsed_window_time
 
@@ -1952,33 +1963,24 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
 
-        # Get all members
-        members = conn.execute(
-            "SELECT peer_id FROM hive_members"
-        ).fetchall()
+        # Single JOIN query: members with their presence data
+        rows = conn.execute("""
+            SELECT m.peer_id, p.online_seconds_rolling, p.window_start_ts,
+                   p.is_online, p.last_change_ts
+            FROM hive_members m
+            JOIN peer_presence p ON m.peer_id = p.peer_id
+        """).fetchall()
 
         updated = 0
-        for row in members:
-            peer_id = row['peer_id']
-            presence = self.get_presence(peer_id)
-
-            if not presence:
-                # No presence data, assume 0% uptime
-                continue
-
-            online_seconds = presence['online_seconds_rolling']
-            window_start = presence['window_start_ts']
-            is_online = bool(presence['is_online'])
-            last_change = presence['last_change_ts']
+        for row in rows:
+            online_seconds = row['online_seconds_rolling']
 
             # If currently online, add time since last state change
-            if is_online:
-                online_seconds += max(0, now - last_change)
+            if row['is_online']:
+                online_seconds += max(0, now - row['last_change_ts'])
 
             # Calculate window elapsed time
-            elapsed = now - window_start
-            if elapsed <= 0:
-                elapsed = 1  # Avoid division by zero
+            elapsed = max(1, now - row['window_start_ts'])
 
             # Cap at window size
             if elapsed > window_seconds:
@@ -1986,13 +1988,11 @@ class HiveDatabase:
             if online_seconds > elapsed:
                 online_seconds = elapsed
 
-            # Calculate percentage (0.0 to 1.0)
             uptime_pct = online_seconds / elapsed
 
-            # Update hive_members
             conn.execute(
                 "UPDATE hive_members SET uptime_pct = ? WHERE peer_id = ?",
-                (uptime_pct, peer_id)
+                (uptime_pct, row['peer_id'])
             )
             updated += 1
 
@@ -2488,35 +2488,37 @@ class HiveDatabase:
         Implements ring-buffer behavior: when MAX_PLANNER_LOG_ROWS is exceeded,
         oldest 10% of entries are pruned to make room.
 
+        Wrapped in a transaction so the COUNT + DELETE + INSERT are atomic.
+
         Args:
             action_type: What the planner did (e.g., 'saturation_check', 'expansion')
             result: Outcome ('success', 'skipped', 'failed', 'proposed')
             target: Target peer related to the action
             details: Additional context as dict
         """
-        conn = self._get_connection()
         now = int(time.time())
         details_json = json.dumps(details) if details else None
 
-        # Check row count and prune if at cap (ring-buffer behavior)
-        row = conn.execute("SELECT COUNT(*) as cnt FROM hive_planner_log").fetchone()
-        if row and row['cnt'] >= self.MAX_PLANNER_LOG_ROWS:
-            # Delete oldest 10% to make room
-            prune_count = self.MAX_PLANNER_LOG_ROWS // 10
-            conn.execute("""
-                DELETE FROM hive_planner_log WHERE id IN (
-                    SELECT id FROM hive_planner_log ORDER BY timestamp ASC LIMIT ?
+        with self.transaction() as conn:
+            # Check row count and prune if at cap (ring-buffer behavior)
+            row = conn.execute("SELECT COUNT(*) as cnt FROM hive_planner_log").fetchone()
+            if row and row['cnt'] >= self.MAX_PLANNER_LOG_ROWS:
+                # Delete oldest 10% to make room
+                prune_count = self.MAX_PLANNER_LOG_ROWS // 10
+                conn.execute("""
+                    DELETE FROM hive_planner_log WHERE id IN (
+                        SELECT id FROM hive_planner_log ORDER BY timestamp ASC LIMIT ?
+                    )
+                """, (prune_count,))
+                self.plugin.log(
+                    f"HiveDatabase: Planner log at cap ({self.MAX_PLANNER_LOG_ROWS}), pruned {prune_count} oldest entries",
+                    level='debug'
                 )
-            """, (prune_count,))
-            self.plugin.log(
-                f"HiveDatabase: Planner log at cap ({self.MAX_PLANNER_LOG_ROWS}), pruned {prune_count} oldest entries",
-                level='debug'
-            )
 
-        conn.execute("""
-            INSERT INTO hive_planner_log (timestamp, action_type, target, result, details)
-            VALUES (?, ?, ?, ?, ?)
-        """, (now, action_type, target, result, details_json))
+            conn.execute("""
+                INSERT INTO hive_planner_log (timestamp, action_type, target, result, details)
+                VALUES (?, ?, ?, ?, ?)
+            """, (now, action_type, target, result, details_json))
 
     def get_planner_logs(self, limit: int = 50) -> List[Dict]:
         """Get recent planner logs."""
@@ -2995,6 +2997,29 @@ class HiveDatabase:
     # =========================================================================
     # BUDGET TRACKING
     # =========================================================================
+
+    def prune_budget_tracking(self, older_than_days: int = 90) -> int:
+        """
+        Remove old budget tracking records.
+
+        Args:
+            older_than_days: Delete records older than this (default: 90)
+
+        Returns:
+            Number of records deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (older_than_days * 86400)
+        result = conn.execute(
+            "DELETE FROM budget_tracking WHERE timestamp < ?", (cutoff,)
+        )
+        deleted = result.rowcount
+        if deleted > 0:
+            self.plugin.log(
+                f"HiveDatabase: Pruned {deleted} budget_tracking rows older than {older_than_days}d",
+                level='info'
+            )
+        return deleted
 
     def get_today_date_key(self) -> str:
         """Get today's date key in YYYY-MM-DD format (UTC)."""
@@ -5964,47 +5989,50 @@ class HiveDatabase:
         """
         Remove old settlement data (proposals, votes, executions).
 
+        Wrapped in a transaction so all three DELETEs succeed or fail together,
+        preventing orphaned votes/executions if interrupted mid-prune.
+
         Args:
             older_than_days: Remove data older than this many days
 
         Returns:
             Total number of rows deleted
         """
-        conn = self._get_connection()
         cutoff = int(time.time()) - (older_than_days * 86400)
         total = 0
 
-        # Get old proposal IDs first
-        old_proposals = conn.execute("""
-            SELECT proposal_id FROM settlement_proposals
-            WHERE proposed_at < ?
-        """, (cutoff,)).fetchall()
+        with self.transaction() as conn:
+            # Get old proposal IDs first
+            old_proposals = conn.execute("""
+                SELECT proposal_id FROM settlement_proposals
+                WHERE proposed_at < ?
+            """, (cutoff,)).fetchall()
 
-        old_ids = [row[0] for row in old_proposals]
+            old_ids = [row[0] for row in old_proposals]
 
-        if old_ids:
-            placeholders = ",".join("?" * len(old_ids))
+            if old_ids:
+                placeholders = ",".join("?" * len(old_ids))
 
-            # Delete executions
-            result = conn.execute(
-                f"DELETE FROM settlement_executions WHERE proposal_id IN ({placeholders})",
-                old_ids
-            )
-            total += result.rowcount
+                # Delete executions
+                result = conn.execute(
+                    f"DELETE FROM settlement_executions WHERE proposal_id IN ({placeholders})",
+                    old_ids
+                )
+                total += result.rowcount
 
-            # Delete votes
-            result = conn.execute(
-                f"DELETE FROM settlement_ready_votes WHERE proposal_id IN ({placeholders})",
-                old_ids
-            )
-            total += result.rowcount
+                # Delete votes
+                result = conn.execute(
+                    f"DELETE FROM settlement_ready_votes WHERE proposal_id IN ({placeholders})",
+                    old_ids
+                )
+                total += result.rowcount
 
-            # Delete proposals
-            result = conn.execute(
-                f"DELETE FROM settlement_proposals WHERE proposal_id IN ({placeholders})",
-                old_ids
-            )
-            total += result.rowcount
+                # Delete proposals
+                result = conn.execute(
+                    f"DELETE FROM settlement_proposals WHERE proposal_id IN ({placeholders})",
+                    old_ids
+                )
+                total += result.rowcount
 
         return total
 

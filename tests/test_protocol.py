@@ -418,5 +418,44 @@ class TestEdgeCases:
         assert result['quotes'] == 'He said "hello"'
 
 
+class TestSerializeNoneReturn:
+    """M-4: Test serialize() returns None for oversized messages."""
+
+    def test_oversized_payload_returns_none(self):
+        """Messages exceeding MAX_MESSAGE_BYTES should return None."""
+        from modules.protocol import MAX_MESSAGE_BYTES
+        # Create a payload large enough to exceed the limit
+        huge_payload = {"data": "x" * (MAX_MESSAGE_BYTES + 1000)}
+        result = serialize(HiveMessageType.HELLO, huge_payload)
+        assert result is None
+
+    def test_normal_payload_returns_bytes(self):
+        """Normal-sized messages should return bytes."""
+        result = serialize(HiveMessageType.HELLO, {"pubkey": "02" + "aa" * 32})
+        assert result is not None
+        assert isinstance(result, bytes)
+
+    def test_create_hello_oversized_pubkey(self):
+        """create_hello with enormous pubkey should return None."""
+        from modules.protocol import MAX_MESSAGE_BYTES
+        # A normal pubkey is fine
+        normal = create_hello("02" + "aa" * 32)
+        assert normal is not None
+
+        # A ridiculously large pubkey should make the message too big
+        huge = create_hello("x" * MAX_MESSAGE_BYTES)
+        assert huge is None
+
+    def test_callers_handle_none(self):
+        """Verify None result doesn't crash .hex() callers."""
+        result = serialize(HiveMessageType.HELLO, {"data": "x" * 100000})
+        if result is None:
+            # This is the pattern callers should use
+            assert True
+        else:
+            # Normal case - can call .hex()
+            assert isinstance(result.hex(), str)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

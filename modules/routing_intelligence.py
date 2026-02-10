@@ -10,6 +10,7 @@ Implements collective routing intelligence for the hive:
 Security: All route probes require cryptographic signatures.
 """
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -105,6 +106,7 @@ class HiveRoutingMap:
         # In-memory path statistics
         # Key: (destination, path_tuple)
         self._path_stats: Dict[Tuple[str, Tuple[str, ...]], PathStats] = {}
+        self._lock = threading.Lock()
 
         # Rate limiting
         self._probe_rate: Dict[str, List[float]] = defaultdict(list)
@@ -504,33 +506,34 @@ class HiveRoutingMap:
         """Update aggregated statistics for a path."""
         key = (destination, path)
 
-        if key not in self._path_stats:
-            self._path_stats[key] = PathStats(
-                path=path,
-                destination=destination
-            )
+        with self._lock:
+            if key not in self._path_stats:
+                self._path_stats[key] = PathStats(
+                    path=path,
+                    destination=destination
+                )
 
-        stats = self._path_stats[key]
-        stats.probe_count += 1
-        stats.reporters.add(reporter_id)
+            stats = self._path_stats[key]
+            stats.probe_count += 1
+            stats.reporters.add(reporter_id)
 
-        if success:
-            stats.success_count += 1
-            stats.total_latency_ms += latency_ms
-            stats.total_fee_ppm += fee_ppm
-            stats.last_success_time = timestamp
+            if success:
+                stats.success_count += 1
+                stats.total_latency_ms += latency_ms
+                stats.total_fee_ppm += fee_ppm
+                stats.last_success_time = timestamp
 
-            # Update capacity (weighted average)
-            if capacity_sats > 0:
-                if stats.avg_capacity_sats == 0:
-                    stats.avg_capacity_sats = capacity_sats
-                else:
-                    stats.avg_capacity_sats = int(
-                        stats.avg_capacity_sats * 0.7 + capacity_sats * 0.3
-                    )
-        else:
-            stats.last_failure_time = timestamp
-            stats.last_failure_reason = failure_reason
+                # Update capacity (weighted average)
+                if capacity_sats > 0:
+                    if stats.avg_capacity_sats == 0:
+                        stats.avg_capacity_sats = capacity_sats
+                    else:
+                        stats.avg_capacity_sats = int(
+                            stats.avg_capacity_sats * 0.7 + capacity_sats * 0.3
+                        )
+            else:
+                stats.last_failure_time = timestamp
+                stats.last_failure_reason = failure_reason
 
     def get_path_success_rate(self, path: List[str]) -> float:
         """
@@ -544,8 +547,11 @@ class HiveRoutingMap:
         """
         path_tuple = tuple(path)
 
+        with self._lock:
+            items = list(self._path_stats.items())
+
         # Look for this path to any destination
-        for (dest, p), stats in self._path_stats.items():
+        for (dest, p), stats in items:
             if p == path_tuple and stats.probe_count > 0:
                 return stats.success_count / stats.probe_count
 
@@ -565,7 +571,10 @@ class HiveRoutingMap:
         now = time.time()
         stale_cutoff = now - (PROBE_STALENESS_HOURS * 3600)
 
-        for (dest, p), stats in self._path_stats.items():
+        with self._lock:
+            items = list(self._path_stats.items())
+
+        for (dest, p), stats in items:
             if p == path_tuple:
                 # Base confidence on reporter diversity
                 reporter_factor = min(1.0, len(stats.reporters) / 3.0)
@@ -642,7 +651,10 @@ class HiveRoutingMap:
         # Collect all paths to this destination
         candidates = []
 
-        for (dest, path), stats in self._path_stats.items():
+        with self._lock:
+            items = list(self._path_stats.items())
+
+        for (dest, path), stats in items:
             if dest != destination:
                 continue
 
@@ -763,7 +775,10 @@ class HiveRoutingMap:
         failed_set = set(failed_path)
         candidates = []
 
-        for (dest, path), stats in self._path_stats.items():
+        with self._lock:
+            items = list(self._path_stats.items())
+
+        for (dest, path), stats in items:
             if dest != destination:
                 continue
 
@@ -851,7 +866,10 @@ class HiveRoutingMap:
         """
         candidates = []
 
-        for (dest, path), stats in self._path_stats.items():
+        with self._lock:
+            items = list(self._path_stats.items())
+
+        for (dest, path), stats in items:
             if dest != destination:
                 continue
 
@@ -895,16 +913,20 @@ class HiveRoutingMap:
         Returns:
             Dict with routing statistics
         """
-        total_paths = len(self._path_stats)
-        total_probes = sum(s.probe_count for s in self._path_stats.values())
-        total_successes = sum(s.success_count for s in self._path_stats.values())
+        with self._lock:
+            stats_values = list(self._path_stats.values())
+            stats_keys = list(self._path_stats.keys())
+
+        total_paths = len(stats_values)
+        total_probes = sum(s.probe_count for s in stats_values)
+        total_successes = sum(s.success_count for s in stats_values)
 
         # Unique destinations
-        destinations = set(dest for dest, _ in self._path_stats.keys())
+        destinations = set(dest for dest, _ in stats_keys)
 
         # High quality paths (>90% success)
         high_quality = sum(
-            1 for s in self._path_stats.values()
+            1 for s in stats_values
             if s.probe_count > 0 and s.success_count / s.probe_count >= HIGH_SUCCESS_RATE
         )
 
@@ -912,7 +934,7 @@ class HiveRoutingMap:
         now = time.time()
         recent_cutoff = now - (24 * 3600)
         recent_probes = sum(
-            1 for s in self._path_stats.values()
+            1 for s in stats_values
             if max(s.last_success_time, s.last_failure_time) > recent_cutoff
         )
 
@@ -956,12 +978,13 @@ class HiveRoutingMap:
         now = time.time()
         stale_cutoff = now - (PROBE_STALENESS_HOURS * 3600)
 
-        stale_keys = [
-            key for key, stats in self._path_stats.items()
-            if max(stats.last_success_time, stats.last_failure_time) < stale_cutoff
-        ]
+        with self._lock:
+            stale_keys = [
+                key for key, stats in self._path_stats.items()
+                if max(stats.last_success_time, stats.last_failure_time) < stale_cutoff
+            ]
 
-        for key in stale_keys:
-            del self._path_stats[key]
+            for key in stale_keys:
+                del self._path_stats[key]
 
         return len(stale_keys)

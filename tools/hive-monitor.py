@@ -167,6 +167,8 @@ class Alert:
 class FleetMonitor:
     """Monitors a fleet of Hive nodes."""
 
+    MAX_ALERTS = 1000
+
     def __init__(self, nodes: Dict[str, NodeConnection], db_path: str = None):
         self.nodes = nodes
         self.state: Dict[str, NodeState] = {}
@@ -198,6 +200,8 @@ class FleetMonitor:
             details=details or {}
         )
         self.alerts.append(alert)
+        if len(self.alerts) > self.MAX_ALERTS:
+            self.alerts = self.alerts[-self.MAX_ALERTS:]
 
         # Log based on severity
         log_msg = f"[{node}] {message}"

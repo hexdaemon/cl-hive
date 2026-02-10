@@ -169,6 +169,7 @@ class LiquidityCoordinator:
         self._member_liquidity_state: Dict[str, Dict[str, Any]] = {}
 
         # Rate limiting
+        self._rate_lock = threading.Lock()
         self._need_rate: Dict[str, List[float]] = defaultdict(list)
         self._snapshot_rate: Dict[str, List[float]] = defaultdict(list)
 
@@ -191,19 +192,20 @@ class LiquidityCoordinator:
         max_count, period = limit
         now = time.time()
 
-        # Clean old entries for this sender
-        rate_tracker[sender] = [
-            ts for ts in rate_tracker[sender]
-            if now - ts < period
-        ]
+        with self._rate_lock:
+            # Clean old entries for this sender
+            rate_tracker[sender] = [
+                ts for ts in rate_tracker[sender]
+                if now - ts < period
+            ]
 
-        # Evict empty/stale keys to prevent unbounded dict growth
-        if len(rate_tracker) > 200:
-            stale = [k for k, v in rate_tracker.items() if not v]
-            for k in stale:
-                del rate_tracker[k]
+            # Evict empty/stale keys to prevent unbounded dict growth
+            if len(rate_tracker) > 200:
+                stale = [k for k, v in rate_tracker.items() if not v]
+                for k in stale:
+                    del rate_tracker[k]
 
-        return len(rate_tracker[sender]) < max_count
+            return len(rate_tracker[sender]) < max_count
 
     def _record_message(
         self,
@@ -211,7 +213,8 @@ class LiquidityCoordinator:
         rate_tracker: Dict[str, List[float]]
     ):
         """Record a message for rate limiting."""
-        rate_tracker[sender].append(time.time())
+        with self._rate_lock:
+            rate_tracker[sender].append(time.time())
 
     def create_liquidity_need_message(
         self,

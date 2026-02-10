@@ -2883,12 +2883,18 @@ def create_close_actions(ctx: HiveContext) -> Dict[str, Any]:
     Puts high-confidence close recommendations into the pending_actions
     queue for AI/human approval.
 
+    Permission: Member or higher (prevents neophytes from creating close proposals).
+
     Args:
         ctx: HiveContext
 
     Returns:
         Dict with number of actions created.
     """
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
     if not ctx.rationalization_mgr:
         return {"error": "Rationalization not initialized"}
 
