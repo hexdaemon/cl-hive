@@ -36,7 +36,8 @@ from . import network_metrics
 # Route quality thresholds
 HIGH_SUCCESS_RATE = 0.9     # 90% success rate considered high
 LOW_SUCCESS_RATE = 0.5      # Below 50% considered unreliable
-MAX_PROBES_PER_PATH = 100   # Max probes to track per path
+MAX_PROBES_PER_PATH = 100   # Cap probe count per path to prevent stat inflation
+MAX_CACHED_PATHS = 5000     # Max entries in _path_stats before LRU eviction
 PROBE_STALENESS_HOURS = 24  # Probes older than this are stale
 
 # Centrality-aware routing (Use Case 7)
@@ -204,15 +205,17 @@ class HiveRoutingMap:
         self,
         peer_id: str,
         payload: Dict[str, Any],
-        rpc: Any
+        rpc: Any,
+        pre_verified: bool = False
     ) -> Dict[str, Any]:
         """
         Handle incoming ROUTE_PROBE message.
 
         Args:
-            peer_id: Sender peer ID
+            peer_id: Verified reporter identity (after signature check by caller)
             payload: Message payload
             rpc: RPC interface for signature verification
+            pre_verified: If True, skip signature verification (caller already verified)
 
         Returns:
             Result dict with success/error
@@ -223,9 +226,28 @@ class HiveRoutingMap:
 
         reporter_id = payload.get("reporter_id")
 
-        # Identity binding: sender must match reporter (prevent relay attacks)
-        if peer_id != reporter_id:
-            return {"error": "identity binding failed"}
+        if pre_verified:
+            # Caller (cl-hive.py handler) already verified signature and identity.
+            # Use peer_id as the verified reporter identity.
+            pass
+        else:
+            # Direct call — verify identity binding and signature
+            if peer_id != reporter_id:
+                return {"error": "identity binding failed"}
+
+            signature = payload.get("signature")
+            if not signature:
+                return {"error": "missing signature"}
+
+            signing_message = get_route_probe_signing_payload(payload)
+            try:
+                verify_result = rpc.checkmessage(signing_message, signature)
+                if not verify_result.get("verified"):
+                    return {"error": "signature verification failed"}
+                if verify_result.get("pubkey") != reporter_id:
+                    return {"error": "signature pubkey mismatch"}
+            except Exception as e:
+                return {"error": f"signature check failed: {e}"}
 
         # Verify sender is a hive member
         member = self.database.get_member(reporter_id)
@@ -239,23 +261,6 @@ class HiveRoutingMap:
             ROUTE_PROBE_RATE_LIMIT
         ):
             return {"error": "rate limited"}
-
-        # Verify signature
-        signature = payload.get("signature")
-        if not signature:
-            return {"error": "missing signature"}
-
-        signing_message = get_route_probe_signing_payload(payload)
-
-        try:
-            verify_result = rpc.checkmessage(signing_message, signature)
-            if not verify_result.get("verified"):
-                return {"error": "signature verification failed"}
-
-            if verify_result.get("pubkey") != reporter_id:
-                return {"error": "signature pubkey mismatch"}
-        except Exception as e:
-            return {"error": f"signature check failed: {e}"}
 
         # Record rate limit
         self._record_message(reporter_id, self._probe_rate)
@@ -311,7 +316,8 @@ class HiveRoutingMap:
         self,
         peer_id: str,
         payload: Dict[str, Any],
-        rpc: Any
+        rpc: Any,
+        pre_verified: bool = False
     ) -> Dict[str, Any]:
         """
         Handle incoming ROUTE_PROBE_BATCH message.
@@ -320,9 +326,10 @@ class HiveRoutingMap:
         contains multiple probe observations instead of N individual messages.
 
         Args:
-            peer_id: Sender peer ID
+            peer_id: Verified reporter identity (after signature check by caller)
             payload: Message payload
             rpc: RPC interface for signature verification
+            pre_verified: If True, skip signature verification (caller already verified)
 
         Returns:
             Result dict with success/error
@@ -333,9 +340,27 @@ class HiveRoutingMap:
 
         reporter_id = payload.get("reporter_id")
 
-        # Identity binding: sender must match reporter (prevent relay attacks)
-        if peer_id != reporter_id:
-            return {"error": "identity binding failed"}
+        if pre_verified:
+            # Caller (cl-hive.py handler) already verified signature and identity.
+            pass
+        else:
+            # Direct call — verify identity binding and signature
+            if peer_id != reporter_id:
+                return {"error": "identity binding failed"}
+
+            signature = payload.get("signature")
+            if not signature:
+                return {"error": "missing signature"}
+
+            signing_message = get_route_probe_batch_signing_payload(payload)
+            try:
+                verify_result = rpc.checkmessage(signing_message, signature)
+                if not verify_result.get("verified"):
+                    return {"error": "signature verification failed"}
+                if verify_result.get("pubkey") != reporter_id:
+                    return {"error": "signature pubkey mismatch"}
+            except Exception as e:
+                return {"error": f"signature check failed: {e}"}
 
         # Verify sender is a hive member
         member = self.database.get_member(reporter_id)
@@ -349,23 +374,6 @@ class HiveRoutingMap:
             ROUTE_PROBE_BATCH_RATE_LIMIT
         ):
             return {"error": "rate limited"}
-
-        # Verify signature
-        signature = payload.get("signature")
-        if not signature:
-            return {"error": "missing signature"}
-
-        signing_message = get_route_probe_batch_signing_payload(payload)
-
-        try:
-            verify_result = rpc.checkmessage(signing_message, signature)
-            if not verify_result.get("verified"):
-                return {"error": "signature verification failed"}
-
-            if verify_result.get("pubkey") != reporter_id:
-                return {"error": "signature pubkey mismatch"}
-        except Exception as e:
-            return {"error": f"signature check failed: {e}"}
 
         # Record rate limit
         self._record_message(reporter_id, self._batch_rate)
@@ -384,6 +392,11 @@ class HiveRoutingMap:
             total_fee_ppm = probe_data.get("total_fee_ppm", 0)
             estimated_capacity = probe_data.get("estimated_capacity_sats", 0)
 
+            # Use per-probe timestamp if available, otherwise batch timestamp
+            probe_timestamp = probe_data.get("timestamp", batch_timestamp)
+            if not isinstance(probe_timestamp, int) or probe_timestamp <= 0:
+                probe_timestamp = batch_timestamp
+
             # Update path statistics
             self._update_path_stats(
                 destination=destination,
@@ -394,7 +407,7 @@ class HiveRoutingMap:
                 capacity_sats=estimated_capacity,
                 reporter_id=reporter_id,
                 failure_reason=failure_reason,
-                timestamp=batch_timestamp
+                timestamp=probe_timestamp
             )
 
             # Store in database
@@ -409,7 +422,7 @@ class HiveRoutingMap:
                 estimated_capacity_sats=estimated_capacity,
                 total_fee_ppm=total_fee_ppm,
                 amount_probed_sats=probe_data.get("amount_probed_sats", 0),
-                timestamp=batch_timestamp
+                timestamp=probe_timestamp
             )
 
             stored_count += 1
@@ -508,12 +521,21 @@ class HiveRoutingMap:
 
         with self._lock:
             if key not in self._path_stats:
+                # Evict least-recently-probed entries if at capacity
+                if len(self._path_stats) >= MAX_CACHED_PATHS:
+                    self._evict_oldest_locked()
+
                 self._path_stats[key] = PathStats(
                     path=path,
                     destination=destination
                 )
 
             stats = self._path_stats[key]
+
+            # Cap probe count to prevent unbounded stat inflation
+            if stats.probe_count >= MAX_PROBES_PER_PATH:
+                return
+
             stats.probe_count += 1
             stats.reporters.add(reporter_id)
 
@@ -534,6 +556,17 @@ class HiveRoutingMap:
             else:
                 stats.last_failure_time = timestamp
                 stats.last_failure_reason = failure_reason
+
+    def _evict_oldest_locked(self):
+        """Evict least-recently-probed entries. Must be called with self._lock held."""
+        # Evict 10% of entries with oldest last-probe time
+        evict_count = max(1, len(self._path_stats) // 10)
+        entries = sorted(
+            self._path_stats.items(),
+            key=lambda kv: max(kv[1].last_success_time, kv[1].last_failure_time)
+        )
+        for key, _ in entries[:evict_count]:
+            del self._path_stats[key]
 
     def get_path_success_rate(self, path: List[str]) -> float:
         """
@@ -557,6 +590,23 @@ class HiveRoutingMap:
 
         return 0.5  # Unknown path, return neutral
 
+    @staticmethod
+    def _confidence_from_stats(stats, stale_cutoff: float) -> float:
+        """Calculate confidence score from a PathStats object.
+
+        Args:
+            stats: PathStats instance
+            stale_cutoff: Epoch timestamp below which data is stale
+
+        Returns:
+            Confidence score (0.0 to 1.0)
+        """
+        reporter_factor = min(1.0, len(stats.reporters) / 3.0)
+        last_probe = max(stats.last_success_time, stats.last_failure_time)
+        recency_factor = 0.3 if last_probe < stale_cutoff else 1.0
+        count_factor = min(1.0, stats.probe_count / 10.0)
+        return reporter_factor * recency_factor * count_factor
+
     def get_path_confidence(self, path: List[str]) -> float:
         """
         Get confidence level for path data based on reporter count and recency.
@@ -576,20 +626,7 @@ class HiveRoutingMap:
 
         for (dest, p), stats in items:
             if p == path_tuple:
-                # Base confidence on reporter diversity
-                reporter_factor = min(1.0, len(stats.reporters) / 3.0)
-
-                # Recency factor
-                last_probe = max(stats.last_success_time, stats.last_failure_time)
-                if last_probe < stale_cutoff:
-                    recency_factor = 0.3  # Stale data
-                else:
-                    recency_factor = 1.0
-
-                # Probe count factor
-                count_factor = min(1.0, stats.probe_count / 10.0)
-
-                return reporter_factor * recency_factor * count_factor
+                return self._confidence_from_stats(stats, stale_cutoff)
 
         return 0.0  # No data
 
@@ -683,8 +720,9 @@ class HiveRoutingMap:
             # Calculate hive hop bonus
             hive_hop_count = sum(1 for hop in path if hop in hive_members)
 
-            # Calculate confidence
-            confidence = self.get_path_confidence(list(path))
+            # Calculate confidence inline from stats (avoids O(n) re-search)
+            stale_cutoff = time.time() - (PROBE_STALENESS_HOURS * 3600)
+            confidence = self._confidence_from_stats(stats, stale_cutoff)
 
             # Calculate path centrality (Use Case 7)
             path_centrality, is_high_centrality = self._get_path_centrality_score(
@@ -815,13 +853,14 @@ class HiveRoutingMap:
             if path_centrality < MIN_CENTRALITY_FOR_FALLBACK and hive_hop_count > 0:
                 continue
 
+            stale_cutoff = time.time() - (PROBE_STALENESS_HOURS * 3600)
             candidates.append(RouteSuggestion(
                 destination=destination,
                 path=list(path),
                 expected_fee_ppm=avg_fee,
                 expected_latency_ms=avg_latency,
                 success_rate=success_rate,
-                confidence=self.get_path_confidence(list(path)),
+                confidence=self._confidence_from_stats(stats, stale_cutoff),
                 last_successful_probe=stats.last_success_time,
                 hive_hop_count=hive_hop_count,
                 path_centrality_score=path_centrality,
@@ -890,13 +929,14 @@ class HiveRoutingMap:
                 avg_latency = 0
                 avg_fee = 0
 
+            stale_cutoff = time.time() - (PROBE_STALENESS_HOURS * 3600)
             candidates.append(RouteSuggestion(
                 destination=destination,
                 path=list(path),
                 expected_fee_ppm=avg_fee,
                 expected_latency_ms=avg_latency,
                 success_rate=success_rate,
-                confidence=self.get_path_confidence(list(path)),
+                confidence=self._confidence_from_stats(stats, stale_cutoff),
                 last_successful_probe=stats.last_success_time,
                 hive_hop_count=0
             ))

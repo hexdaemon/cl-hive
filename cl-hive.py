@@ -3140,13 +3140,21 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
             safe_plugin.log(f"cl-hive: Fee report broadcast error: {e}", level="warn")
 
 
+# Cached channel_scid -> peer_id mapping for _record_forward_as_route_probe
+_channel_peer_cache: Dict[str, str] = {}
+_channel_peer_cache_time: float = 0
+_CHANNEL_PEER_CACHE_TTL = 300  # Refresh every 5 minutes
+
+
 def _record_forward_as_route_probe(forward_event: Dict):
     """
     Record a settled forward as route probe data.
 
-    While we don't know the full path, we can record that this hop
-    (through our node) succeeded, which contributes to path success rates.
+    Stores the forwarding segment (in_peer -> out_peer) locally.
+    Does not include our_pubkey in the path to avoid self-referential entries.
     """
+    global _channel_peer_cache, _channel_peer_cache_time
+
     if not routing_map or not database or not safe_plugin:
         return
 
@@ -3159,24 +3167,31 @@ def _record_forward_as_route_probe(forward_event: Dict):
         if not in_channel or not out_channel:
             return
 
-        # Get peer IDs for the channels
-        funds = safe_plugin.rpc.listfunds()
-        channels = {ch.get("short_channel_id"): ch for ch in funds.get("channels", [])}
+        # Use cached channel -> peer_id mapping (refreshed every 5 min)
+        now = time.time()
+        if not _channel_peer_cache or now - _channel_peer_cache_time > _CHANNEL_PEER_CACHE_TTL:
+            funds = safe_plugin.rpc.listfunds()
+            _channel_peer_cache = {
+                ch.get("short_channel_id"): ch.get("peer_id", "")
+                for ch in funds.get("channels", [])
+                if ch.get("short_channel_id")
+            }
+            _channel_peer_cache_time = now
 
-        in_peer = channels.get(in_channel, {}).get("peer_id", "")
-        out_peer = channels.get(out_channel, {}).get("peer_id", "")
+        in_peer = _channel_peer_cache.get(in_channel, "")
+        out_peer = _channel_peer_cache.get(out_channel, "")
 
         if not in_peer or not out_peer:
             return
 
-        # Record this as a successful path segment: in_peer -> us -> out_peer
-        # This is stored locally (no need to broadcast - each node sees their own forwards)
+        # Record as a successful path segment: in_peer -> out_peer
+        # Path contains only intermediate hops (in_peer), not reporter or destination
         database.store_route_probe(
             reporter_id=our_pubkey,
-            destination=out_peer,  # The next hop in the path
-            path=[in_peer, our_pubkey],  # Partial path we observed
+            destination=out_peer,
+            path=[in_peer],  # Intermediate hops only (not reporter, not destination)
             success=True,
-            latency_ms=0,  # We don't have timing for forwards
+            latency_ms=0,
             failure_reason="",
             failure_hop=-1,
             estimated_capacity_sats=out_msat // 1000 if out_msat else 0,
@@ -6011,18 +6026,21 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: ROUTE_PROBE signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
-    # Delegate to routing map
-    result = routing_map.handle_route_probe(peer_id, payload, safe_plugin.rpc)
+    # Delegate to routing map — pass verified reporter_id (not transport peer_id)
+    # and skip re-verification since we already checked the signature above
+    result = routing_map.handle_route_probe(
+        reporter_id, payload, safe_plugin.rpc, pre_verified=True
+    )
 
     if result.get("success"):
         relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored route probe from {peer_id[:16]}...{relay_info}",
+            f"cl-hive: Stored route probe from {reporter_id[:16]}...{relay_info}",
             level='debug'
         )
     elif result.get("error"):
         plugin.log(
-            f"cl-hive: ROUTE_PROBE rejected from {peer_id[:16]}...: {result.get('error')}",
+            f"cl-hive: ROUTE_PROBE rejected from {reporter_id[:16]}...: {result.get('error')}",
             level='debug'
         )
 
@@ -6080,19 +6098,22 @@ def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
         plugin.log(f"cl-hive: ROUTE_PROBE_BATCH signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
-    # Delegate to routing map
-    result = routing_map.handle_route_probe_batch(peer_id, payload, safe_plugin.rpc)
+    # Delegate to routing map — pass verified reporter_id (not transport peer_id)
+    # and skip re-verification since we already checked the signature above
+    result = routing_map.handle_route_probe_batch(
+        reporter_id, payload, safe_plugin.rpc, pre_verified=True
+    )
 
     if result.get("success"):
         relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored route probe batch from {peer_id[:16]}...{relay_info} "
+            f"cl-hive: Stored route probe batch from {reporter_id[:16]}...{relay_info} "
             f"with {result.get('probes_stored', 0)} probes",
             level='debug'
         )
     elif result.get("error"):
         plugin.log(
-            f"cl-hive: ROUTE_PROBE_BATCH rejected from {peer_id[:16]}...: {result.get('error')}",
+            f"cl-hive: ROUTE_PROBE_BATCH rejected from {reporter_id[:16]}...: {result.get('error')}",
             level='debug'
         )
 

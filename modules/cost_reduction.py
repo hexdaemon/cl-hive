@@ -20,6 +20,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict, deque
 
+# TODO: Integrate routing_intelligence.HiveRoutingMap to bias MCF/BFS path
+# selection toward routes with high collective success rates. Currently,
+# fleet route probe data is collected but not consumed here.
 from . import network_metrics
 from .mcf_solver import (
     MCFCoordinator,

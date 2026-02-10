@@ -776,7 +776,8 @@ class HiveDatabase:
                 failure_hop INTEGER DEFAULT -1,
                 estimated_capacity_sats INTEGER DEFAULT 0,
                 total_fee_ppm INTEGER DEFAULT 0,
-                amount_probed_sats INTEGER DEFAULT 0
+                amount_probed_sats INTEGER DEFAULT 0,
+                UNIQUE(reporter_id, destination, path, timestamp)
             )
         """)
         conn.execute(
@@ -4393,7 +4394,7 @@ class HiveDatabase:
         path_str = json.dumps(path)
 
         conn.execute("""
-            INSERT INTO route_probes
+            INSERT OR IGNORE INTO route_probes
             (reporter_id, destination, path, timestamp, success, latency_ms,
              failure_reason, failure_hop, estimated_capacity_sats, total_fee_ppm,
              amount_probed_sats)

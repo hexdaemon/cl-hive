@@ -2174,9 +2174,10 @@ def get_route_probe_signing_payload(payload: Dict[str, Any]) -> str:
     Returns:
         Canonical string for signmessage()
     """
-    # Sort path to make signing deterministic
+    # Preserve path order — route A→B→C is different from C→B→A.
+    # Path lists are already deterministic (ordered hops).
     path = payload.get("path", [])
-    path_str = ",".join(sorted(path)) if path else ""
+    path_str = ",".join(path) if path else ""
 
     return (
         f"ROUTE_PROBE:"
