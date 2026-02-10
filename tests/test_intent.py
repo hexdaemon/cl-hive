@@ -21,8 +21,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.intent_manager import (
     IntentManager, Intent, IntentType,
-    STATUS_PENDING, STATUS_COMMITTED, STATUS_ABORTED,
-    DEFAULT_HOLD_SECONDS
+    STATUS_PENDING, STATUS_COMMITTED, STATUS_ABORTED, STATUS_FAILED,
+    DEFAULT_HOLD_SECONDS, VALID_TRANSITIONS, VALID_STATUSES,
+    MAX_REMOTE_INTENTS
 )
 
 
@@ -332,7 +333,7 @@ class TestIntentAbort:
         result = intent_manager.abort_local_intent('target', 'channel_open')
         
         assert result is True
-        mock_database.update_intent_status.assert_called_with(5, STATUS_ABORTED)
+        mock_database.update_intent_status.assert_called_with(5, STATUS_ABORTED, reason="tie_breaker_loss")
     
     def test_abort_no_local_intent(self, intent_manager, mock_database):
         """abort_local_intent should return False if no intent exists."""
@@ -416,9 +417,12 @@ class TestIntentCommit:
     def test_commit_intent(self, intent_manager, mock_database):
         """commit_intent should update DB status to committed."""
         mock_database.update_intent_status.return_value = True
-        
+        mock_database.get_intent_by_id.return_value = {
+            'id': 42, 'status': STATUS_PENDING
+        }
+
         result = intent_manager.commit_intent(42)
-        
+
         assert result is True
         mock_database.update_intent_status.assert_called_with(42, STATUS_COMMITTED)
     
@@ -565,6 +569,373 @@ class TestIntentStats:
         assert 'our_pubkey' in stats
         assert 'remote_intents_cached' in stats
         assert stats['remote_intents_cached'] == 0
+
+
+# =============================================================================
+# FIX 1: INTENT TYPE VALIDATION TESTS
+# =============================================================================
+
+class TestIntentTypeValidation:
+    """Test that create_intent rejects invalid intent_type strings."""
+
+    def test_valid_intent_types_accepted(self, intent_manager, mock_database):
+        """All IntentType enum values should be accepted."""
+        mock_database.create_intent.return_value = 1
+        for it in IntentType:
+            mock_database.get_conflicting_intents.return_value = []
+            intent = intent_manager.create_intent(it.value, '02' + 'x' * 64)
+            assert intent is not None, f"Valid type {it.value} was rejected"
+
+    def test_typo_intent_type_rejected(self, intent_manager, mock_database):
+        """A typo like 'channel_opn' should return None."""
+        intent = intent_manager.create_intent('channel_opn', '02' + 'x' * 64)
+        assert intent is None
+
+    def test_empty_intent_type_rejected(self, intent_manager, mock_database):
+        """Empty string intent_type should return None."""
+        intent = intent_manager.create_intent('', '02' + 'x' * 64)
+        assert intent is None
+
+    def test_arbitrary_string_rejected(self, intent_manager, mock_database):
+        """Random string intent_type should return None."""
+        intent = intent_manager.create_intent('hack_the_planet', '02' + 'x' * 64)
+        assert intent is None
+
+
+# =============================================================================
+# FIX 2: STATUS TRANSITION VALIDATION TESTS
+# =============================================================================
+
+class TestStatusTransitions:
+    """Test that _validate_transition enforces the state machine."""
+
+    def test_pending_to_committed_valid(self, intent_manager, mock_database):
+        """pending -> committed is valid."""
+        mock_database.get_intent_by_id.return_value = {'id': 1, 'status': STATUS_PENDING}
+        assert intent_manager._validate_transition(1, STATUS_COMMITTED) is True
+
+    def test_pending_to_aborted_valid(self, intent_manager, mock_database):
+        """pending -> aborted is valid."""
+        mock_database.get_intent_by_id.return_value = {'id': 1, 'status': STATUS_PENDING}
+        assert intent_manager._validate_transition(1, STATUS_ABORTED) is True
+
+    def test_pending_to_expired_valid(self, intent_manager, mock_database):
+        """pending -> expired is valid."""
+        mock_database.get_intent_by_id.return_value = {'id': 1, 'status': STATUS_PENDING}
+        assert intent_manager._validate_transition(1, 'expired') is True
+
+    def test_committed_to_pending_invalid(self, intent_manager, mock_database):
+        """committed -> pending is NOT valid (backward transition)."""
+        mock_database.get_intent_by_id.return_value = {'id': 1, 'status': STATUS_COMMITTED}
+        assert intent_manager._validate_transition(1, STATUS_PENDING) is False
+
+    def test_aborted_to_committed_invalid(self, intent_manager, mock_database):
+        """aborted -> committed is NOT valid (terminal state)."""
+        mock_database.get_intent_by_id.return_value = {'id': 1, 'status': STATUS_ABORTED}
+        assert intent_manager._validate_transition(1, STATUS_COMMITTED) is False
+
+    def test_committed_to_failed_valid(self, intent_manager, mock_database):
+        """committed -> failed is valid."""
+        mock_database.get_intent_by_id.return_value = {'id': 1, 'status': STATUS_COMMITTED}
+        assert intent_manager._validate_transition(1, STATUS_FAILED) is True
+
+    def test_failed_is_terminal(self, intent_manager, mock_database):
+        """No transitions out of failed."""
+        mock_database.get_intent_by_id.return_value = {'id': 1, 'status': STATUS_FAILED}
+        for status in VALID_STATUSES:
+            assert intent_manager._validate_transition(1, status) is False
+
+    def test_commit_intent_validates_transition(self, intent_manager, mock_database):
+        """commit_intent should reject if intent is not pending."""
+        mock_database.get_intent_by_id.return_value = {'id': 1, 'status': STATUS_ABORTED}
+        result = intent_manager.commit_intent(1)
+        assert result is False
+        mock_database.update_intent_status.assert_not_called()
+
+    def test_invalid_status_string_rejected(self, intent_manager, mock_database):
+        """Completely unknown status should be rejected."""
+        mock_database.get_intent_by_id.return_value = {'id': 1, 'status': STATUS_PENDING}
+        assert intent_manager._validate_transition(1, 'nonexistent') is False
+
+    def test_nonexistent_intent_rejected(self, intent_manager, mock_database):
+        """Missing intent should fail validation."""
+        mock_database.get_intent_by_id.return_value = None
+        assert intent_manager._validate_transition(999, STATUS_COMMITTED) is False
+
+
+# =============================================================================
+# FIX 3: THREAD-SAFE CALLBACK REGISTRATION TESTS
+# =============================================================================
+
+class TestCallbackLock:
+    """Test that callback registration and read are thread-safe."""
+
+    def test_callback_lock_exists(self, intent_manager):
+        """IntentManager should have a _callback_lock."""
+        assert hasattr(intent_manager, '_callback_lock')
+
+    def test_register_and_execute_callback(self, intent_manager, mock_database):
+        """Register then execute should work through the lock."""
+        called = []
+        intent_manager.register_commit_callback('channel_open', lambda i: called.append(i))
+
+        intent_row = {
+            'id': 1, 'intent_type': 'channel_open', 'target': 'peer',
+            'initiator': intent_manager.our_pubkey,
+            'timestamp': int(time.time()), 'expires_at': int(time.time()) + 60,
+            'status': STATUS_COMMITTED
+        }
+        result = intent_manager.execute_committed_intent(intent_row)
+        assert result is True
+        assert len(called) == 1
+
+    def test_concurrent_registration(self, intent_manager):
+        """Concurrent callback registrations should not corrupt the dict."""
+        import threading
+        errors = []
+
+        def register_callbacks(prefix):
+            try:
+                for i in range(50):
+                    intent_manager.register_commit_callback(f'{prefix}_{i}', lambda x: None)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=register_callbacks, args=(f't{n}',))
+            for n in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+
+
+# =============================================================================
+# FIX 4: AUDIT TRAIL REASON TESTS
+# =============================================================================
+
+class TestAuditTrailReason:
+    """Test that reason strings are passed through to the DB layer."""
+
+    def test_abort_local_intent_passes_reason(self, intent_manager, mock_database):
+        """abort_local_intent should pass 'tie_breaker_loss' reason."""
+        mock_database.get_conflicting_intents.return_value = [
+            {'id': 5, 'intent_type': 'channel_open', 'target': 'target',
+             'initiator': intent_manager.our_pubkey, 'status': 'pending'}
+        ]
+        intent_manager.abort_local_intent('target', 'channel_open')
+        mock_database.update_intent_status.assert_called_with(
+            5, STATUS_ABORTED, reason="tie_breaker_loss"
+        )
+
+    def test_clear_intents_by_peer_passes_reason(self, intent_manager, mock_database):
+        """clear_intents_by_peer should pass 'peer_banned' reason."""
+        peer = '02' + 'b' * 64
+        mock_database.get_pending_intents.return_value = [
+            {'id': 10, 'initiator': peer}
+        ]
+        intent_manager.clear_intents_by_peer(peer)
+        mock_database.update_intent_status.assert_called_with(
+            10, STATUS_ABORTED, reason="peer_banned"
+        )
+
+    def test_callback_exception_passes_reason(self, intent_manager, mock_database):
+        """Callback exception should record reason with exception message."""
+        def bad_callback(intent):
+            raise RuntimeError("connection timeout")
+
+        intent_manager.register_commit_callback('channel_open', bad_callback)
+
+        intent_row = {
+            'id': 7, 'intent_type': 'channel_open', 'target': 'peer',
+            'initiator': intent_manager.our_pubkey,
+            'timestamp': int(time.time()), 'expires_at': int(time.time()) + 60,
+            'status': STATUS_COMMITTED
+        }
+        result = intent_manager.execute_committed_intent(intent_row)
+        assert result is False
+        mock_database.update_intent_status.assert_called_once()
+        call_args = mock_database.update_intent_status.call_args
+        assert call_args[0][0] == 7
+        assert call_args[0][1] == STATUS_FAILED
+        assert 'callback_exception: connection timeout' in call_args[1]['reason']
+
+
+# =============================================================================
+# FIX 5: INSERTION-ORDER EVICTION TESTS
+# =============================================================================
+
+class TestInsertionOrderEviction:
+    """Test that cache eviction uses insertion order, not timestamp."""
+
+    def test_evicts_first_inserted_not_oldest_timestamp(self, intent_manager):
+        """With cache full, the first-inserted entry should be evicted,
+        even if a later entry has an older timestamp."""
+        now = int(time.time())
+
+        # Fill cache to capacity
+        for i in range(MAX_REMOTE_INTENTS):
+            intent = Intent(
+                intent_type='channel_open',
+                target=f'target_{i}',
+                initiator=f'02{"0" * 62}{i:02d}',
+                timestamp=now,
+                expires_at=now + 300
+            )
+            intent_manager.record_remote_intent(intent)
+
+        assert len(intent_manager._remote_intents) == MAX_REMOTE_INTENTS
+
+        # First key inserted
+        first_key = next(iter(intent_manager._remote_intents))
+
+        # Insert a new intent with an *old* timestamp (attacker scenario)
+        attacker_intent = Intent(
+            intent_type='channel_open',
+            target='attacker_target',
+            initiator='02' + 'f' * 64,
+            timestamp=now - 100,  # old timestamp
+            expires_at=now + 200
+        )
+        intent_manager.record_remote_intent(attacker_intent)
+
+        # The first-inserted key should be evicted, not the one with oldest timestamp
+        assert first_key not in intent_manager._remote_intents
+        assert len(intent_manager._remote_intents) == MAX_REMOTE_INTENTS
+
+    def test_eviction_preserves_recent_entries(self, intent_manager):
+        """Entries added most recently should NOT be evicted."""
+        now = int(time.time())
+
+        for i in range(MAX_REMOTE_INTENTS):
+            intent = Intent(
+                intent_type='channel_open',
+                target=f'target_{i}',
+                initiator=f'02{"0" * 62}{i:02d}',
+                timestamp=now,
+                expires_at=now + 300
+            )
+            intent_manager.record_remote_intent(intent)
+
+        # The last key inserted should survive eviction
+        keys = list(intent_manager._remote_intents.keys())
+        last_key = keys[-1]
+
+        # Add new entry to trigger eviction
+        new_intent = Intent(
+            intent_type='channel_open',
+            target='new_target',
+            initiator='02' + 'e' * 64,
+            timestamp=now,
+            expires_at=now + 300
+        )
+        intent_manager.record_remote_intent(new_intent)
+
+        assert last_key in intent_manager._remote_intents
+
+
+# =============================================================================
+# FIX 6: IMMEDIATE FAILURE ON CALLBACK EXCEPTION TESTS
+# =============================================================================
+
+class TestImmediateFailure:
+    """Test that callback exceptions immediately mark intent as failed."""
+
+    def test_callback_exception_marks_failed(self, intent_manager, mock_database):
+        """On callback exception, intent should be immediately set to 'failed'."""
+        def exploding_callback(intent):
+            raise ValueError("boom")
+
+        intent_manager.register_commit_callback('rebalance', exploding_callback)
+
+        intent_row = {
+            'id': 99, 'intent_type': 'rebalance', 'target': 'route',
+            'initiator': intent_manager.our_pubkey,
+            'timestamp': int(time.time()), 'expires_at': int(time.time()) + 60,
+            'status': STATUS_COMMITTED
+        }
+        result = intent_manager.execute_committed_intent(intent_row)
+        assert result is False
+        mock_database.update_intent_status.assert_called_once_with(
+            99, STATUS_FAILED, reason="callback_exception: boom"
+        )
+
+    def test_successful_callback_does_not_set_failed(self, intent_manager, mock_database):
+        """Successful callback should not touch update_intent_status."""
+        intent_manager.register_commit_callback('channel_open', lambda i: None)
+
+        intent_row = {
+            'id': 1, 'intent_type': 'channel_open', 'target': 'peer',
+            'initiator': intent_manager.our_pubkey,
+            'timestamp': int(time.time()), 'expires_at': int(time.time()) + 60,
+            'status': STATUS_COMMITTED
+        }
+        result = intent_manager.execute_committed_intent(intent_row)
+        assert result is True
+        mock_database.update_intent_status.assert_not_called()
+
+
+# =============================================================================
+# FIX 7: SOFT-DELETE EXPIRED INTENTS (DB-level, tested via mock)
+# =============================================================================
+
+class TestSoftDeleteExpired:
+    """Test that cleanup_expired_intents calls DB (soft-delete behavior
+    is tested in the DB method itself; here we verify the manager delegates)."""
+
+    def test_cleanup_delegates_to_db(self, intent_manager, mock_database):
+        """IntentManager.cleanup_expired_intents should call db method."""
+        mock_database.cleanup_expired_intents.return_value = 3
+        result = intent_manager.cleanup_expired_intents()
+        assert result >= 3
+        mock_database.cleanup_expired_intents.assert_called_once()
+
+
+# =============================================================================
+# FIX 8: HONOR CONFIG expire_seconds TESTS
+# =============================================================================
+
+class TestExpireSecondsConfig:
+    """Test that expire_seconds from config is used instead of hardcoded value."""
+
+    def test_default_expire_seconds(self, mock_database, mock_plugin):
+        """Without explicit expire_seconds, should default to hold_seconds * 2."""
+        mgr = IntentManager(mock_database, mock_plugin, our_pubkey='02' + 'a' * 64,
+                            hold_seconds=60)
+        assert mgr.expire_seconds == 120
+
+    def test_custom_expire_seconds(self, mock_database, mock_plugin):
+        """Explicit expire_seconds should override the default."""
+        mgr = IntentManager(mock_database, mock_plugin, our_pubkey='02' + 'a' * 64,
+                            hold_seconds=60, expire_seconds=300)
+        assert mgr.expire_seconds == 300
+
+    def test_expire_seconds_used_in_create_intent(self, mock_database, mock_plugin):
+        """create_intent should use expire_seconds for TTL, not hold_seconds * 2."""
+        mock_database.create_intent.return_value = 1
+        mock_database.get_conflicting_intents.return_value = []
+
+        mgr = IntentManager(mock_database, mock_plugin, our_pubkey='02' + 'a' * 64,
+                            hold_seconds=60, expire_seconds=300)
+        intent = mgr.create_intent('channel_open', '02' + 'x' * 64)
+
+        assert intent is not None
+        # expires_at should be ~now + 300, not now + 120
+        assert intent.expires_at - intent.timestamp == 300
+
+        # DB should get expire_seconds too
+        call_kwargs = mock_database.create_intent.call_args
+        assert call_kwargs[1]['expires_seconds'] == 300
+
+    def test_stats_include_expire_seconds(self, mock_database, mock_plugin):
+        """get_intent_stats should report expire_seconds."""
+        mgr = IntentManager(mock_database, mock_plugin, our_pubkey='02' + 'a' * 64,
+                            hold_seconds=60, expire_seconds=300)
+        stats = mgr.get_intent_stats()
+        assert stats['expire_seconds'] == 300
 
 
 if __name__ == "__main__":

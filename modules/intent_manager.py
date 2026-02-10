@@ -42,6 +42,20 @@ STATUS_PENDING = 'pending'
 STATUS_COMMITTED = 'committed'
 STATUS_ABORTED = 'aborted'
 STATUS_EXPIRED = 'expired'
+STATUS_FAILED = 'failed'
+
+# All valid statuses
+VALID_STATUSES = {STATUS_PENDING, STATUS_COMMITTED, STATUS_ABORTED, STATUS_EXPIRED, STATUS_FAILED}
+
+# Valid status transitions (from -> set of allowed to)
+VALID_TRANSITIONS = {
+    STATUS_PENDING: {STATUS_COMMITTED, STATUS_ABORTED, STATUS_EXPIRED},
+    STATUS_COMMITTED: {STATUS_FAILED},
+    # Terminal states: no transitions out
+    STATUS_ABORTED: set(),
+    STATUS_EXPIRED: set(),
+    STATUS_FAILED: set(),
+}
 
 
 # =============================================================================
@@ -162,23 +176,29 @@ class IntentManager:
     """
     
     def __init__(self, database, plugin=None, our_pubkey: str = None,
-                 hold_seconds: int = DEFAULT_HOLD_SECONDS):
+                 hold_seconds: int = DEFAULT_HOLD_SECONDS,
+                 expire_seconds: int = None):
         """
         Initialize the IntentManager.
-        
+
         Args:
             database: HiveDatabase instance for persistence
             plugin: Optional plugin reference for logging and RPC
             our_pubkey: Our node's public key (for tie-breaker)
             hold_seconds: Seconds to wait before committing
+            expire_seconds: Intent TTL in seconds (defaults to hold_seconds * 2)
         """
         self.db = database
         self.plugin = plugin
         self.our_pubkey = our_pubkey
         self.hold_seconds = hold_seconds
-        
+        self.expire_seconds = expire_seconds if expire_seconds is not None else hold_seconds * 2
+
         # Callback registry for intent commit actions
         self._commit_callbacks: Dict[str, Callable] = {}
+
+        # Lock protecting _commit_callbacks
+        self._callback_lock = threading.Lock()
 
         # Lock protecting _remote_intents
         self._remote_lock = threading.Lock()
@@ -196,35 +216,90 @@ class IntentManager:
         self.our_pubkey = pubkey
     
     # =========================================================================
+    # STATUS VALIDATION
+    # =========================================================================
+
+    def _validate_transition(self, intent_id: int, new_status: str) -> bool:
+        """
+        Validate that a status transition is allowed.
+
+        Queries current status from DB and checks against VALID_TRANSITIONS.
+
+        Args:
+            intent_id: Database ID of the intent
+            new_status: Desired new status
+
+        Returns:
+            True if transition is valid
+        """
+        if new_status not in VALID_STATUSES:
+            self._log(f"Invalid status '{new_status}' for intent {intent_id}", level="warn")
+            return False
+
+        row = self.db.get_intent_by_id(intent_id)
+        if not row:
+            self._log(f"Intent {intent_id} not found for transition check", level="warn")
+            return False
+
+        current = row.get('status')
+        allowed = VALID_TRANSITIONS.get(current, set())
+        if new_status not in allowed:
+            self._log(f"Invalid transition for intent {intent_id}: "
+                     f"'{current}' -> '{new_status}' (allowed: {allowed})", level="warn")
+            return False
+
+        return True
+
+    # =========================================================================
     # INTENT CREATION
     # =========================================================================
-    
+
     def create_intent(self, intent_type: str, target: str) -> Optional[Intent]:
         """
         Create a new local intent and persist to database.
+
+        Checks for existing pending intents for the same target/type to
+        prevent duplicate intents from being created.
 
         Args:
             intent_type: Type of action (from IntentType enum)
             target: Target identifier
 
         Returns:
-            The created Intent object with database ID, or None if our_pubkey not set
+            The created Intent object with database ID, or None if
+            our_pubkey not set, invalid type, or a duplicate already exists
         """
         if not self.our_pubkey:
             self._log("Cannot create intent: our_pubkey not set", level="warn")
             return None
 
-        now = int(time.time())
-        expires_at = now + self.hold_seconds
+        # Validate intent_type against known enum values
+        valid_types = {t.value for t in IntentType}
+        if intent_type not in valid_types:
+            self._log(f"Invalid intent_type '{intent_type}' "
+                     f"(valid: {sorted(valid_types)})", level="warn")
+            return None
 
-        # Insert into database
+        # Check for existing pending intent for same target/type
+        existing = self.db.get_conflicting_intents(target, intent_type)
+        for row in existing:
+            if row.get('initiator') == self.our_pubkey:
+                self._log(f"Duplicate intent rejected: {intent_type} -> {target[:16]}... "
+                         f"(existing ID: {row.get('id')})", level="warn")
+                return None
+
+        now = int(time.time())
+        expires_at = now + self.expire_seconds
+
+        # Pass timestamp to DB to ensure Intent object and DB record match
         intent_id = self.db.create_intent(
             intent_type=intent_type,
             target=target,
             initiator=self.our_pubkey,
-            expires_seconds=self.hold_seconds
+            expires_seconds=self.expire_seconds,
+            timestamp=now
         )
-        
+
         intent = Intent(
             intent_type=intent_type,
             target=target,
@@ -234,9 +309,9 @@ class IntentManager:
             status=STATUS_PENDING,
             intent_id=intent_id
         )
-        
+
         self._log(f"Created intent: {intent_type} -> {target[:16]}... (ID: {intent_id})")
-        
+
         return intent
     
     def create_intent_message(self, intent: Intent) -> Dict[str, Any]:
@@ -318,10 +393,10 @@ class IntentManager:
         for intent_row in local_intents:
             intent_id = intent_row.get('id')
             if intent_id:
-                self.db.update_intent_status(intent_id, STATUS_ABORTED)
+                self.db.update_intent_status(intent_id, STATUS_ABORTED, reason="tie_breaker_loss")
                 self._log(f"Aborted local intent {intent_id} for {target[:16]}... (lost tie-breaker)")
                 aborted = True
-        
+
         return aborted
     
     def create_abort_message(self, intent: Intent) -> Dict[str, Any]:
@@ -369,18 +444,13 @@ class IntentManager:
         key = f"{intent.intent_type}:{intent.target}:{intent.initiator}"
 
         with self._remote_lock:
-            # P3-01: Enforce cache size limit - evict oldest by timestamp before adding
+            # P3-01: Enforce cache size limit - evict by insertion order (Python 3.7+)
+            # Using insertion order prevents attackers from crafting old timestamps
+            # to evict legitimate recent intents.
             if key not in self._remote_intents and len(self._remote_intents) >= MAX_REMOTE_INTENTS:
-                # Find and evict the oldest intent by timestamp
-                oldest_key = None
-                oldest_ts = float('inf')
-                for k, v in self._remote_intents.items():
-                    if v.timestamp < oldest_ts:
-                        oldest_ts = v.timestamp
-                        oldest_key = k
-                if oldest_key:
-                    del self._remote_intents[oldest_key]
-                    self._log(f"Evicted oldest remote intent (cache full at {MAX_REMOTE_INTENTS})", level='debug')
+                evict_key = next(iter(self._remote_intents))
+                del self._remote_intents[evict_key]
+                self._log(f"Evicted oldest remote intent (cache full at {MAX_REMOTE_INTENTS})", level='debug')
 
             self._remote_intents[key] = intent
 
@@ -407,14 +477,20 @@ class IntentManager:
         """
         Get tracked remote intents, optionally filtered by target.
 
+        Returns defensive copies to prevent callers from mutating
+        cached state without holding the lock.
+
         Args:
             target: Optional target to filter by
 
         Returns:
-            List of remote Intent objects
+            List of remote Intent objects (copies)
         """
         with self._remote_lock:
-            intents = list(self._remote_intents.values())
+            intents = [
+                Intent.from_dict(i.to_dict(), i.intent_id)
+                for i in self._remote_intents.values()
+            ]
 
         if target:
             intents = [i for i in intents if i.target == target]
@@ -428,12 +504,13 @@ class IntentManager:
     def register_commit_callback(self, intent_type: str, callback: Callable) -> None:
         """
         Register a callback function for when an intent commits.
-        
+
         Args:
             intent_type: Type of intent to handle
             callback: Function(intent) to call on commit
         """
-        self._commit_callbacks[intent_type] = callback
+        with self._callback_lock:
+            self._commit_callbacks[intent_type] = callback
         self._log(f"Registered commit callback for {intent_type}")
     
     def get_pending_intents_ready_to_commit(self) -> List[Dict]:
@@ -453,44 +530,57 @@ class IntentManager:
     def commit_intent(self, intent_id: int) -> bool:
         """
         Commit a pending intent and trigger its action.
-        
+
+        Validates the pending -> committed transition before updating.
+
         Args:
             intent_id: Database ID of the intent
-            
+
         Returns:
             True if commit succeeded
         """
-        # Update status
+        if not self._validate_transition(intent_id, STATUS_COMMITTED):
+            return False
+
         success = self.db.update_intent_status(intent_id, STATUS_COMMITTED)
-        
+
         if success:
             self._log(f"Committed intent {intent_id}")
-        
+
         return success
     
     def execute_committed_intent(self, intent_row: Dict) -> bool:
         """
         Execute the action for a committed intent.
-        
+
+        On callback exception, immediately marks the intent as failed
+        rather than leaving it in 'committed' for the recovery sweep.
+
         Args:
             intent_row: Intent data from database
-            
+
         Returns:
             True if action executed successfully
         """
         intent_type = intent_row.get('intent_type')
-        callback = self._commit_callbacks.get(intent_type)
-        
+        intent_id = intent_row.get('id')
+
+        with self._callback_lock:
+            callback = self._commit_callbacks.get(intent_type)
+
         if not callback:
             self._log(f"No callback registered for {intent_type}", level='warn')
             return False
-        
+
         try:
-            intent = Intent.from_dict(intent_row, intent_row.get('id'))
+            intent = Intent.from_dict(intent_row, intent_id)
             callback(intent)
             return True
         except Exception as e:
-            self._log(f"Failed to execute intent {intent_row.get('id')}: {e}", level='warn')
+            reason = f"callback_exception: {e}"
+            self._log(f"Failed to execute intent {intent_id}: {e}", level='warn')
+            if intent_id:
+                self.db.update_intent_status(intent_id, STATUS_FAILED, reason=reason)
             return False
     
     # =========================================================================
@@ -518,7 +608,7 @@ class IntentManager:
                 if intent_row.get("initiator") == peer_id:
                     intent_id = intent_row.get("id")
                     if intent_id:
-                        self.db.update_intent_status(intent_id, STATUS_ABORTED)
+                        self.db.update_intent_status(intent_id, STATUS_ABORTED, reason="peer_banned")
                         cleared += 1
         except Exception as e:
             self._log(f"Error clearing DB intents for {peer_id[:16]}...: {e}", level='warn')
@@ -575,14 +665,7 @@ class IntentManager:
         Returns:
             Number of intents recovered
         """
-        conn = self.db._get_connection()
-        cutoff = int(time.time()) - max_age_seconds
-        result = conn.execute(
-            "UPDATE intent_locks SET status = 'failed' "
-            "WHERE status = 'committed' AND timestamp < ?",
-            (cutoff,)
-        )
-        count = result.rowcount
+        count = self.db.recover_stuck_intents(max_age_seconds)
         if count > 0:
             self._log(f"Recovered {count} stuck committed intent(s) older than {max_age_seconds}s")
         return count
@@ -600,9 +683,12 @@ class IntentManager:
         """
         with self._remote_lock:
             remote_count = len(self._remote_intents)
+        with self._callback_lock:
+            callbacks = list(self._commit_callbacks.keys())
         return {
             'hold_seconds': self.hold_seconds,
+            'expire_seconds': self.expire_seconds,
             'our_pubkey': self.our_pubkey[:16] + '...' if self.our_pubkey else None,
             'remote_intents_cached': remote_count,
-            'registered_callbacks': list(self._commit_callbacks.keys())
+            'registered_callbacks': callbacks,
         }

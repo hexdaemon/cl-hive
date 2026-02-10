@@ -1129,7 +1129,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database,
         safe_plugin,
         our_pubkey=our_pubkey,
-        hold_seconds=config.intent_hold_seconds
+        hold_seconds=config.intent_hold_seconds,
+        expire_seconds=config.intent_expire_seconds
     )
     plugin.log("cl-hive: Intent manager initialized")
     

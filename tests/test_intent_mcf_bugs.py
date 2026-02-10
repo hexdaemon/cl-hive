@@ -67,7 +67,7 @@ class MockDatabase:
     def get_conflicting_intents(self, target, intent_type):
         return []
 
-    def update_intent_status(self, intent_id, status):
+    def update_intent_status(self, intent_id, status, reason=None):
         return True
 
     def cleanup_expired_intents(self):

@@ -175,10 +175,18 @@ class HiveDatabase:
         
         # Index for quick lookup of active intents by target
         conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_intent_locks_target 
+            CREATE INDEX IF NOT EXISTS idx_intent_locks_target
             ON intent_locks(target, status)
         """)
-        
+
+        # Add reason column for audit trail if upgrading from older schema
+        try:
+            conn.execute(
+                "ALTER TABLE intent_locks ADD COLUMN reason TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # =====================================================================
         # HIVE STATE TABLE
         # =====================================================================
@@ -1312,28 +1320,30 @@ class HiveDatabase:
     # =========================================================================
     
     def create_intent(self, intent_type: str, target: str, initiator: str,
-                      expires_seconds: int = 300) -> int:
+                      expires_seconds: int = 300,
+                      timestamp: Optional[int] = None) -> int:
         """
         Create a new Intent lock.
-        
+
         Args:
             intent_type: 'channel_open', 'rebalance', 'ban_peer'
             target: Target peer_id or identifier
             initiator: Our node pubkey
             expires_seconds: Lock TTL
-            
+            timestamp: Creation timestamp (uses current time if None)
+
         Returns:
             Intent ID
         """
         conn = self._get_connection()
-        now = int(time.time())
+        now = timestamp if timestamp is not None else int(time.time())
         expires = now + expires_seconds
-        
+
         cursor = conn.execute("""
             INSERT INTO intent_locks (intent_type, target, initiator, timestamp, expires_at, status)
             VALUES (?, ?, ?, ?, ?, 'pending')
         """, (intent_type, target, initiator, now, expires))
-        
+
         return cursor.lastrowid
     
     def get_conflicting_intents(self, target: str, intent_type: str) -> List[Dict]:
@@ -1348,24 +1358,49 @@ class HiveDatabase:
         
         return [dict(row) for row in rows]
     
-    def update_intent_status(self, intent_id: int, status: str) -> bool:
-        """Update Intent status: 'pending', 'committed', 'aborted'."""
+    def update_intent_status(self, intent_id: int, status: str, reason: str = None) -> bool:
+        """Update Intent status with optional reason for audit trail."""
         conn = self._get_connection()
-        result = conn.execute(
-            "UPDATE intent_locks SET status = ? WHERE id = ?",
-            (status, intent_id)
-        )
+        if reason:
+            result = conn.execute(
+                "UPDATE intent_locks SET status = ?, reason = ? WHERE id = ?",
+                (status, reason, intent_id)
+            )
+        else:
+            result = conn.execute(
+                "UPDATE intent_locks SET status = ? WHERE id = ?",
+                (status, intent_id)
+            )
         return result.rowcount > 0
     
     def cleanup_expired_intents(self) -> int:
-        """Remove expired Intent locks."""
+        """Soft-delete expired intents, then purge terminal intents after 24h.
+
+        Phase 1: Mark pending expired intents as 'expired' (preserves audit trail).
+        Phase 2: Hard-delete terminal intents (expired/aborted/failed) older than 24h.
+
+        Returns:
+            Total number of intents affected (soft-deleted + purged)
+        """
         conn = self._get_connection()
         now = int(time.time())
-        result = conn.execute(
-            "DELETE FROM intent_locks WHERE expires_at < ?",
+
+        # Phase 1: Soft-delete - mark pending expired intents
+        r1 = conn.execute(
+            "UPDATE intent_locks SET status = 'expired', reason = 'ttl_expired' "
+            "WHERE status = 'pending' AND expires_at < ?",
             (now,)
         )
-        return result.rowcount
+
+        # Phase 2: Purge terminal intents older than 24 hours
+        purge_cutoff = now - 86400
+        r2 = conn.execute(
+            "DELETE FROM intent_locks "
+            "WHERE status IN ('expired', 'aborted', 'failed') AND expires_at < ?",
+            (purge_cutoff,)
+        )
+
+        return r1.rowcount + r2.rowcount
     
     def get_pending_intents_ready(self, hold_seconds: int) -> List[Dict]:
         """
@@ -1406,6 +1441,28 @@ class HiveDatabase:
         """, (now,)).fetchall()
 
         return [dict(row) for row in rows]
+
+    def recover_stuck_intents(self, max_age_seconds: int = 300) -> int:
+        """
+        Mark intents stuck in 'committed' state as 'failed'.
+
+        Intents that remain in 'committed' for longer than max_age_seconds
+        are assumed to have failed execution and are freed for retry.
+
+        Args:
+            max_age_seconds: Max age in seconds before marking as failed
+
+        Returns:
+            Number of intents recovered
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        result = conn.execute(
+            "UPDATE intent_locks SET status = 'failed', reason = 'stuck_recovery' "
+            "WHERE status = 'committed' AND timestamp < ?",
+            (cutoff,)
+        )
+        return result.rowcount
 
     def get_intent_by_id(self, intent_id: int) -> Optional[Dict]:
         """Get a specific intent by ID."""

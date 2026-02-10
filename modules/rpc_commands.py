@@ -401,7 +401,7 @@ def reject_action(ctx: HiveContext, action_id, reason=None) -> Dict[str, Any]:
     payload = action['payload']
     intent_id = payload.get('intent_id')
     if intent_id:
-        ctx.database.update_intent_status(intent_id, 'aborted')
+        ctx.database.update_intent_status(intent_id, 'aborted', reason="action_rejected")
 
     # Update action status with optional reason
     ctx.database.update_action_status(action_id, 'rejected', reason=reason)
@@ -444,7 +444,7 @@ def _reject_all_actions(ctx: HiveContext, reason=None) -> Dict[str, Any]:
             payload = action.get('payload', {})
             intent_id = payload.get('intent_id')
             if intent_id:
-                ctx.database.update_intent_status(intent_id, 'aborted')
+                ctx.database.update_intent_status(intent_id, 'aborted', reason="action_rejected")
 
             # Update action status with optional reason
             ctx.database.update_action_status(action_id, 'rejected', reason=reason)
@@ -875,7 +875,7 @@ def _execute_channel_open(
 
         # Update intent status if we have one
         if intent_id and ctx.database:
-            ctx.database.update_intent_status(intent_id, 'committed')
+            ctx.database.update_intent_status(intent_id, 'committed', reason="action_executed")
 
         # Update action status
         ctx.database.update_action_status(action_id, 'executed')
