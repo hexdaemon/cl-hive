@@ -78,13 +78,6 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-hive")
 
-# Goat Feeder configuration
-# Revenue is tracked via LNbits API - payments with "⚡CyberHerd Treats⚡" in memo
-GOAT_FEEDER_PATTERN = "⚡CyberHerd Treats⚡"
-LNBITS_URL = os.environ.get("LNBITS_URL", "http://127.0.0.1:3002")
-LNBITS_INVOICE_KEY = os.environ.get("LNBITS_INVOICE_KEY", "")
-LNBITS_ALLOW_INSECURE = os.environ.get("LNBITS_ALLOW_INSECURE", "false").lower() == "true"
-LNBITS_TIMEOUT_SECS = float(os.environ.get("LNBITS_TIMEOUT_SECS", "10"))
 
 # =============================================================================
 # Strategy Prompt Loading
@@ -172,15 +165,6 @@ def load_strategy(name: str) -> str:
 def _is_local_host(hostname: str) -> bool:
     return hostname in {"127.0.0.1", "localhost", "::1"}
 
-
-def _validate_lnbits_config() -> Optional[str]:
-    parsed = urlparse(LNBITS_URL)
-    if not parsed.scheme or not parsed.netloc:
-        return "LNBITS_URL is invalid or missing a scheme/host."
-    if parsed.scheme != "https" and not _is_local_host(parsed.hostname or ""):
-        if not LNBITS_ALLOW_INSECURE:
-            return "LNBITS_URL must use https for non-localhost targets."
-    return None
 
 
 def _validate_node_config(node_config: Dict, node_mode: str) -> Optional[str]:
@@ -1712,24 +1696,6 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
-            name="revenue_outgoing",
-            description="Get goat feeder P&L: Lightning Goats revenue (incoming donations) vs CyberHerd Treats expenses (outgoing rewards). Shows goat feeder profitability separate from routing.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name"
-                    },
-                    "window_days": {
-                        "type": "integer",
-                        "description": "Time window in days (default: 30)"
-                    }
-                },
-                "required": ["node"]
-            }
-        ),
-        Tool(
             name="revenue_competitor_analysis",
             description="""Get competitor fee analysis - understand market positioning.
 
@@ -1764,42 +1730,6 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                     }
                 },
                 "required": ["node"]
-            }
-        ),
-        Tool(
-            name="goat_feeder_history",
-            description="Get historical goat feeder P&L from the advisor database. Shows snapshots over time for trend analysis.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name (optional, omit for all nodes)"
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "Days of history to retrieve (default: 30)"
-                    }
-                },
-                "required": []
-            }
-        ),
-        Tool(
-            name="goat_feeder_trends",
-            description="Get goat feeder trend analysis comparing current vs previous period. Shows if goat feeder profitability is improving, stable, or declining.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name (optional, omit for all nodes)"
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "Analysis period in days (default: 7)"
-                    }
-                },
-                "required": []
             }
         ),
         # =====================================================================
@@ -5861,7 +5791,7 @@ async def handle_revenue_profitability(args: Dict) -> Dict:
 
 
 async def handle_revenue_dashboard(args: Dict) -> Dict:
-    """Get financial health dashboard with routing and goat feeder revenue."""
+    """Get financial health dashboard with routing revenue."""
     node_name = args.get("node")
     window_days = args.get("window_days", 30)
 
@@ -5875,84 +5805,27 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
     if "error" in dashboard:
         return dashboard
 
-    import time
-    since_timestamp = int(time.time()) - (window_days * 86400)
-
-    # Fetch goat feeder revenue from LNbits (only for hive-nexus-01)
-    goat_feeder_error = None
-    if node_name == "hive-nexus-01":
-        goat_feeder = await get_goat_feeder_revenue(since_timestamp)
-        if "error" in goat_feeder:
-            goat_feeder_error = goat_feeder["error"]
-            logger.warning(f"Goat feeder data unavailable: {goat_feeder_error}")
-    else:
-        goat_feeder = {"total_sats": 0, "payment_count": 0}
-
     # Extract routing P&L data from cl-revenue-ops dashboard structure
-    # Data is in "period" and "financial_health", not "pnl_summary"
     period = dashboard.get("period", {})
     financial_health = dashboard.get("financial_health", {})
     routing_revenue = period.get("gross_revenue_sats", 0)
     routing_opex = period.get("opex_sats", 0)
     routing_net = financial_health.get("net_profit_sats", 0)
 
-    # Initialize pnl structure for building enhanced response
-    pnl = {}
+    operating_margin_pct = financial_health.get("operating_margin_pct", 0.0)
 
-    # Goat feeder revenue (no expenses tracked)
-    goat_revenue = goat_feeder.get("total_sats", 0)
-    goat_count = goat_feeder.get("payment_count", 0)
-
-    # Combined totals
-    total_revenue = routing_revenue + goat_revenue
-    total_net = routing_net + goat_revenue  # Goat revenue adds directly to profit
-
-    # Calculate combined operating margin
-    if total_revenue > 0:
-        combined_margin_pct = round((total_net / total_revenue) * 100, 2)
-    else:
-        combined_margin_pct = financial_health.get("operating_margin_pct", 0.0)
-
-    # Build enhanced P&L structure
-    pnl["routing"] = {
-        "revenue_sats": routing_revenue,
-        "opex_sats": routing_opex,
-        "net_profit_sats": routing_net,
-        "opex_breakdown": {
-            "rebalance_cost_sats": period.get("rebalance_cost_sats", 0),
-            "closure_cost_sats": period.get("closure_cost_sats", 0),
-            "splice_cost_sats": period.get("splice_cost_sats", 0),
+    pnl = {
+        "routing": {
+            "revenue_sats": routing_revenue,
+            "opex_sats": routing_opex,
+            "net_profit_sats": routing_net,
+            "operating_margin_pct": operating_margin_pct,
+            "opex_breakdown": {
+                "rebalance_cost_sats": period.get("rebalance_cost_sats", 0),
+                "closure_cost_sats": period.get("closure_cost_sats", 0),
+                "splice_cost_sats": period.get("splice_cost_sats", 0),
+            }
         }
-    }
-
-    pnl["goat_feeder"] = {
-        "revenue_sats": goat_revenue,
-        "payment_count": goat_count,
-        "source": "LNbits"
-    }
-
-    # Record goat feeder snapshot to advisor database for historical tracking
-    # Skip recording when LNbits returned an error to avoid polluting data with zeros
-    if goat_feeder_error is None:
-        try:
-            db = ensure_advisor_db()
-            db.record_goat_feeder_snapshot(
-                node_name=node_name,
-                window_days=window_days,
-                revenue_sats=goat_revenue,
-                revenue_count=goat_count,
-                expense_sats=0,
-                expense_count=0,
-                expense_routing_fee_sats=0
-            )
-        except Exception as e:
-            logger.warning(f"Failed to record goat feeder snapshot: {e}")
-
-    pnl["combined"] = {
-        "total_revenue_sats": total_revenue,
-        "total_opex_sats": routing_opex,
-        "net_profit_sats": total_net,
-        "operating_margin_pct": combined_margin_pct
     }
 
     # Update top-level fields for backwards compatibility
@@ -6167,113 +6040,6 @@ async def handle_revenue_history(args: Dict) -> Dict:
     return await node.call("revenue-history")
 
 
-async def get_goat_feeder_revenue(since_timestamp: int) -> Dict[str, Any]:
-    """
-    Fetch goat feeder revenue from LNbits.
-
-    Queries the LNbits wallet for payments with "⚡CyberHerd Treats⚡" in the memo.
-    These are incoming payments to the sat wallet from the goat feeder.
-
-    Args:
-        since_timestamp: Only count payments after this timestamp
-
-    Returns:
-        Dict with total_sats and payment_count
-    """
-    import urllib.request
-    import json
-
-    validation_error = _validate_lnbits_config()
-    if validation_error:
-        return {"total_sats": 0, "payment_count": 0, "error": validation_error}
-    if not LNBITS_INVOICE_KEY:
-        return {"total_sats": 0, "payment_count": 0, "error": "LNBITS_INVOICE_KEY not configured."}
-
-    try:
-        # Query LNbits payments API using urllib (no external dependencies)
-        req = urllib.request.Request(
-            f"{LNBITS_URL}/api/v1/payments",
-            headers={"X-Api-Key": LNBITS_INVOICE_KEY}
-        )
-        with urllib.request.urlopen(req, timeout=LNBITS_TIMEOUT_SECS) as response:
-            if response.status != 200:
-                return {"total_sats": 0, "payment_count": 0, "error": f"API error: {response.status}"}
-            raw = json.loads(response.read())
-
-        if isinstance(raw, dict) and "data" in raw:
-            payments = raw.get("data", [])
-        else:
-            payments = raw if isinstance(raw, list) else []
-
-        total_sats = 0
-        payment_count = 0
-
-        for payment in payments:
-            # Only count incoming payments (positive amount)
-            amount = payment.get("amount", 0)
-            if amount <= 0:
-                continue
-
-            # Check if memo matches goat feeder pattern
-            memo = payment.get("memo", "") or ""
-            if GOAT_FEEDER_PATTERN not in memo:
-                continue
-
-            # Parse timestamp (LNbits uses ISO date string in 'time' field)
-            payment_time_str = payment.get("time", "")
-            try:
-                from datetime import datetime
-                # Handle ISO format with or without timezone
-                if "." in payment_time_str:
-                    payment_time = datetime.fromisoformat(payment_time_str.replace("Z", "+00:00"))
-                else:
-                    payment_time = datetime.fromisoformat(payment_time_str)
-                payment_timestamp = int(payment_time.timestamp())
-            except (ValueError, TypeError):
-                payment_timestamp = 0
-
-            if payment_timestamp < since_timestamp:
-                continue
-
-            # LNbits amounts are in millisats
-            total_sats += amount // 1000
-            payment_count += 1
-
-        return {
-            "total_sats": total_sats,
-            "payment_count": payment_count
-        }
-
-    except Exception as e:
-        logger.warning(f"Error fetching goat feeder revenue from LNbits: {e}")
-        return {
-            "total_sats": 0,
-            "payment_count": 0,
-            "error": str(e)
-        }
-
-
-async def handle_revenue_outgoing(args: Dict) -> Dict:
-    """Get goat feeder revenue from LNbits."""
-    window_days = args.get("window_days", 30)
-
-    import time
-    since_timestamp = int(time.time()) - (window_days * 86400)
-
-    # Get goat feeder revenue from LNbits
-    revenue = await get_goat_feeder_revenue(since_timestamp)
-
-    return {
-        "window_days": window_days,
-        "goat_feeder": {
-            "revenue_sats": revenue.get("total_sats", 0),
-            "payment_count": revenue.get("payment_count", 0),
-            "pattern": GOAT_FEEDER_PATTERN,
-            "source": f"LNbits ({LNBITS_URL})"
-        },
-        "error": revenue.get("error")
-    }
-
 
 async def handle_revenue_competitor_analysis(args: Dict) -> Dict:
     """
@@ -6424,57 +6190,6 @@ def _analyze_market_position(our_fee: int, their_avg_fee: int, intel: Dict) -> D
         "reasoning": reasoning
     }
 
-
-async def handle_goat_feeder_history(args: Dict) -> Dict:
-    """Get historical goat feeder P&L from the advisor database."""
-    node_name = args.get("node")
-    days = args.get("days", 30)
-
-    db = ensure_advisor_db()
-    history = db.get_goat_feeder_history(node_name=node_name, days=days)
-
-    if not history:
-        return {
-            "snapshots": [],
-            "count": 0,
-            "note": "No goat feeder history found. Run revenue_dashboard to start recording snapshots."
-        }
-
-    return {
-        "snapshots": [
-            {
-                "timestamp": s.timestamp.isoformat(),
-                "node_name": s.node_name,
-                "window_days": s.window_days,
-                "revenue_sats": s.revenue_sats,
-                "revenue_count": s.revenue_count,
-                "expense_sats": s.expense_sats,
-                "expense_count": s.expense_count,
-                "net_profit_sats": s.net_profit_sats,
-                "profitable": s.profitable
-            }
-            for s in history
-        ],
-        "count": len(history),
-        "summary": db.get_goat_feeder_summary(node_name=node_name)
-    }
-
-
-async def handle_goat_feeder_trends(args: Dict) -> Dict:
-    """Get goat feeder trend analysis."""
-    node_name = args.get("node")
-    days = args.get("days", 7)
-
-    db = ensure_advisor_db()
-    trends = db.get_goat_feeder_trends(node_name=node_name, days=days)
-
-    if not trends:
-        return {
-            "error": "Insufficient data for trend analysis",
-            "note": "Run revenue_dashboard multiple times over several days to collect enough data for trends."
-        }
-
-    return trends
 
 
 # =============================================================================
@@ -9064,10 +8779,7 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_config": handle_revenue_config,
     "revenue_debug": handle_revenue_debug,
     "revenue_history": handle_revenue_history,
-    "revenue_outgoing": handle_revenue_outgoing,
     "revenue_competitor_analysis": handle_revenue_competitor_analysis,
-    "goat_feeder_history": handle_goat_feeder_history,
-    "goat_feeder_trends": handle_goat_feeder_trends,
     # Advisor database
     "advisor_record_snapshot": handle_advisor_record_snapshot,
     "advisor_get_trends": handle_advisor_get_trends,
