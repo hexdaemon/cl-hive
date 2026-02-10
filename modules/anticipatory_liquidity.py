@@ -541,6 +541,8 @@ class AnticipatoryLiquidityManager:
         self._pattern_cache: Dict[str, List[TemporalPattern]] = {}
         self._prediction_cache: Dict[str, LiquidityPrediction] = {}
         self._flow_history: Dict[str, List[HourlyFlowSample]] = defaultdict(list)
+        # Track last-update timestamp per channel for O(1) eviction
+        self._flow_history_last_ts: Dict[str, int] = {}
 
         # Cache timestamps
         self._pattern_cache_time: Dict[str, int] = {}
@@ -613,31 +615,30 @@ class AnticipatoryLiquidityManager:
         # Add to in-memory history (lock protects shared caches)
         with self._lock:
             self._flow_history[channel_id].append(sample)
+            self._flow_history_last_ts[channel_id] = ts
 
-            # Enforce per-channel sample limit
-            if len(self._flow_history[channel_id]) > MAX_FLOW_SAMPLES_PER_CHANNEL:
-                self._flow_history[channel_id] = self._flow_history[channel_id][-MAX_FLOW_SAMPLES_PER_CHANNEL:]
-
-            # Evict oldest channel if dict exceeds limit
-            if len(self._flow_history) > MAX_FLOW_HISTORY_CHANNELS:
-                oldest_cid = None
-                oldest_ts = float('inf')
-                for cid, samples_list in self._flow_history.items():
-                    if cid == channel_id:
-                        continue
-                    last_ts = samples_list[-1].timestamp if samples_list else 0
-                    if last_ts < oldest_ts:
-                        oldest_ts = last_ts
-                        oldest_cid = cid
-                if oldest_cid:
-                    del self._flow_history[oldest_cid]
-
-            # Trim old samples (keep PATTERN_WINDOW_DAYS)
-            cutoff = ts - (PATTERN_WINDOW_DAYS * 24 * 3600)
+            # Trim old samples first (use wider monthly window to keep enough data)
+            window_days = MONTHLY_PATTERN_WINDOW_DAYS if MONTHLY_PATTERNS_ENABLED else PATTERN_WINDOW_DAYS
+            cutoff = ts - (window_days * 24 * 3600)
             self._flow_history[channel_id] = [
                 s for s in self._flow_history[channel_id]
                 if s.timestamp > cutoff
             ]
+
+            # Then enforce hard per-channel limit
+            if len(self._flow_history[channel_id]) > MAX_FLOW_SAMPLES_PER_CHANNEL:
+                self._flow_history[channel_id] = self._flow_history[channel_id][-MAX_FLOW_SAMPLES_PER_CHANNEL:]
+
+            # Evict oldest channel if dict exceeds limit (O(1) lookup via tracker)
+            if len(self._flow_history) > MAX_FLOW_HISTORY_CHANNELS:
+                oldest_cid = min(
+                    (cid for cid in self._flow_history_last_ts if cid != channel_id),
+                    key=lambda c: self._flow_history_last_ts.get(c, 0),
+                    default=None
+                )
+                if oldest_cid:
+                    del self._flow_history[oldest_cid]
+                    self._flow_history_last_ts.pop(oldest_cid, None)
 
         # Persist to database
         self._persist_flow_sample(sample)
@@ -657,20 +658,24 @@ class AnticipatoryLiquidityManager:
         except Exception as e:
             self._log(f"Failed to persist flow sample: {e}", level="debug")
 
-    def load_flow_history(self, channel_id: str) -> List[HourlyFlowSample]:
+    def load_flow_history(self, channel_id: str, days: int = None) -> List[HourlyFlowSample]:
         """
         Load flow history from database.
 
         Args:
             channel_id: Channel SCID
+            days: Number of days of history to load (default: PATTERN_WINDOW_DAYS,
+                  or MONTHLY_PATTERN_WINDOW_DAYS when monthly detection is enabled)
 
         Returns:
             List of historical flow samples
         """
+        if days is None:
+            days = MONTHLY_PATTERN_WINDOW_DAYS if MONTHLY_PATTERNS_ENABLED else PATTERN_WINDOW_DAYS
         try:
             rows = self.database.get_flow_samples(
                 channel_id=channel_id,
-                days=PATTERN_WINDOW_DAYS
+                days=days
             )
 
             samples = []
@@ -1138,7 +1143,8 @@ class AnticipatoryLiquidityManager:
     def detect_intraday_patterns(
         self,
         channel_id: str,
-        force_refresh: bool = False
+        force_refresh: bool = False,
+        capacity_sats: int = None
     ) -> List[IntraDayPattern]:
         """
         Detect Kalman-enhanced intra-day flow patterns.
@@ -1150,6 +1156,7 @@ class AnticipatoryLiquidityManager:
         Args:
             channel_id: Channel SCID
             force_refresh: Force recalculation even if cached
+            capacity_sats: Channel capacity in sats (looked up via RPC if not provided)
 
         Returns:
             List of IntraDayPattern objects for each time bucket
@@ -1163,6 +1170,11 @@ class AnticipatoryLiquidityManager:
                 cached = self._intraday_cache.get(cache_key)
                 if cached and (now - cached.get('time', 0)) < PREDICTION_STALE_HOURS * 3600:
                     return list(cached.get('patterns', []))
+
+        # Look up capacity if not provided
+        if capacity_sats is None or capacity_sats <= 0:
+            channel_info = self._get_channel_info(channel_id)
+            capacity_sats = channel_info.get("capacity_sats", 0) if channel_info else 0
 
         # Load flow history
         samples = self.load_flow_history(channel_id)
@@ -1198,7 +1210,8 @@ class AnticipatoryLiquidityManager:
                 hour_start=hour_start,
                 hour_end=hour_end,
                 kalman_confidence=kalman_confidence,
-                is_regime_change=is_regime_change
+                is_regime_change=is_regime_change,
+                capacity_sats=capacity_sats
             )
             if pattern:
                 patterns.append(pattern)
@@ -1225,7 +1238,8 @@ class AnticipatoryLiquidityManager:
         hour_start: int,
         hour_end: int,
         kalman_confidence: float,
-        is_regime_change: bool
+        is_regime_change: bool,
+        capacity_sats: int = 0
     ) -> Optional[IntraDayPattern]:
         """
         Analyze a specific time bucket for patterns.
@@ -1238,6 +1252,7 @@ class AnticipatoryLiquidityManager:
             hour_end: End hour of bucket
             kalman_confidence: Confidence from Kalman filter
             is_regime_change: Whether regime change was detected
+            capacity_sats: Channel capacity in sats (0 = use fallback estimate)
 
         Returns:
             IntraDayPattern or None if insufficient data
@@ -1258,8 +1273,21 @@ class AnticipatoryLiquidityManager:
         if len(bucket_samples) < INTRADAY_MIN_SAMPLES_PER_BUCKET:
             return None
 
+        # Determine capacity for velocity normalization
+        # Use actual capacity when available, fall back to median flow magnitude estimate
+        if capacity_sats > 0:
+            norm_capacity = capacity_sats
+        else:
+            # Estimate from flow magnitudes: assume peak flow is ~10% of capacity
+            magnitudes = sorted(abs(s.net_flow_sats) for s in bucket_samples if s.net_flow_sats != 0)
+            if magnitudes:
+                p90 = magnitudes[min(len(magnitudes) - 1, int(len(magnitudes) * 0.9))]
+                norm_capacity = max(p90 * 10, 1)  # At least 1 to avoid division by zero
+            else:
+                norm_capacity = 10_000_000  # Ultimate fallback
+
         # Calculate velocities for each sample
-        # Velocity = net_flow / capacity (approximated from flow magnitude)
+        # Velocity = net_flow / capacity (fraction of channel capacity per sample period)
         velocities = []
         flow_magnitudes = []
 
@@ -1267,12 +1295,8 @@ class AnticipatoryLiquidityManager:
             magnitude = abs(sample.net_flow_sats)
             flow_magnitudes.append(magnitude)
 
-            # Estimate velocity as fraction of typical capacity
-            # (we don't have capacity here, so use relative metric)
             if magnitude > 0:
-                direction = 1 if sample.net_flow_sats > 0 else -1
-                # Normalize by assuming 10M sat typical capacity
-                velocity = (sample.net_flow_sats / 10_000_000)
+                velocity = sample.net_flow_sats / norm_capacity
                 velocities.append(velocity)
 
         if not velocities:
@@ -1606,9 +1630,10 @@ class AnticipatoryLiquidityManager:
         target_time = datetime.fromtimestamp(time.time() + hours_ahead * 3600, tz=timezone.utc)
         target_hour = target_time.hour
         target_day = target_time.weekday()
+        target_day_of_month = target_time.day
 
         matched_pattern = self._find_best_pattern_match(
-            patterns, target_hour, target_day
+            patterns, target_hour, target_day, target_day_of_month
         )
 
         # Calculate base velocity from recent samples
@@ -1616,14 +1641,20 @@ class AnticipatoryLiquidityManager:
 
         # Adjust velocity based on pattern
         if matched_pattern and matched_pattern.confidence >= PATTERN_CONFIDENCE_THRESHOLD:
-            # Pattern indicates stronger flow expected
+            # Pattern-derived velocity floor: use pattern's avg flow as independent signal
+            # so patterns have effect even when current base_velocity is zero
+            pattern_velocity_floor = 0.0
+            if capacity_sats > 0 and matched_pattern.avg_flow_sats > 0:
+                pattern_velocity_floor = matched_pattern.avg_flow_sats / capacity_sats
+            velocity_magnitude = max(abs(base_velocity), pattern_velocity_floor)
+
             if matched_pattern.direction == FlowDirection.OUTBOUND:
                 adjusted_velocity = base_velocity - (
-                    matched_pattern.intensity * abs(base_velocity) * 0.5
+                    matched_pattern.intensity * velocity_magnitude * 0.5
                 )
             elif matched_pattern.direction == FlowDirection.INBOUND:
                 adjusted_velocity = base_velocity + (
-                    matched_pattern.intensity * abs(base_velocity) * 0.5
+                    matched_pattern.intensity * velocity_magnitude * 0.5
                 )
             else:
                 adjusted_velocity = base_velocity
@@ -1637,8 +1668,35 @@ class AnticipatoryLiquidityManager:
             pattern_intensity = 1.0
             confidence = 0.5  # Lower confidence without pattern match
 
-        # Project forward
-        predicted_local_pct = current_local_pct + (adjusted_velocity * hours_ahead)
+        # Project forward: step through hours to account for changing patterns
+        if hours_ahead <= 6 or not patterns:
+            # Short horizon or no patterns: simple linear projection
+            predicted_local_pct = current_local_pct + (adjusted_velocity * hours_ahead)
+        else:
+            # Long horizon: step hour-by-hour, re-matching patterns each hour
+            predicted_local_pct = current_local_pct
+            now_ts = time.time()
+            for h in range(hours_ahead):
+                step_time = datetime.fromtimestamp(now_ts + (h + 1) * 3600, tz=timezone.utc)
+                step_pattern = self._find_best_pattern_match(
+                    patterns, step_time.hour, step_time.weekday(), step_time.day
+                )
+                if step_pattern and step_pattern.confidence >= PATTERN_CONFIDENCE_THRESHOLD:
+                    step_floor = 0.0
+                    if capacity_sats > 0 and step_pattern.avg_flow_sats > 0:
+                        step_floor = step_pattern.avg_flow_sats / capacity_sats
+                    step_mag = max(abs(base_velocity), step_floor)
+                    if step_pattern.direction == FlowDirection.OUTBOUND:
+                        step_v = base_velocity - step_pattern.intensity * step_mag * 0.5
+                    elif step_pattern.direction == FlowDirection.INBOUND:
+                        step_v = base_velocity + step_pattern.intensity * step_mag * 0.5
+                    else:
+                        step_v = base_velocity
+                else:
+                    step_v = base_velocity
+                predicted_local_pct += step_v
+            # adjusted_velocity represents the average over the window
+            adjusted_velocity = (predicted_local_pct - current_local_pct) / hours_ahead if hours_ahead > 0 else adjusted_velocity
         predicted_local_pct = max(0.0, min(1.0, predicted_local_pct))
 
         # Calculate risks
@@ -1685,35 +1743,52 @@ class AnticipatoryLiquidityManager:
         self,
         patterns: List[TemporalPattern],
         target_hour: int,
-        target_day: int
+        target_day: int,
+        target_day_of_month: int = None
     ) -> Optional[TemporalPattern]:
         """
         Find the best matching pattern for a target time.
 
         Priority:
-        1. Exact hour+day match
-        2. Hour match (any day)
-        3. Day match (any hour)
+        1. Exact hour+day_of_week match (score 3)
+        2. Hour match (any day) (score 2)
+        3. Day-of-month match (score 1.5) — includes EOM cluster (day 31 matches days 28-31,1-3)
+        4. Day-of-week match (any hour) (score 1)
         """
         best_match = None
-        best_score = 0
+        best_score = 0.0
+
+        # Days considered part of end-of-month cluster (marker day_of_month=31)
+        EOM_DAYS = {28, 29, 30, 31, 1, 2, 3}
 
         for pattern in patterns:
-            score = 0
+            score = 0.0
 
-            # Check hour match
-            if pattern.hour_of_day is not None:
-                if pattern.hour_of_day == target_hour:
-                    score += 2
+            # Monthly patterns (day_of_month set, hour/day_of_week are None)
+            if pattern.day_of_month is not None:
+                if target_day_of_month is None:
+                    continue
+                # EOM cluster marker (day_of_month=31) matches any EOM day
+                if pattern.day_of_month == 31 and target_day_of_month in EOM_DAYS:
+                    score = 1.5
+                elif pattern.day_of_month == target_day_of_month:
+                    score = 1.5
                 else:
-                    continue  # Hour specified but doesn't match
+                    continue  # Day of month doesn't match
+            else:
+                # Check hour match
+                if pattern.hour_of_day is not None:
+                    if pattern.hour_of_day == target_hour:
+                        score += 2
+                    else:
+                        continue  # Hour specified but doesn't match
 
-            # Check day match
-            if pattern.day_of_week is not None:
-                if pattern.day_of_week == target_day:
-                    score += 1
-                else:
-                    continue  # Day specified but doesn't match
+                # Check day match
+                if pattern.day_of_week is not None:
+                    if pattern.day_of_week == target_day:
+                        score += 1
+                    else:
+                        continue  # Day specified but doesn't match
 
             # Weight by confidence
             weighted_score = score * pattern.confidence
@@ -1812,18 +1887,18 @@ class AnticipatoryLiquidityManager:
         if len(valid_reports) < KALMAN_MIN_REPORTERS:
             return None
 
-        # Uncertainty-weighted average (inverse variance weighting)
+        # Inverse-variance weighted average (1/sigma^2) with confidence and recency
         total_weight = 0.0
         weighted_velocity = 0.0
 
         for report in valid_reports:
-            # Weight by inverse uncertainty (lower uncertainty = higher weight)
-            # Also weight by confidence and recency
-            uncertainty = max(0.001, report.uncertainty)
+            # Weight by inverse variance (1/sigma^2): lower uncertainty = much higher weight
+            # Modulated by confidence and exponential recency decay
+            variance = max(1e-6, report.uncertainty ** 2)
             age_hours = (now - report.timestamp) / 3600
             recency_weight = math.exp(-age_hours / 6)  # Decay over 6 hours
 
-            weight = (report.confidence * recency_weight) / (uncertainty * KALMAN_UNCERTAINTY_SCALING)
+            weight = (report.confidence * recency_weight) / (variance * KALMAN_UNCERTAINTY_SCALING)
             weighted_velocity += report.velocity_pct_per_hour * weight
             total_weight += weight
 
@@ -1875,8 +1950,8 @@ class AnticipatoryLiquidityManager:
         else:
             predicted_risk = 0.1
 
-        # Combine risks
-        combined = max(base_risk, velocity_risk * 0.8, predicted_risk * 0.7)
+        # Combine risks: weighted sum so all factors contribute
+        combined = base_risk * 0.4 + velocity_risk * 0.3 + predicted_risk * 0.3
         return min(1.0, combined)
 
     def _calculate_saturation_risk(
@@ -1914,8 +1989,8 @@ class AnticipatoryLiquidityManager:
         else:
             predicted_risk = 0.1
 
-        # Combine risks
-        combined = max(base_risk, velocity_risk * 0.8, predicted_risk * 0.7)
+        # Combine risks: weighted sum so all factors contribute
+        combined = base_risk * 0.4 + velocity_risk * 0.3 + predicted_risk * 0.3
         return min(1.0, combined)
 
     def _hours_to_critical(
@@ -2129,26 +2204,50 @@ class AnticipatoryLiquidityManager:
                     if pred.saturation_risk > 0.5:
                         members_saturating.append(self._get_our_id())
 
-                # Check other members (from shared state)
-                for state in all_states:
-                    # Would need liquidity state to include predictions
-                    # For now, check if they have channels to same peer
-                    topology = getattr(state, 'topology', []) or []
-                    if peer_id in topology:
-                        # They have a channel to this peer too
-                        # Could be competing for rebalance
-                        pass
+                # Check other members using shared remote patterns
+                our_id = self._get_our_id()
+                with self._lock:
+                    remote = list(self._remote_patterns.get(peer_id, []))
+                if remote:
+                    # Aggregate remote reporter signals for this peer
+                    seen_reporters = set()
+                    now_ts = time.time()
+                    for rp in remote:
+                        reporter = rp.get("reporter_id", "")
+                        if not reporter or reporter == our_id or reporter in seen_reporters:
+                            continue
+                        # Only use recent reports (last 24 hours)
+                        if now_ts - rp.get("timestamp", 0) > 86400:
+                            continue
+                        seen_reporters.add(reporter)
+                        direction = rp.get("direction", "balanced")
+                        intensity = rp.get("intensity", 0)
+                        if direction == "outbound" and intensity >= PATTERN_STRENGTH_THRESHOLD:
+                            members_depleting.append(reporter)
+                        elif direction == "inbound" and intensity >= PATTERN_STRENGTH_THRESHOLD:
+                            members_saturating.append(reporter)
 
                 if members_depleting or members_saturating:
-                    # Determine recommended coordinator
-                    # Prefer member with most capacity to this peer
-                    coordinator = self._get_our_id()  # Default to us
+                    # Determine recommended coordinator: member with highest
+                    # available capacity (from state) or default to us
+                    coordinator = our_id
+                    best_capacity = 0
+                    for state in all_states:
+                        sid = getattr(state, 'peer_id', None)
+                        if sid and sid in (members_depleting + members_saturating):
+                            cap = getattr(state, 'available_sats', 0) or 0
+                            if cap > best_capacity:
+                                best_capacity = cap
+                                coordinator = sid
 
-                    total_demand = sum(
-                        int(p.current_local_pct * 1_000_000)  # Rough estimate
-                        for p in preds
-                        if p.depletion_risk > 0.5
-                    )
+                    # Estimate demand from velocity and prediction horizon
+                    total_demand = 0
+                    for p in preds:
+                        if p.depletion_risk > 0.5 and p.velocity_pct_per_hour < 0:
+                            # Demand = velocity * hours * capacity (rough)
+                            channel_info = self._get_channel_info(p.channel_id)
+                            cap = channel_info.get("capacity_sats", 0) if channel_info else 0
+                            total_demand += int(abs(p.velocity_pct_per_hour) * p.hours_ahead * cap)
 
                     recommendations.append(FleetAnticipation(
                         target_peer=peer_id,
@@ -2328,6 +2427,20 @@ class AnticipatoryLiquidityManager:
         if not peer_id:
             return False
 
+        hour = pattern_data.get("hour_of_day", -1)
+        day = pattern_data.get("day_of_week", -1)
+
+        entry = {
+            "reporter_id": reporter_id,
+            "hour_of_day": hour if hour >= 0 else None,
+            "day_of_week": day if day >= 0 else None,
+            "direction": pattern_data.get("direction", "balanced"),
+            "intensity": pattern_data.get("intensity", 0),
+            "confidence": pattern_data.get("confidence", 0),
+            "samples": pattern_data.get("samples", 0),
+            "timestamp": time.time()
+        }
+
         with self._lock:
             # Limit total number of tracked peers to prevent unbounded growth
             MAX_REMOTE_PEERS = 500
@@ -2344,21 +2457,6 @@ class AnticipatoryLiquidityManager:
                 if oldest_peer:
                     del self._remote_patterns[oldest_peer]
 
-        hour = pattern_data.get("hour_of_day", -1)
-        day = pattern_data.get("day_of_week", -1)
-
-        entry = {
-            "reporter_id": reporter_id,
-            "hour_of_day": hour if hour >= 0 else None,
-            "day_of_week": day if day >= 0 else None,
-            "direction": pattern_data.get("direction", "balanced"),
-            "intensity": pattern_data.get("intensity", 0),
-            "confidence": pattern_data.get("confidence", 0),
-            "samples": pattern_data.get("samples", 0),
-            "timestamp": time.time()
-        }
-
-        with self._lock:
             self._remote_patterns[peer_id].append(entry)
 
             # Keep only recent patterns per peer (last 50)
@@ -2587,20 +2685,18 @@ class AnticipatoryLiquidityManager:
 
     def get_kalman_velocity_status(self) -> Dict[str, Any]:
         """Get status of Kalman velocity integration."""
+        now = int(time.time())
         with self._lock:
             total_reports = sum(len(r) for r in self._kalman_velocities.values())
-            fresh_reports = sum(
-                sum(1 for r in reports if not r.is_stale())
-                for reports in self._kalman_velocities.values()
-            )
+            fresh_reports = 0
+            channels_with_consensus = 0
+            for reports in self._kalman_velocities.values():
+                valid = [r for r in reports if not r.is_stale() and r.confidence >= KALMAN_MIN_CONFIDENCE]
+                fresh_reports += len(valid)
+                if len(valid) >= KALMAN_MIN_REPORTERS:
+                    channels_with_consensus += 1
             channels_with_data = len(self._kalman_velocities)
-            channel_ids = list(self._kalman_velocities.keys())
             unique_peers = len(self._peer_to_channels)
-
-        channels_with_consensus = sum(
-            1 for channel_id in channel_ids
-            if self._get_kalman_consensus_velocity(channel_id) is not None
-        )
 
         return {
             "kalman_integration_active": True,
