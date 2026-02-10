@@ -752,37 +752,38 @@ class AdaptiveFeeController:
         now = time.time()
         evap_rate = self.calculate_evaporation_rate(channel_id)
 
-        # Apply time-based exponential decay (half-life model)
-        # If no timestamp exists, apply at least one cycle of decay
-        if channel_id in self._pheromone_last_update:
-            last_update = self._pheromone_last_update[channel_id]
-            hours_elapsed = (now - last_update) / 3600.0
-            if hours_elapsed > 0 and self._pheromone[channel_id] > 0:
-                # Convert per-cycle evaporation to continuous decay
-                # If evap_rate = 0.2 means 20% loss per hour, apply proportionally
-                decay_factor = math.pow(1 - evap_rate, hours_elapsed)
-                self._pheromone[channel_id] *= decay_factor
-        elif self._pheromone[channel_id] > 0:
-            # No timestamp but has pheromone - apply one cycle of decay
-            # This handles legacy data and ensures evaporation on failure
-            self._pheromone[channel_id] *= (1 - evap_rate)
+        with self._lock:
+            # Apply time-based exponential decay (half-life model)
+            # If no timestamp exists, apply at least one cycle of decay
+            if channel_id in self._pheromone_last_update:
+                last_update = self._pheromone_last_update[channel_id]
+                hours_elapsed = (now - last_update) / 3600.0
+                if hours_elapsed > 0 and self._pheromone[channel_id] > 0:
+                    # Convert per-cycle evaporation to continuous decay
+                    # If evap_rate = 0.2 means 20% loss per hour, apply proportionally
+                    decay_factor = math.pow(1 - evap_rate, hours_elapsed)
+                    self._pheromone[channel_id] *= decay_factor
+            elif self._pheromone[channel_id] > 0:
+                # No timestamp but has pheromone - apply one cycle of decay
+                # This handles legacy data and ensures evaporation on failure
+                self._pheromone[channel_id] *= (1 - evap_rate)
 
-        # Update timestamp
-        self._pheromone_last_update[channel_id] = now
+            # Update timestamp
+            self._pheromone_last_update[channel_id] = now
 
-        if routing_success:
-            # Deposit proportional to revenue
-            deposit = revenue_sats * PHEROMONE_DEPOSIT_SCALE
-            self._pheromone[channel_id] += deposit
+            if routing_success:
+                # Deposit proportional to revenue
+                deposit = revenue_sats * PHEROMONE_DEPOSIT_SCALE
+                self._pheromone[channel_id] += deposit
 
-            # Track the fee that earned this pheromone
-            self._pheromone_fee[channel_id] = current_fee
+                # Track the fee that earned this pheromone
+                self._pheromone_fee[channel_id] = current_fee
 
-            self._log(
-                f"Channel {channel_id[:8]}: pheromone deposit {deposit:.2f}, "
-                f"total now {self._pheromone[channel_id]:.2f}",
-                level="debug"
-            )
+                self._log(
+                    f"Channel {channel_id[:8]}: pheromone deposit {deposit:.2f}, "
+                    f"total now {self._pheromone[channel_id]:.2f}",
+                    level="debug"
+                )
 
     def suggest_fee(
         self,
@@ -795,7 +796,8 @@ class AdaptiveFeeController:
 
         Returns (suggested_fee, reason)
         """
-        pheromone = self._pheromone.get(channel_id, 0)
+        with self._lock:
+            pheromone = self._pheromone.get(channel_id, 0)
 
         if pheromone > PHEROMONE_EXPLOIT_THRESHOLD:
             # Strong signal - exploit current fee
@@ -816,11 +818,13 @@ class AdaptiveFeeController:
 
     def get_pheromone_level(self, channel_id: str) -> float:
         """Get current pheromone level for a channel."""
-        return self._pheromone.get(channel_id, 0.0)
+        with self._lock:
+            return self._pheromone.get(channel_id, 0.0)
 
     def get_all_pheromone_levels(self) -> Dict[str, float]:
         """Get all pheromone levels."""
-        return dict(self._pheromone)
+        with self._lock:
+            return dict(self._pheromone)
 
     def set_channel_peer_mapping(self, channel_id: str, peer_id: str) -> None:
         """
@@ -937,6 +941,10 @@ class AdaptiveFeeController:
         if level <= 0 or fee_ppm <= 0:
             return False
 
+        # Bound values to prevent manipulation via gossip
+        fee_ppm = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, fee_ppm))
+        level = max(0.0, min(100.0, level))
+
         # Store remote pheromone, keyed by the external peer
         entry = {
             "reporter_id": reporter_id,
@@ -979,7 +987,8 @@ class AdaptiveFeeController:
         Returns:
             Tuple of (suggested_fee_ppm, confidence) or None if no data
         """
-        reports = self._remote_pheromones.get(peer_id, [])
+        with self._lock:
+            reports = list(self._remote_pheromones.get(peer_id, []))
         if not reports:
             return None
 
@@ -1133,7 +1142,7 @@ class StigmergicCoordinator:
             success=success,
             volume_sats=volume_sats,
             timestamp=time.time(),
-            strength=max(0.1, volume_sats / 100_000)  # Larger payments = stronger signal, min floor preserves signal
+            strength=max(0.1, min(1.0, volume_sats / 100_000))  # Capped to [0.1, 1.0] like gossip markers
         )
 
         key = (source, destination)
@@ -1219,12 +1228,14 @@ class StigmergicCoordinator:
         failed = [m for m in markers if not m.success]
 
         if successful:
-            # Find strongest successful marker
-            best = max(successful, key=lambda m: m.strength)
-
-            # Don't undercut successful fleet member
-            recommended = max(FLEET_FEE_FLOOR_PPM, best.fee_ppm)
-            confidence = min(0.9, 0.5 + best.strength * 0.1)
+            # Strength-weighted average of successful markers
+            total_weight = sum(m.strength for m in successful)
+            if total_weight > 0:
+                weighted_fee = sum(m.fee_ppm * m.strength for m in successful) / total_weight
+                recommended = max(FLEET_FEE_FLOOR_PPM, int(weighted_fee))
+            else:
+                recommended = max(FLEET_FEE_FLOOR_PPM, default_fee)
+            confidence = min(0.9, 0.5 + (total_weight / len(successful)) * 0.1)
 
             return recommended, confidence
 
@@ -1561,16 +1572,17 @@ class MyceliumDefenseSystem:
 
     def get_defensive_multiplier(self, peer_id: str) -> float:
         """Get current defensive fee multiplier for a peer."""
-        defense = self._defensive_fees.get(peer_id)
-        if not defense:
-            return 1.0
+        with self._lock:
+            defense = self._defensive_fees.get(peer_id)
+            if not defense:
+                return 1.0
 
-        # Check if expired
-        if time.time() > defense["expires_at"]:
-            del self._defensive_fees[peer_id]
-            return 1.0
+            # Check if expired
+            if time.time() > defense["expires_at"]:
+                del self._defensive_fees[peer_id]
+                return 1.0
 
-        return defense["multiplier"]
+            return defense["multiplier"]
 
     def check_warning_expiration(self) -> List[str]:
         """
@@ -2234,6 +2246,9 @@ class FeeCoordinationManager:
         # Salience detection: Track last fee change times per channel
         self._fee_change_times: Dict[str, float] = {}
 
+        # Optional reference to FeeIntelligenceManager for cross-system blending
+        self.fee_intelligence_mgr = None
+
     def set_our_pubkey(self, pubkey: str) -> None:
         self.our_pubkey = pubkey
         self.corridor_mgr.set_our_pubkey(pubkey)
@@ -2245,6 +2260,10 @@ class FeeCoordinationManager:
     def set_anticipatory_manager(self, mgr: Any) -> None:
         """Set or update the anticipatory liquidity manager for time-based fees."""
         self.time_adjuster.set_anticipatory_manager(mgr)
+
+    def set_fee_intelligence_mgr(self, mgr: Any) -> None:
+        """Set reference to FeeIntelligenceManager for cross-system blending."""
+        self.fee_intelligence_mgr = mgr
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -2354,6 +2373,25 @@ class FeeCoordinationManager:
             recommended_fee = adaptive_fee
             reasons.append(adaptive_reason)
 
+        # 2b. Incorporate fee intelligence if available
+        if self.fee_intelligence_mgr:
+            try:
+                intel = self.fee_intelligence_mgr.get_fee_recommendation(
+                    target_peer_id=peer_id,
+                    our_health=50
+                )
+                if intel.get("confidence", 0) > 0.3:
+                    intel_fee = intel["recommended_fee_ppm"]
+                    # Blend: weight scales with intelligence confidence (max 30%)
+                    blend_weight = min(0.3, intel["confidence"] * 0.4)
+                    recommended_fee = int(
+                        recommended_fee * (1 - blend_weight) +
+                        intel_fee * blend_weight
+                    )
+                    reasons.append(f"intelligence_{intel['confidence']:.2f}")
+            except Exception:
+                pass  # Intelligence unavailable, continue without it
+
         # 3. Check stigmergic markers
         if source_hint and destination_hint:
             stig_fee, stig_confidence = self.stigmergic_coord.calculate_coordinated_fee(
@@ -2430,6 +2468,9 @@ class FeeCoordinationManager:
         if not is_salient:
             recommended_fee = current_fee
             reasons.append(f"not_salient:{salience_reason}")
+        elif recommended_fee != current_fee:
+            # Salient change — record so cooldown activates for next check
+            self.record_fee_change(channel_id)
 
         return FeeRecommendation(
             channel_id=channel_id,

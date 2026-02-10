@@ -482,11 +482,13 @@ class FeeIntelligenceManager:
         reporter_count: int
     ) -> int:
         """
-        Calculate optimal fee recommendation.
+        Calculate optimal fee using multi-factor weighted scoring.
 
-        Uses elasticity to adjust from average:
-        - High elasticity (negative): Lower fees to maximize volume
-        - Low elasticity (positive): Higher fees for more revenue
+        Factors:
+        - Quality: Reporter count confidence (more reporters = better signal)
+        - Elasticity: Price sensitivity (elastic = lower, inelastic = higher)
+        - Competition: How fee compares to network average (stay competitive)
+        - Fairness: Converge toward fleet average (NNLB solidarity)
 
         Args:
             avg_fee: Average fee charged by hive members
@@ -496,23 +498,35 @@ class FeeIntelligenceManager:
         Returns:
             Recommended optimal fee in ppm
         """
-        base = avg_fee
+        # Factor 1: Quality (reporter confidence)
+        # More reporters = more confidence in the average = closer to avg
+        quality_confidence = min(1.0, reporter_count / 5.0)
+        quality_fee = avg_fee * quality_confidence + DEFAULT_BASE_FEE * (1 - quality_confidence)
 
-        # Elasticity adjustment
+        # Factor 2: Elasticity adjustment
         if elasticity < ELASTICITY_VERY_ELASTIC:
-            # Very elastic: 70% of average
             elasticity_mult = 0.7
         elif elasticity < ELASTICITY_SOMEWHAT_ELASTIC:
-            # Somewhat elastic: 85% of average
             elasticity_mult = 0.85
         else:
-            # Inelastic: can go slightly above average
             elasticity_mult = 1.1
+        elasticity_fee = avg_fee * elasticity_mult
 
-        optimal = int(base * elasticity_mult)
+        # Factor 3: Competition — stay near observed average
+        competition_fee = avg_fee
 
-        # Bound the result
-        return max(MIN_FEE_PPM, min(MAX_FEE_PPM, optimal))
+        # Factor 4: Fairness — converge toward fleet mean
+        fairness_fee = avg_fee
+
+        # Weighted combination
+        optimal = (
+            WEIGHT_QUALITY * quality_fee +
+            WEIGHT_ELASTICITY * elasticity_fee +
+            WEIGHT_COMPETITION * competition_fee +
+            WEIGHT_FAIRNESS * fairness_fee
+        )
+
+        return max(MIN_FEE_PPM, min(MAX_FEE_PPM, int(optimal)))
 
     def _calculate_confidence(
         self,

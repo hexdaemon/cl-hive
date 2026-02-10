@@ -1442,6 +1442,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         gossip_mgr=gossip_mgr
     )
     fee_coordination_mgr.set_our_pubkey(our_pubkey)
+    fee_coordination_mgr.set_fee_intelligence_mgr(fee_intel_mgr)
     plugin.log("cl-hive: Fee coordination manager initialized (Phase 2)")
 
     # Initialize Cost Reduction Manager (Phase 3 - Cost Reduction)
@@ -8966,6 +8967,25 @@ def fee_intelligence_loop():
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Local pheromone evaporation error: {e}", level='warn')
 
+            # Step 10b: Update velocity cache for adaptive evaporation
+            try:
+                if fee_coordination_mgr:
+                    funds = safe_plugin.rpc.listfunds()
+                    for ch in funds.get("channels", []):
+                        scid = ch.get("short_channel_id")
+                        if not scid or ch.get("state") != "CHANNELD_NORMAL":
+                            continue
+                        amount_msat = ch.get("amount_msat", 0)
+                        our_msat = ch.get("our_amount_msat", 0)
+                        capacity = amount_msat if amount_msat > 0 else 1
+                        balance_pct = our_msat / capacity
+                        # Use balance deviation from 50% as proxy for velocity
+                        # Channels far from 50% are experiencing directional flow
+                        velocity = (balance_pct - 0.5) * 2  # -1 to +1 range
+                        fee_coordination_mgr.adaptive_controller.update_velocity(scid, velocity)
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Velocity cache update error: {e}", level='debug')
+
             # Step 11: Cleanup old remote yield metrics (Phase 14)
             try:
                 if yield_metrics_mgr:
@@ -9850,6 +9870,19 @@ def _broadcast_our_fee_intelligence():
         members = database.get_all_members()
         member_ids = {m.get("peer_id") for m in members}
 
+        # Build fee map from listpeerchannels for actual fee rates
+        try:
+            peer_channels = safe_plugin.rpc.listpeerchannels()
+            fee_map = {}
+            for pc in peer_channels.get("channels", []):
+                scid = pc.get("short_channel_id")
+                updates = pc.get("updates", {})
+                local = updates.get("local", {})
+                if scid and local:
+                    fee_map[scid] = local.get("fee_proportional_millionths", 100)
+        except Exception:
+            fee_map = {}
+
         # Get forwarding stats if available
         try:
             forwards = safe_plugin.rpc.listforwards(status="settled")
@@ -9918,8 +9951,8 @@ def _broadcast_our_fee_intelligence():
             forward_volume_sats = stats.get("volume_msat", 0) // 1000
             revenue_sats = stats.get("fee_msat", 0) // 1000
 
-            # Get our fee rate for this channel (simplified - would need listpeerchannels)
-            our_fee_ppm = 100  # Default, would query actual fee
+            # Get actual fee rate for this channel from listpeerchannels data
+            our_fee_ppm = fee_map.get(short_channel_id, 100)
 
             # Add peer data to snapshot list
             peers_data.append({

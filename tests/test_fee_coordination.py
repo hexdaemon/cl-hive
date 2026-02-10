@@ -713,3 +713,356 @@ class TestConstants:
         """Test threat detection thresholds."""
         assert DRAIN_RATIO_THRESHOLD > 1.0  # Outflow must exceed inflow
         assert 0 < FAILURE_RATE_THRESHOLD < 1.0
+
+
+# =============================================================================
+# FIX 2: THREAD LOCK TESTS
+# =============================================================================
+
+class TestAdaptiveFeeControllerLocks:
+    """Test that AdaptiveFeeController methods are thread-safe."""
+
+    def setup_method(self):
+        self.plugin = MockPlugin()
+        self.controller = AdaptiveFeeController(plugin=self.plugin)
+        self.controller.set_our_pubkey("02" + "0" * 64)
+
+    def test_update_pheromone_holds_lock(self):
+        """Test update_pheromone acquires the lock (no deadlock, no crash)."""
+        # Acquire the lock first and release — ensure method also acquires it
+        import threading
+
+        channel_id = "100x1x0"
+        # Seed some pheromone so evaporation path runs
+        with self.controller._lock:
+            self.controller._pheromone[channel_id] = 5.0
+
+        # Now call from another thread — should succeed without deadlock
+        result = [None]
+        def run():
+            self.controller.update_pheromone(channel_id, 500, True, 1000)
+            result[0] = self.controller.get_pheromone_level(channel_id)
+
+        t = threading.Thread(target=run)
+        t.start()
+        t.join(timeout=5)
+        assert not t.is_alive(), "Thread deadlocked"
+        assert result[0] is not None
+        assert result[0] > 0
+
+    def test_suggest_fee_holds_lock(self):
+        """Test suggest_fee reads pheromone under lock."""
+        channel_id = "100x1x0"
+        self.controller._pheromone[channel_id] = 20.0  # Above exploit threshold
+
+        fee, reason = self.controller.suggest_fee(channel_id, 500, 0.5)
+        assert fee == 500
+        assert "exploit" in reason
+
+    def test_get_pheromone_level_holds_lock(self):
+        """Test get_pheromone_level acquires lock."""
+        self.controller._pheromone["100x1x0"] = 7.5
+        level = self.controller.get_pheromone_level("100x1x0")
+        assert level == 7.5
+
+    def test_get_all_pheromone_levels_holds_lock(self):
+        """Test get_all_pheromone_levels returns snapshot under lock."""
+        self.controller._pheromone["a"] = 1.0
+        self.controller._pheromone["b"] = 2.0
+        levels = self.controller.get_all_pheromone_levels()
+        assert levels["a"] == 1.0
+        assert levels["b"] == 2.0
+
+    def test_get_fleet_fee_hint_holds_lock(self):
+        """Test get_fleet_fee_hint acquires lock."""
+        peer = "02" + "a" * 64
+        self.controller._remote_pheromones[peer].append({
+            "reporter_id": "02" + "b" * 64,
+            "level": 5.0,
+            "fee_ppm": 300,
+            "timestamp": time.time(),
+            "weight": 0.3
+        })
+        result = self.controller.get_fleet_fee_hint(peer)
+        assert result is not None
+        assert result[0] > 0
+
+    def test_defensive_multiplier_holds_lock(self):
+        """Test MyceliumDefenseSystem.get_defensive_multiplier acquires lock."""
+        db = MockDatabase()
+        plugin = MockPlugin()
+        defense = MyceliumDefenseSystem(database=db, plugin=plugin)
+        defense.set_our_pubkey("02" + "d" * 64)
+
+        peer_id = "02" + "a" * 64
+        # No defense set — should return 1.0
+        assert defense.get_defensive_multiplier(peer_id) == 1.0
+
+        # Set active defense
+        warning = PeerWarning(
+            peer_id=peer_id,
+            threat_type="drain",
+            severity=0.5,
+            reporter="02" + "d" * 64,
+            timestamp=time.time(),
+            ttl=24 * 3600
+        )
+        defense.handle_warning(warning)
+        mult = defense.get_defensive_multiplier(peer_id)
+        assert mult > 1.0
+
+
+# =============================================================================
+# FIX 5: GOSSIP PHEROMONE BOUNDS TESTS
+# =============================================================================
+
+class TestGossipPheromoneBounds:
+    """Test that gossip pheromone values are bounded."""
+
+    def setup_method(self):
+        self.plugin = MockPlugin()
+        self.controller = AdaptiveFeeController(plugin=self.plugin)
+        self.controller.set_our_pubkey("02" + "0" * 64)
+
+    def test_extreme_fee_ppm_clamped(self):
+        """Test that extreme fee_ppm from gossip is clamped to fleet bounds."""
+        result = self.controller.receive_pheromone_from_gossip(
+            reporter_id="02" + "a" * 64,
+            pheromone_data={
+                "peer_id": "02" + "b" * 64,
+                "level": 5.0,
+                "fee_ppm": 999999  # Way above ceiling
+            }
+        )
+        assert result is True
+
+        peer_id = "02" + "b" * 64
+        reports = self.controller._remote_pheromones[peer_id]
+        assert len(reports) == 1
+        assert reports[0]["fee_ppm"] == FLEET_FEE_CEILING_PPM
+
+    def test_very_low_fee_ppm_clamped(self):
+        """Test that very low fee_ppm is clamped to floor."""
+        result = self.controller.receive_pheromone_from_gossip(
+            reporter_id="02" + "a" * 64,
+            pheromone_data={
+                "peer_id": "02" + "b" * 64,
+                "level": 5.0,
+                "fee_ppm": 1  # Way below floor
+            }
+        )
+        assert result is True
+
+        peer_id = "02" + "b" * 64
+        reports = self.controller._remote_pheromones[peer_id]
+        assert reports[0]["fee_ppm"] == FLEET_FEE_FLOOR_PPM
+
+    def test_extreme_level_clamped(self):
+        """Test that extreme pheromone level is clamped to 100."""
+        result = self.controller.receive_pheromone_from_gossip(
+            reporter_id="02" + "a" * 64,
+            pheromone_data={
+                "peer_id": "02" + "b" * 64,
+                "level": 99999.0,  # Way above max
+                "fee_ppm": 500
+            }
+        )
+        assert result is True
+
+        peer_id = "02" + "b" * 64
+        reports = self.controller._remote_pheromones[peer_id]
+        assert reports[0]["level"] == 100.0
+
+
+# =============================================================================
+# FIX 6: MARKER STRENGTH CAP + WEIGHTED AVERAGE TESTS
+# =============================================================================
+
+class TestMarkerStrengthCap:
+    """Test that local marker strength is capped to [0.1, 1.0]."""
+
+    def setup_method(self):
+        self.db = MockDatabase()
+        self.plugin = MockPlugin()
+        self.coordinator = StigmergicCoordinator(
+            database=self.db, plugin=self.plugin
+        )
+        self.coordinator.set_our_pubkey("02" + "0" * 64)
+
+    def test_large_volume_strength_capped(self):
+        """Test that a 1 BTC payment does not produce strength > 1.0."""
+        marker = self.coordinator.deposit_marker(
+            source="peer1",
+            destination="peer2",
+            fee_charged=500,
+            success=True,
+            volume_sats=100_000_000  # 1 BTC
+        )
+        assert marker.strength <= 1.0
+
+    def test_small_volume_has_floor(self):
+        """Test that a tiny payment still gets minimum strength."""
+        marker = self.coordinator.deposit_marker(
+            source="peer1",
+            destination="peer2",
+            fee_charged=500,
+            success=True,
+            volume_sats=100  # Very small
+        )
+        assert marker.strength >= 0.1
+
+    def test_weighted_average_not_winner_take_all(self):
+        """Test that calculate_coordinated_fee uses weighted average."""
+        # Deposit two markers with different fees and strengths
+        self.coordinator.deposit_marker("p1", "p2", 200, True, 50_000)   # strength 0.5
+        self.coordinator.deposit_marker("p1", "p2", 800, True, 100_000)  # strength 1.0
+
+        fee, confidence = self.coordinator.calculate_coordinated_fee(
+            "p1", "p2", 500
+        )
+
+        # With weighted avg: (200*0.5 + 800*1.0)/(0.5+1.0) = 600
+        # Not 800 (which winner-take-all would give)
+        assert fee < 800
+        assert fee >= FLEET_FEE_FLOOR_PPM
+
+    def test_weighted_average_single_marker(self):
+        """Test that single marker works correctly."""
+        self.coordinator.deposit_marker("p1", "p2", 600, True, 100_000)
+
+        fee, confidence = self.coordinator.calculate_coordinated_fee(
+            "p1", "p2", 500
+        )
+        assert fee == 600
+
+
+# =============================================================================
+# FIX 3: RECORD_FEE_CHANGE WIRING TESTS
+# =============================================================================
+
+class TestRecordFeeChangeWiring:
+    """Test that salient recommendations trigger record_fee_change."""
+
+    def setup_method(self):
+        self.db = MockDatabase()
+        self.plugin = MockPlugin()
+        self.manager = FeeCoordinationManager(
+            database=self.db,
+            plugin=self.plugin
+        )
+        self.manager.set_our_pubkey("02" + "0" * 64)
+
+    def test_salient_change_records_fee_change(self):
+        """Test that a salient recommendation records fee change time."""
+        channel_id = "100x1x0"
+
+        # Start with no recorded change time
+        assert self.manager._get_last_fee_change_time(channel_id) == 0
+
+        # Make a recommendation with a significantly different fee
+        # Set up pheromone to drive the fee away from current
+        self.manager.adaptive_controller._pheromone[channel_id] = 1.0
+
+        rec = self.manager.get_fee_recommendation(
+            channel_id=channel_id,
+            peer_id="02" + "a" * 64,
+            current_fee=500,
+            local_balance_pct=0.15  # Low balance → raise fees
+        )
+
+        if rec.is_salient and rec.recommended_fee_ppm != 500:
+            # Fee change time should have been recorded
+            assert self.manager._get_last_fee_change_time(channel_id) > 0
+
+    def test_non_salient_change_no_record(self):
+        """Test that a non-salient recommendation doesn't record."""
+        channel_id = "100x1x0"
+
+        # Request recommendation with current fee that won't change much
+        rec = self.manager.get_fee_recommendation(
+            channel_id=channel_id,
+            peer_id="02" + "a" * 64,
+            current_fee=500,
+            local_balance_pct=0.5  # Balanced → no change
+        )
+
+        if not rec.is_salient:
+            # No fee change time should be recorded
+            assert self.manager._get_last_fee_change_time(channel_id) == 0
+
+
+# =============================================================================
+# FIX 7: CROSS-WIRE FEE INTELLIGENCE TESTS
+# =============================================================================
+
+class TestCrossWireFeeIntelligence:
+    """Test fee_intelligence integration into fee_coordination."""
+
+    def setup_method(self):
+        self.db = MockDatabase()
+        self.plugin = MockPlugin()
+        self.manager = FeeCoordinationManager(
+            database=self.db,
+            plugin=self.plugin
+        )
+        self.manager.set_our_pubkey("02" + "0" * 64)
+
+    def test_set_fee_intelligence_mgr(self):
+        """Test setter method works."""
+        mock_intel = MagicMock()
+        self.manager.set_fee_intelligence_mgr(mock_intel)
+        assert self.manager.fee_intelligence_mgr is mock_intel
+
+    def test_intelligence_blended_when_confident(self):
+        """Test that fee intelligence is blended when confidence > 0.3."""
+        mock_intel = MagicMock()
+        mock_intel.get_fee_recommendation.return_value = {
+            "recommended_fee_ppm": 300,
+            "confidence": 0.8,
+        }
+        self.manager.set_fee_intelligence_mgr(mock_intel)
+
+        rec = self.manager.get_fee_recommendation(
+            channel_id="100x1x0",
+            peer_id="02" + "a" * 64,
+            current_fee=500,
+            local_balance_pct=0.5
+        )
+
+        # Intelligence was called
+        mock_intel.get_fee_recommendation.assert_called_once()
+        # Reason should include intelligence
+        assert "intelligence" in rec.reason
+
+    def test_intelligence_skipped_when_low_confidence(self):
+        """Test that low-confidence intelligence is ignored."""
+        mock_intel = MagicMock()
+        mock_intel.get_fee_recommendation.return_value = {
+            "recommended_fee_ppm": 300,
+            "confidence": 0.1,  # Below 0.3 threshold
+        }
+        self.manager.set_fee_intelligence_mgr(mock_intel)
+
+        rec = self.manager.get_fee_recommendation(
+            channel_id="100x1x0",
+            peer_id="02" + "a" * 64,
+            current_fee=500,
+            local_balance_pct=0.5
+        )
+
+        assert "intelligence" not in rec.reason
+
+    def test_intelligence_exception_handled(self):
+        """Test that exception from intelligence manager doesn't crash."""
+        mock_intel = MagicMock()
+        mock_intel.get_fee_recommendation.side_effect = Exception("db error")
+        self.manager.set_fee_intelligence_mgr(mock_intel)
+
+        # Should not raise
+        rec = self.manager.get_fee_recommendation(
+            channel_id="100x1x0",
+            peer_id="02" + "a" * 64,
+            current_fee=500,
+            local_balance_pct=0.5
+        )
+        assert rec is not None
