@@ -1629,22 +1629,25 @@ def on_peer_connected(peer: dict, plugin: Plugin, **kwargs):
         # Peer is known, but we're not a member - this shouldn't happen normally
         return {"result": "continue"}
 
-    # Send HIVE_HELLO to discover if peer is a hive member
-    try:
-        from modules.protocol import create_hello
-        hello_msg = create_hello(local_pubkey)
-        if hello_msg is None:
-            plugin.log("cl-hive: HELLO message too large, skipping autodiscovery", level='warning')
-            return {"result": "continue"}
+    # Send HIVE_HELLO in a background thread to avoid blocking the I/O thread
+    # on RPC_LOCK (same deadlock risk as custommsg handlers).
+    def _send_autodiscovery_hello():
+        try:
+            from modules.protocol import create_hello
+            hello_msg = create_hello(local_pubkey)
+            if hello_msg is None:
+                plugin.log("cl-hive: HELLO message too large, skipping autodiscovery", level='warning')
+                return
 
-        safe_plugin.rpc.call("sendcustommsg", {
-            "node_id": peer_id,
-            "msg": hello_msg.hex()
-        })
-        plugin.log(f"cl-hive: Sent HELLO to {peer_id[:16]}... (autodiscovery)")
-    except Exception as e:
-        plugin.log(f"cl-hive: Failed to send autodiscovery HELLO: {e}", level='debug')
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": peer_id,
+                "msg": hello_msg.hex()
+            })
+            plugin.log(f"cl-hive: Sent HELLO to {peer_id[:16]}... (autodiscovery)")
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to send autodiscovery HELLO: {e}", level='debug')
 
+    threading.Thread(target=_send_autodiscovery_hello, daemon=True).start()
     return {"result": "continue"}
 
 
@@ -1713,138 +1716,149 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
         if member:
             database.update_member(peer_id, last_seen=int(time.time()))
 
-    # Dispatch based on message type
+    # Dispatch to a background thread so the hook returns immediately.
+    # Handlers make RPC calls (checkmessage, sendcustommsg, etc.) that acquire
+    # RPC_LOCK. Running them on the I/O thread causes a deadlock when a
+    # background thread already holds the lock and is waiting for a CLN response
+    # that CLN can't deliver until this hook returns.
+    threading.Thread(
+        target=_dispatch_hive_message,
+        args=(peer_id, msg_type, msg_payload, plugin),
+        daemon=True,
+    ).start()
+    return {"result": "continue"}
+
+
+def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Plugin):
+    """Process a validated Hive message on a background thread."""
     try:
         if msg_type == HiveMessageType.HELLO:
-            return handle_hello(peer_id, msg_payload, plugin)
+            handle_hello(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.CHALLENGE:
-            return handle_challenge(peer_id, msg_payload, plugin)
+            handle_challenge(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.ATTEST:
-            return handle_attest(peer_id, msg_payload, plugin)
+            handle_attest(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.WELCOME:
-            return handle_welcome(peer_id, msg_payload, plugin)
+            handle_welcome(peer_id, msg_payload, plugin)
         # Phase 2: State Management
         elif msg_type == HiveMessageType.GOSSIP:
-            return handle_gossip(peer_id, msg_payload, plugin)
+            handle_gossip(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.STATE_HASH:
-            return handle_state_hash(peer_id, msg_payload, plugin)
+            handle_state_hash(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.FULL_SYNC:
-            return handle_full_sync(peer_id, msg_payload, plugin)
+            handle_full_sync(peer_id, msg_payload, plugin)
         # Phase 3: Intent Lock Protocol
         elif msg_type == HiveMessageType.INTENT:
-            return handle_intent(peer_id, msg_payload, plugin)
+            handle_intent(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.INTENT_ABORT:
-            return handle_intent_abort(peer_id, msg_payload, plugin)
+            handle_intent_abort(peer_id, msg_payload, plugin)
         # Phase 5: Membership Promotion
         elif msg_type == HiveMessageType.PROMOTION_REQUEST:
-            return handle_promotion_request(peer_id, msg_payload, plugin)
+            handle_promotion_request(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.VOUCH:
-            return handle_vouch(peer_id, msg_payload, plugin)
+            handle_vouch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.PROMOTION:
-            return handle_promotion(peer_id, msg_payload, plugin)
+            handle_promotion(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.MEMBER_LEFT:
-            return handle_member_left(peer_id, msg_payload, plugin)
+            handle_member_left(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.BAN_PROPOSAL:
-            return handle_ban_proposal(peer_id, msg_payload, plugin)
+            handle_ban_proposal(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.BAN_VOTE:
-            return handle_ban_vote(peer_id, msg_payload, plugin)
+            handle_ban_vote(peer_id, msg_payload, plugin)
         # Phase 6: Channel Coordination
         elif msg_type == HiveMessageType.PEER_AVAILABLE:
-            return handle_peer_available(peer_id, msg_payload, plugin)
+            handle_peer_available(peer_id, msg_payload, plugin)
         # Phase 6.4: Cooperative Expansion
         elif msg_type == HiveMessageType.EXPANSION_NOMINATE:
-            return handle_expansion_nominate(peer_id, msg_payload, plugin)
+            handle_expansion_nominate(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.EXPANSION_ELECT:
-            return handle_expansion_elect(peer_id, msg_payload, plugin)
+            handle_expansion_elect(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.EXPANSION_DECLINE:
-            return handle_expansion_decline(peer_id, msg_payload, plugin)
+            handle_expansion_decline(peer_id, msg_payload, plugin)
         # Phase 7: Cooperative Fee Coordination
         elif msg_type == HiveMessageType.FEE_INTELLIGENCE_SNAPSHOT:
-            return handle_fee_intelligence_snapshot(peer_id, msg_payload, plugin)
+            handle_fee_intelligence_snapshot(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.HEALTH_REPORT:
-            return handle_health_report(peer_id, msg_payload, plugin)
+            handle_health_report(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.LIQUIDITY_NEED:
-            return handle_liquidity_need(peer_id, msg_payload, plugin)
+            handle_liquidity_need(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.LIQUIDITY_SNAPSHOT:
-            return handle_liquidity_snapshot(peer_id, msg_payload, plugin)
+            handle_liquidity_snapshot(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.ROUTE_PROBE:
-            return handle_route_probe(peer_id, msg_payload, plugin)
+            handle_route_probe(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.ROUTE_PROBE_BATCH:
-            return handle_route_probe_batch(peer_id, msg_payload, plugin)
+            handle_route_probe_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.PEER_REPUTATION_SNAPSHOT:
-            return handle_peer_reputation_snapshot(peer_id, msg_payload, plugin)
+            handle_peer_reputation_snapshot(peer_id, msg_payload, plugin)
         # Phase 13: Stigmergic Marker Sharing
         elif msg_type == HiveMessageType.STIGMERGIC_MARKER_BATCH:
-            return handle_stigmergic_marker_batch(peer_id, msg_payload, plugin)
+            handle_stigmergic_marker_batch(peer_id, msg_payload, plugin)
         # Phase 13: Pheromone Sharing
         elif msg_type == HiveMessageType.PHEROMONE_BATCH:
-            return handle_pheromone_batch(peer_id, msg_payload, plugin)
+            handle_pheromone_batch(peer_id, msg_payload, plugin)
         # Phase 14: Fleet-Wide Intelligence Sharing
         elif msg_type == HiveMessageType.YIELD_METRICS_BATCH:
-            return handle_yield_metrics_batch(peer_id, msg_payload, plugin)
+            handle_yield_metrics_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.CIRCULAR_FLOW_ALERT:
-            return handle_circular_flow_alert(peer_id, msg_payload, plugin)
+            handle_circular_flow_alert(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.TEMPORAL_PATTERN_BATCH:
-            return handle_temporal_pattern_batch(peer_id, msg_payload, plugin)
+            handle_temporal_pattern_batch(peer_id, msg_payload, plugin)
         # Phase 14.2: Strategic Positioning & Rationalization
         elif msg_type == HiveMessageType.CORRIDOR_VALUE_BATCH:
-            return handle_corridor_value_batch(peer_id, msg_payload, plugin)
+            handle_corridor_value_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.POSITIONING_PROPOSAL:
-            return handle_positioning_proposal(peer_id, msg_payload, plugin)
+            handle_positioning_proposal(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.PHYSARUM_RECOMMENDATION:
-            return handle_physarum_recommendation(peer_id, msg_payload, plugin)
+            handle_physarum_recommendation(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.COVERAGE_ANALYSIS_BATCH:
-            return handle_coverage_analysis_batch(peer_id, msg_payload, plugin)
+            handle_coverage_analysis_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.CLOSE_PROPOSAL:
-            return handle_close_proposal(peer_id, msg_payload, plugin)
+            handle_close_proposal(peer_id, msg_payload, plugin)
         # Phase 9: Settlement
         elif msg_type == HiveMessageType.SETTLEMENT_OFFER:
-            return handle_settlement_offer(peer_id, msg_payload, plugin)
+            handle_settlement_offer(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.FEE_REPORT:
-            return handle_fee_report(peer_id, msg_payload, plugin)
+            handle_fee_report(peer_id, msg_payload, plugin)
         # Phase 12: Distributed Settlement
         elif msg_type == HiveMessageType.SETTLEMENT_PROPOSE:
-            return handle_settlement_propose(peer_id, msg_payload, plugin)
+            handle_settlement_propose(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.SETTLEMENT_READY:
-            return handle_settlement_ready(peer_id, msg_payload, plugin)
+            handle_settlement_ready(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.SETTLEMENT_EXECUTED:
-            return handle_settlement_executed(peer_id, msg_payload, plugin)
+            handle_settlement_executed(peer_id, msg_payload, plugin)
         # Phase 10: Task Delegation
         elif msg_type == HiveMessageType.TASK_REQUEST:
-            return handle_task_request(peer_id, msg_payload, plugin)
+            handle_task_request(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.TASK_RESPONSE:
-            return handle_task_response(peer_id, msg_payload, plugin)
+            handle_task_response(peer_id, msg_payload, plugin)
         # Phase 11: Hive-Splice Coordination
         elif msg_type == HiveMessageType.SPLICE_INIT_REQUEST:
-            return handle_splice_init_request(peer_id, msg_payload, plugin)
+            handle_splice_init_request(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.SPLICE_INIT_RESPONSE:
-            return handle_splice_init_response(peer_id, msg_payload, plugin)
+            handle_splice_init_response(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.SPLICE_UPDATE:
-            return handle_splice_update(peer_id, msg_payload, plugin)
+            handle_splice_update(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.SPLICE_SIGNED:
-            return handle_splice_signed(peer_id, msg_payload, plugin)
+            handle_splice_signed(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.SPLICE_ABORT:
-            return handle_splice_abort(peer_id, msg_payload, plugin)
+            handle_splice_abort(peer_id, msg_payload, plugin)
         # Phase 15: MCF (Min-Cost Max-Flow) Optimization
         elif msg_type == HiveMessageType.MCF_NEEDS_BATCH:
-            return handle_mcf_needs_batch(peer_id, msg_payload, plugin)
+            handle_mcf_needs_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.MCF_SOLUTION_BROADCAST:
-            return handle_mcf_solution_broadcast(peer_id, msg_payload, plugin)
+            handle_mcf_solution_broadcast(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.MCF_ASSIGNMENT_ACK:
-            return handle_mcf_assignment_ack(peer_id, msg_payload, plugin)
+            handle_mcf_assignment_ack(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.MCF_COMPLETION_REPORT:
-            return handle_mcf_completion_report(peer_id, msg_payload, plugin)
+            handle_mcf_completion_report(peer_id, msg_payload, plugin)
         # Phase D: Reliable Delivery
         elif msg_type == HiveMessageType.MSG_ACK:
-            return handle_msg_ack(peer_id, msg_payload, plugin)
+            handle_msg_ack(peer_id, msg_payload, plugin)
         else:
-            # Known but unimplemented message type
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
-            return {"result": "continue"}
-            
+
     except Exception as e:
         plugin.log(f"cl-hive: Error handling {msg_type.name}: {e}", level='warn')
-        return {"result": "continue"}
 
 
 def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
