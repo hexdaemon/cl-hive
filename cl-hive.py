@@ -17290,8 +17290,8 @@ def hive_routing_intelligence_status(plugin: Plugin):
         "pheromone_levels": pheromone_summary,
         "stigmergic_markers": marker_summary,
         "config": {
-            "pheromone_exploit_threshold": 10.0,
-            "marker_half_life_hours": 24,
+            "pheromone_exploit_threshold": 2.0,
+            "marker_half_life_hours": 168,
             "marker_min_strength": 0.1
         }
     }

@@ -38,11 +38,11 @@ SECONDARY_FEE_MULTIPLIER = 1.5    # Secondary: premium for overflow
 BASE_EVAPORATION_RATE = 0.2       # 20% base evaporation per cycle
 MIN_EVAPORATION_RATE = 0.1        # Minimum evaporation
 MAX_EVAPORATION_RATE = 0.9        # Maximum evaporation
-PHEROMONE_EXPLOIT_THRESHOLD = 10.0  # Above this: exploit current fee
+PHEROMONE_EXPLOIT_THRESHOLD = 2.0   # Above this: exploit current fee (lowered for low-traffic nodes)
 PHEROMONE_DEPOSIT_SCALE = 0.001   # Scale factor for deposits
 
 # Stigmergic markers
-MARKER_HALF_LIFE_HOURS = 24       # Markers decay with 24-hour half-life
+MARKER_HALF_LIFE_HOURS = 168      # Markers decay with 7-day half-life (extended for low-traffic nodes)
 MARKER_MIN_STRENGTH = 0.1         # Below this, markers are ignored
 
 # Mycelium defense
