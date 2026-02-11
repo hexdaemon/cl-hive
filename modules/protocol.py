@@ -428,7 +428,7 @@ MAX_PEERS_IN_REPUTATION_SNAPSHOT = 200      # Maximum peers in one reputation sn
 STIGMERGIC_MARKER_BATCH_RATE_LIMIT = (1, 3600)  # 1 batch per hour per sender
 MAX_MARKERS_IN_BATCH = 50                   # Maximum markers in one batch message
 MIN_MARKER_STRENGTH = 0.1                   # Minimum strength to share (after decay)
-MAX_MARKER_AGE_HOURS = 24                   # Don't share markers older than this
+MAX_MARKER_AGE_HOURS = 336                  # Don't share markers older than this (2 weeks, matches extended half-life)
 
 # Pheromone sharing constants
 PHEROMONE_BATCH_RATE_LIMIT = (1, 3600)      # 1 batch per hour per sender
