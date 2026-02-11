@@ -4232,39 +4232,6 @@ Takes alerts from hive_connectivity_alerts and enriches them with specific actio
         # Automation Tools (Phase 2 - Hex Enhancement)
         # =====================================================================
         Tool(
-            name="stagnant_channels",
-            description="""List channels with ≥95% local balance (stagnant) with enriched context.
-
-Returns channels where liquidity is stuck on our side with:
-- peer_alias, capacity, local_pct
-- channel_age_days (calculated from SCID)
-- days_since_last_forward
-- peer_quality (from advisor_get_peer_intel if available)
-- current_fee_ppm
-- recommendation: "close" | "fee_reduction" | "static_policy" | "wait"
-- reasoning: Why this recommendation
-
-Use this to identify channels that need remediation.""",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name"
-                    },
-                    "min_local_pct": {
-                        "type": "number",
-                        "description": "Minimum local balance percentage (default: 95)"
-                    },
-                    "min_age_days": {
-                        "type": "integer",
-                        "description": "Minimum channel age in days (default: 14)"
-                    }
-                },
-                "required": ["node"]
-            }
-        ),
-        Tool(
             name="bulk_policy",
             description="""Apply policies to multiple channels matching criteria.
 
@@ -8642,21 +8609,6 @@ async def handle_advisor_scan_opportunities(args: Dict) -> Dict:
 # =============================================================================
 # Phase 3: Automation Tool Handlers
 # =============================================================================
-
-def _scid_to_age_days(scid: str, current_blockheight: int) -> Optional[int]:
-    """Calculate channel age in days from short_channel_id.
-
-    SCID format: BLOCKxTXINDEXxOUTPUT (e.g., 933128x1345x0)
-    """
-    if not scid or 'x' not in scid:
-        return None
-    try:
-        funding_block = int(scid.split('x')[0])
-        blocks_elapsed = current_blockheight - funding_block
-        return max(0, blocks_elapsed // 144)  # ~144 blocks per day
-    except (ValueError, IndexError):
-        return None
-
 
 async def handle_auto_evaluate_proposal(args: Dict) -> Dict:
     """Evaluate a pending proposal against automated criteria and optionally execute."""
