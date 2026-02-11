@@ -69,53 +69,17 @@ MCPEOF
 export NODE_OPTIONS="--max-old-space-size=2048"
 
 # Run Claude with MCP server
-# The proactive advisor runs a complete 9-phase optimization cycle:
-# 1) Record snapshot 2) Analyze state 3) Check goals 4) Scan opportunities
-# 5) Score with learning 6) Auto-execute safe actions 7) Queue risky actions
-# 8) Measure outcomes 9) Plan next cycle
-claude -p "Run the proactive advisor cycle on ALL nodes using advisor_run_cycle_all. After the cycle completes:
+# The advisor uses enhanced automation tools for efficient fleet management
+claude -p "Run the complete advisor workflow as defined in the system prompt:
 
-## AUTO-PROCESS CHANNEL OPENS
-For each pending channel_open action on each node, automatically approve or reject based on these criteria:
+1. **Quick Assessment**: fleet_health_summary, membership_dashboard, routing_intelligence_health
+2. **Process Pending**: process_all_pending on all nodes (preview with dry_run=true, then execute)
+3. **Execute Opportunities**: execute_safe_opportunities on all nodes
+4. **Remediate Stagnant**: Check stagnant_channels, apply remediate_stagnant where appropriate
+5. **Health Analysis**: critical_velocity, connectivity_recommendations, advisor_get_trends
+6. **Generate Report**: Follow the output format in system prompt
 
-APPROVE only if ALL conditions met:
-- Target node has >15 active channels (strong connectivity)
-- Target's median fee is <500 ppm (quality routing partner)
-- Current on-chain fees are <20 sat/vB
-- Channel size is 2-10M sats
-- Node has <30 total channels AND <40% underwater channels
-- Opening maintains 500k sats on-chain reserve
-- Not a duplicate channel to existing peer
-
-REJECT if ANY condition applies:
-- Target has <10 channels (insufficient connectivity)
-- On-chain fees >30 sat/vB (wait for lower fees)
-- Node already has >30 channels (focus on profitability)
-- Node has >40% underwater channels (fix existing first)
-- Amount below 1M sats or above 10M sats
-- Would create duplicate channel
-- Insufficient on-chain balance for reserve
-
-Use hive_approve_action or hive_reject_action for each pending channel_open.
-
-## REPORT SECTIONS
-After processing actions, provide a report with these sections:
-
-### FLEET HEALTH (use advisor_get_trends and hive_status)
-- Total nodes and their status (online/offline)
-- Fleet-wide capacity and revenue trends (7-day)
-- Hive membership summary (members/neophytes)
-- Any internal competition or coordination issues
-
-### PER-NODE SUMMARIES (for each node)
-1) Node state (capacity, channels, ROC%, underwater%)
-2) Goals progress and strategy adjustments needed
-3) Opportunities found by type and actions taken/queued
-4) Next cycle priorities
-
-### ACTIONS TAKEN
-- List channel opens approved with reasoning
-- List channel opens rejected with reasoning" \
+Run on ALL fleet nodes. Use the enhanced automation tools - they handle criteria evaluation automatically." \
     --mcp-config "$MCP_CONFIG_TMP" \
     --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
