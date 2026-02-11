@@ -189,6 +189,14 @@ from modules.rpc_commands import (
     member_connectivity as rpc_member_connectivity,
     # Promotion Criteria
     neophyte_rankings as rpc_neophyte_rankings,
+    # Revenue Ops Integration
+    get_defense_status as rpc_get_defense_status,
+    get_peer_quality as rpc_get_peer_quality,
+    get_fee_change_outcomes as rpc_get_fee_change_outcomes,
+    get_channel_flags as rpc_get_channel_flags,
+    get_mcf_targets as rpc_get_mcf_targets,
+    get_nnlb_opportunities as rpc_get_nnlb_opportunities,
+    get_channel_ages as rpc_get_channel_ages,
 )
 
 # Initialize the plugin
@@ -17413,6 +17421,168 @@ def hive_splice_abort(plugin: Plugin, session_id: str):
         return {"error": "Splice manager not initialized"}
 
     return splice_mgr.abort_session(session_id, safe_plugin.rpc)
+
+
+# =============================================================================
+# REVENUE OPS INTEGRATION RPCs
+# =============================================================================
+# These methods provide data to cl-revenue-ops for improved fee optimization
+# and rebalancing decisions. They expose cl-hive's intelligence layer.
+
+
+@plugin.method("hive-get-defense-status")
+def hive_get_defense_status(plugin: Plugin, scid: str = None):
+    """
+    Get defense status for channel(s).
+
+    Returns whether channels are under defensive fee protection due to
+    drain attacks, spam, or fee wars. Used by cl-revenue-ops to avoid
+    overriding defensive fees during optimization.
+
+    Args:
+        scid: Optional specific channel SCID. If None, returns all channels.
+
+    Returns:
+        Dict with defense status for each channel.
+
+    Example:
+        lightning-cli hive-get-defense-status
+        lightning-cli hive-get-defense-status 932263x1883x0
+    """
+    ctx = _build_rpc_context()
+    return rpc_get_defense_status(ctx, scid)
+
+
+@plugin.method("hive-get-peer-quality")
+def hive_get_peer_quality(plugin: Plugin, peer_id: str = None):
+    """
+    Get peer quality assessments from the hive's collective intelligence.
+
+    Returns quality ratings based on uptime, routing success, fee stability,
+    and fleet-wide reputation. Used by cl-revenue-ops to adjust optimization
+    intensity.
+
+    Args:
+        peer_id: Optional specific peer ID. If None, returns all peers.
+
+    Returns:
+        Dict with peer quality assessments.
+
+    Example:
+        lightning-cli hive-get-peer-quality
+        lightning-cli hive-get-peer-quality 03abc...
+    """
+    ctx = _build_rpc_context()
+    return rpc_get_peer_quality(ctx, peer_id)
+
+
+@plugin.method("hive-get-fee-change-outcomes")
+def hive_get_fee_change_outcomes(plugin: Plugin, scid: str = None, days: int = 30):
+    """
+    Get outcomes of past fee changes for learning.
+
+    Returns historical fee changes with before/after metrics to help
+    cl-revenue-ops learn from past decisions.
+
+    Args:
+        scid: Optional specific channel SCID. If None, returns all.
+        days: Number of days of history (default: 30, max: 90)
+
+    Returns:
+        Dict with fee change outcomes.
+
+    Example:
+        lightning-cli hive-get-fee-change-outcomes
+        lightning-cli hive-get-fee-change-outcomes scid=932263x1883x0 days=14
+    """
+    ctx = _build_rpc_context()
+    return rpc_get_fee_change_outcomes(ctx, scid, days)
+
+
+@plugin.method("hive-get-channel-flags")
+def hive_get_channel_flags(plugin: Plugin, scid: str = None):
+    """
+    Get special flags for channels.
+
+    Returns flags identifying hive-internal channels that should be excluded
+    from optimization (always 0 fee) or have other special treatment.
+
+    Args:
+        scid: Optional specific channel SCID. If None, returns all.
+
+    Returns:
+        Dict with channel flags.
+
+    Example:
+        lightning-cli hive-get-channel-flags
+        lightning-cli hive-get-channel-flags 932263x1883x0
+    """
+    ctx = _build_rpc_context()
+    return rpc_get_channel_flags(ctx, scid)
+
+
+@plugin.method("hive-get-mcf-targets")
+def hive_get_mcf_targets(plugin: Plugin):
+    """
+    Get MCF-computed optimal balance targets.
+
+    Returns the Multi-Commodity Flow computed optimal local balance
+    percentages for each channel. Used by cl-revenue-ops to guide
+    rebalancing toward globally optimal distribution.
+
+    Returns:
+        Dict with MCF targets for each channel.
+
+    Example:
+        lightning-cli hive-get-mcf-targets
+    """
+    ctx = _build_rpc_context()
+    return rpc_get_mcf_targets(ctx)
+
+
+@plugin.method("hive-get-nnlb-opportunities")
+def hive_get_nnlb_opportunities(plugin: Plugin, min_amount: int = 50000):
+    """
+    Get Nearest-Neighbor Load Balancing opportunities.
+
+    Returns low-cost rebalance opportunities between fleet members where
+    the rebalance can be done at zero or minimal fee.
+
+    Args:
+        min_amount: Minimum amount in sats to consider (default: 50000)
+
+    Returns:
+        Dict with NNLB opportunities.
+
+    Example:
+        lightning-cli hive-get-nnlb-opportunities
+        lightning-cli hive-get-nnlb-opportunities 100000
+    """
+    ctx = _build_rpc_context()
+    return rpc_get_nnlb_opportunities(ctx, min_amount)
+
+
+@plugin.method("hive-get-channel-ages")
+def hive_get_channel_ages(plugin: Plugin, scid: str = None):
+    """
+    Get channel age information.
+
+    Returns age and maturity classification for channels. Used by
+    cl-revenue-ops to adjust exploration vs exploitation in Thompson
+    sampling.
+
+    Args:
+        scid: Optional specific channel SCID. If None, returns all.
+
+    Returns:
+        Dict with channel ages and maturity classifications.
+
+    Example:
+        lightning-cli hive-get-channel-ages
+        lightning-cli hive-get-channel-ages 932263x1883x0
+    """
+    ctx = _build_rpc_context()
+    return rpc_get_channel_ages(ctx, scid)
 
 
 # =============================================================================

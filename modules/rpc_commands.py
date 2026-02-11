@@ -3932,3 +3932,633 @@ def mcf_assignments(ctx: HiveContext) -> Dict[str, Any]:
 
     except Exception as e:
         return {"error": f"Failed to get MCF assignments: {e}"}
+
+
+# =============================================================================
+# REVENUE OPS INTEGRATION COMMANDS
+# =============================================================================
+# These RPC methods provide data to cl-revenue-ops for improved fee optimization
+# and rebalancing decisions. They expose cl-hive's intelligence layer.
+
+
+def get_defense_status(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
+    """
+    Get defense status for channel(s).
+
+    Returns whether channels are under defensive fee protection due to
+    drain attacks, spam, or fee wars. Used by cl-revenue-ops to avoid
+    overriding defensive fees during optimization.
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel SCID. If None, returns all channels.
+
+    Returns:
+        Dict with defense status for each channel:
+        {
+            "channels": {
+                "932263x1883x0": {
+                    "under_defense": false,
+                    "defense_type": null,
+                    "defensive_fee_ppm": null,
+                    "defense_started_at": null,
+                    "defense_reason": null
+                }
+            }
+        }
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    try:
+        channels_data = {}
+
+        # Get all channels with defense status
+        if ctx.safe_plugin:
+            channels = ctx.safe_plugin.rpc.listpeerchannels()
+
+            for ch in channels.get('channels', []):
+                ch_scid = ch.get('short_channel_id')
+                if not ch_scid:
+                    continue
+
+                # Skip if specific scid requested and this isn't it
+                if scid and ch_scid != scid:
+                    continue
+
+                peer_id = ch.get('peer_id', '')
+
+                # Check defense status from fee coordination manager
+                defense_info = ctx.fee_coordination_mgr.get_channel_defense_status(
+                    ch_scid, peer_id
+                ) if hasattr(ctx.fee_coordination_mgr, 'get_channel_defense_status') else {}
+
+                # Also check active warnings
+                active_warnings = ctx.fee_coordination_mgr.get_active_warnings_for_peer(
+                    peer_id
+                ) if hasattr(ctx.fee_coordination_mgr, 'get_active_warnings_for_peer') else []
+
+                under_defense = defense_info.get('under_defense', False) or len(active_warnings) > 0
+                defense_type = defense_info.get('defense_type')
+
+                if not defense_type and active_warnings:
+                    # Derive from warnings
+                    for warn in active_warnings:
+                        if warn.get('threat_type') == 'drain':
+                            defense_type = 'drain_protection'
+                            break
+                        elif warn.get('threat_type') == 'unreliable':
+                            defense_type = 'spam_defense'
+                            break
+
+                channels_data[ch_scid] = {
+                    "under_defense": under_defense,
+                    "defense_type": defense_type,
+                    "defensive_fee_ppm": defense_info.get('defensive_fee_ppm'),
+                    "defense_started_at": defense_info.get('defense_started_at'),
+                    "defense_reason": defense_info.get('defense_reason'),
+                    "active_warnings": len(active_warnings),
+                }
+
+        return {"channels": channels_data}
+
+    except Exception as e:
+        return {"error": f"Failed to get defense status: {e}"}
+
+
+def get_peer_quality(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
+    """
+    Get peer quality assessments from the hive's collective intelligence.
+
+    Returns quality ratings based on uptime, routing success, fee stability,
+    and fleet-wide reputation. Used by cl-revenue-ops to adjust optimization
+    intensity - don't invest heavily in bad peers.
+
+    Args:
+        ctx: HiveContext
+        peer_id: Optional specific peer ID. If None, returns all peers.
+
+    Returns:
+        Dict with peer quality assessments:
+        {
+            "peers": {
+                "03abc...": {
+                    "quality": "good",
+                    "quality_score": 0.85,
+                    "reasons": ["high_uptime", "good_routing_partner"],
+                    "recommendation": "expand",
+                    "last_assessed": 1707600000
+                }
+            }
+        }
+    """
+    if not ctx.quality_scorer:
+        return {"error": "Quality scorer not initialized"}
+
+    try:
+        peers_data = {}
+
+        # Get peers to assess
+        peer_list = []
+        if peer_id:
+            peer_list = [peer_id]
+        elif ctx.safe_plugin:
+            # Get all connected peers
+            channels = ctx.safe_plugin.rpc.listpeerchannels()
+            peer_list = list(set(
+                ch.get('peer_id') for ch in channels.get('channels', [])
+                if ch.get('peer_id')
+            ))
+
+        for pid in peer_list:
+            # Get quality score from quality_scorer
+            score_result = ctx.quality_scorer.score_peer(pid)
+
+            quality_score = score_result.quality_score if score_result else 0.5
+            recommendation = score_result.quality_recommendation if score_result else "maintain"
+
+            # Classify quality tier
+            if quality_score >= 0.7:
+                quality = "good"
+            elif quality_score >= 0.4:
+                quality = "neutral"
+            else:
+                quality = "avoid"
+
+            # Build reasons list
+            reasons = []
+            if score_result:
+                if hasattr(score_result, 'uptime_score') and score_result.uptime_score >= 0.9:
+                    reasons.append("high_uptime")
+                if hasattr(score_result, 'success_rate_score') and score_result.success_rate_score >= 0.8:
+                    reasons.append("good_routing_partner")
+                if hasattr(score_result, 'fee_stability_score') and score_result.fee_stability_score >= 0.8:
+                    reasons.append("stable_fees")
+                if hasattr(score_result, 'force_close_penalty') and score_result.force_close_penalty > 0:
+                    reasons.append("force_close_history")
+                if quality_score < 0.4:
+                    reasons.append("low_quality_score")
+
+            # Get last assessment time from peer reputation manager
+            last_assessed = None
+            if ctx.database:
+                # Check for peer events
+                events = ctx.database.get_peer_events(peer_id=pid, limit=1)
+                if events:
+                    last_assessed = events[0].get('timestamp')
+
+            peers_data[pid] = {
+                "quality": quality,
+                "quality_score": round(quality_score, 3),
+                "reasons": reasons,
+                "recommendation": recommendation,
+                "last_assessed": last_assessed or int(time.time()),
+            }
+
+        return {"peers": peers_data}
+
+    except Exception as e:
+        return {"error": f"Failed to get peer quality: {e}"}
+
+
+def get_fee_change_outcomes(ctx: HiveContext, scid: str = None,
+                             days: int = 30) -> Dict[str, Any]:
+    """
+    Get outcomes of past fee changes for learning.
+
+    Returns historical fee changes with before/after metrics to help
+    cl-revenue-ops learn from past decisions and adjust Thompson priors.
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel SCID. If None, returns all.
+        days: Number of days of history to return (default: 30, max: 90)
+
+    Returns:
+        Dict with fee change outcomes:
+        {
+            "changes": [
+                {
+                    "scid": "932263x1883x0",
+                    "timestamp": 1707500000,
+                    "old_fee_ppm": 200,
+                    "new_fee_ppm": 300,
+                    "source": "advisor",
+                    "outcome": {
+                        "forwards_before_24h": 5,
+                        "forwards_after_24h": 3,
+                        "revenue_before_24h": 500,
+                        "revenue_after_24h": 600,
+                        "verdict": "positive"
+                    }
+                }
+            ]
+        }
+    """
+    if not ctx.database:
+        return {"error": "Database not initialized"}
+
+    # Bound days parameter
+    days = min(max(1, days), 90)
+
+    try:
+        changes = []
+        cutoff_ts = int(time.time()) - (days * 86400)
+
+        # Query fee change history from database
+        # This data may come from multiple sources:
+        # 1. fee_coordination_mgr stigmergic markers
+        # 2. database recorded fee changes
+        # 3. routing_map pheromone history
+
+        if ctx.fee_coordination_mgr:
+            # Get markers which track fee changes
+            markers = ctx.fee_coordination_mgr.get_all_markers() \
+                if hasattr(ctx.fee_coordination_mgr, 'get_all_markers') else []
+
+            # Filter by scid if specified
+            if scid:
+                markers = [m for m in markers if m.get('channel_id') == scid]
+
+            for marker in markers:
+                if marker.get('timestamp', 0) < cutoff_ts:
+                    continue
+
+                # Get outcome data if available
+                outcome_data = marker.get('outcome', {})
+
+                change_entry = {
+                    "scid": marker.get('channel_id', ''),
+                    "timestamp": marker.get('timestamp', 0),
+                    "old_fee_ppm": marker.get('old_fee_ppm', 0),
+                    "new_fee_ppm": marker.get('fee_ppm', 0),
+                    "source": marker.get('source', 'unknown'),
+                    "outcome": {
+                        "forwards_before_24h": outcome_data.get('forwards_before', 0),
+                        "forwards_after_24h": outcome_data.get('forwards_after', 0),
+                        "revenue_before_24h": outcome_data.get('revenue_before', 0),
+                        "revenue_after_24h": outcome_data.get('revenue_after', 0),
+                        "verdict": outcome_data.get('verdict', 'unknown'),
+                    }
+                }
+                changes.append(change_entry)
+
+        # Sort by timestamp descending
+        changes.sort(key=lambda x: x['timestamp'], reverse=True)
+
+        return {"changes": changes[:200]}  # Limit to 200 entries
+
+    except Exception as e:
+        return {"error": f"Failed to get fee change outcomes: {e}"}
+
+
+def get_channel_flags(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
+    """
+    Get special flags for channels.
+
+    Returns flags identifying hive-internal channels that should be excluded
+    from optimization (always 0 fee) or have other special treatment.
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel SCID. If None, returns all channels.
+
+    Returns:
+        Dict with channel flags:
+        {
+            "channels": {
+                "932263x1883x0": {
+                    "is_hive_internal": false,
+                    "is_hive_member": false,
+                    "fixed_fee": null,
+                    "exclude_from_optimization": false
+                }
+            }
+        }
+    """
+    if not ctx.database:
+        return {"error": "Database not initialized"}
+
+    try:
+        channels_data = {}
+
+        # Get all hive members
+        members = ctx.database.get_all_members()
+        member_ids = set(m.get('peer_id') for m in members if m.get('peer_id'))
+
+        # Get all channels
+        if ctx.safe_plugin:
+            channels = ctx.safe_plugin.rpc.listpeerchannels()
+
+            for ch in channels.get('channels', []):
+                ch_scid = ch.get('short_channel_id')
+                if not ch_scid:
+                    continue
+
+                # Skip if specific scid requested and this isn't it
+                if scid and ch_scid != scid:
+                    continue
+
+                peer_id = ch.get('peer_id', '')
+                is_hive_member = peer_id in member_ids
+
+                # Check if this is a hive-internal channel (between hive members)
+                # Both ends must be hive members
+                is_hive_internal = is_hive_member  # Our end is hive, check peer
+
+                # Hive internal channels should have 0 fee
+                fixed_fee = 0 if is_hive_internal else None
+                exclude_from_optimization = is_hive_internal
+
+                channels_data[ch_scid] = {
+                    "is_hive_internal": is_hive_internal,
+                    "is_hive_member": is_hive_member,
+                    "fixed_fee": fixed_fee,
+                    "exclude_from_optimization": exclude_from_optimization,
+                    "peer_id": peer_id[:16] + "..." if peer_id else None,
+                }
+
+        return {"channels": channels_data}
+
+    except Exception as e:
+        return {"error": f"Failed to get channel flags: {e}"}
+
+
+def get_mcf_targets(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get MCF-computed optimal balance targets.
+
+    Returns the Multi-Commodity Flow computed optimal local balance
+    percentages for each channel. Used by cl-revenue-ops to guide
+    rebalancing toward globally optimal distribution.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with MCF targets:
+        {
+            "targets": {
+                "932263x1883x0": {
+                    "optimal_local_pct": 45,
+                    "current_local_pct": 30,
+                    "delta_sats": 150000,
+                    "priority": "high"
+                }
+            },
+            "computed_at": 1707600000
+        }
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction manager not initialized"}
+
+    try:
+        targets_data = {}
+        computed_at = 0
+
+        # Get current MCF solution if available
+        if hasattr(ctx.cost_reduction_mgr, 'get_current_mcf_solution'):
+            solution = ctx.cost_reduction_mgr.get_current_mcf_solution()
+            if solution:
+                computed_at = solution.get('timestamp', 0)
+
+                # Extract target balances from assignments
+                assignments = solution.get('assignments', [])
+                channel_deltas: Dict[str, int] = {}
+
+                for assignment in assignments:
+                    to_channel = assignment.get('to_channel')
+                    from_channel = assignment.get('from_channel')
+                    amount = assignment.get('amount_sats', 0)
+
+                    if to_channel:
+                        channel_deltas[to_channel] = channel_deltas.get(to_channel, 0) + amount
+                    if from_channel:
+                        channel_deltas[from_channel] = channel_deltas.get(from_channel, 0) - amount
+
+                # Get current channel balances
+                if ctx.safe_plugin:
+                    channels = ctx.safe_plugin.rpc.listpeerchannels()
+
+                    for ch in channels.get('channels', []):
+                        ch_scid = ch.get('short_channel_id')
+                        if not ch_scid:
+                            continue
+
+                        local_msat = ch.get('to_us_msat', 0)
+                        if isinstance(local_msat, str):
+                            local_msat = int(local_msat.replace('msat', ''))
+                        total_msat = ch.get('total_msat', 0)
+                        if isinstance(total_msat, str):
+                            total_msat = int(total_msat.replace('msat', ''))
+
+                        if total_msat <= 0:
+                            continue
+
+                        current_local_pct = (local_msat / total_msat) * 100
+                        delta_sats = channel_deltas.get(ch_scid, 0)
+
+                        # Calculate optimal based on delta
+                        optimal_local_sats = (local_msat // 1000) + delta_sats
+                        optimal_local_pct = (optimal_local_sats * 1000 / total_msat) * 100
+                        optimal_local_pct = max(0, min(100, optimal_local_pct))
+
+                        # Determine priority
+                        abs_delta = abs(delta_sats)
+                        if abs_delta > 500000:
+                            priority = "high"
+                        elif abs_delta > 100000:
+                            priority = "medium"
+                        else:
+                            priority = "low"
+
+                        targets_data[ch_scid] = {
+                            "optimal_local_pct": round(optimal_local_pct, 1),
+                            "current_local_pct": round(current_local_pct, 1),
+                            "delta_sats": delta_sats,
+                            "priority": priority,
+                        }
+
+        return {
+            "targets": targets_data,
+            "computed_at": computed_at,
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get MCF targets: {e}"}
+
+
+def get_nnlb_opportunities(ctx: HiveContext, min_amount: int = 50000) -> Dict[str, Any]:
+    """
+    Get Nearest-Neighbor Load Balancing opportunities.
+
+    Returns low-cost rebalance opportunities between fleet members where
+    the rebalance can be done at zero or minimal fee through hive-internal
+    channels.
+
+    Args:
+        ctx: HiveContext
+        min_amount: Minimum amount in sats to consider (default: 50000)
+
+    Returns:
+        Dict with NNLB opportunities:
+        {
+            "opportunities": [
+                {
+                    "source_scid": "932263x1883x0",
+                    "sink_scid": "931308x1256x0",
+                    "amount_sats": 200000,
+                    "estimated_cost_sats": 0,
+                    "path_hops": 1,
+                    "is_hive_internal": true
+                }
+            ]
+        }
+    """
+    if not ctx.anticipatory_manager:
+        # Fall back to liquidity coordinator
+        if not ctx.liquidity_coordinator:
+            return {"error": "Neither anticipatory manager nor liquidity coordinator initialized"}
+
+    try:
+        opportunities = []
+
+        # Get NNLB recommendations from anticipatory manager
+        if ctx.anticipatory_manager and hasattr(ctx.anticipatory_manager, 'get_nnlb_opportunities'):
+            nnlb_opps = ctx.anticipatory_manager.get_nnlb_opportunities(min_amount)
+            for opp in nnlb_opps:
+                opportunities.append({
+                    "source_scid": opp.get('source_channel'),
+                    "sink_scid": opp.get('sink_channel'),
+                    "amount_sats": opp.get('amount_sats', 0),
+                    "estimated_cost_sats": opp.get('estimated_cost', 0),
+                    "path_hops": opp.get('path_hops', 1),
+                    "is_hive_internal": opp.get('is_hive_internal', False),
+                })
+        elif ctx.liquidity_coordinator:
+            # Use liquidity coordinator's circular flow detection
+            if hasattr(ctx.liquidity_coordinator, 'get_circular_rebalance_opportunities'):
+                circ_opps = ctx.liquidity_coordinator.get_circular_rebalance_opportunities()
+                for opp in circ_opps:
+                    if opp.get('amount_sats', 0) >= min_amount:
+                        opportunities.append({
+                            "source_scid": opp.get('from_channel'),
+                            "sink_scid": opp.get('to_channel'),
+                            "amount_sats": opp.get('amount_sats', 0),
+                            "estimated_cost_sats": opp.get('cost_sats', 0),
+                            "path_hops": opp.get('hops', 1),
+                            "is_hive_internal": opp.get('is_hive_internal', True),
+                        })
+
+        # Sort by amount descending
+        opportunities.sort(key=lambda x: x['amount_sats'], reverse=True)
+
+        return {"opportunities": opportunities[:20]}  # Limit to 20
+
+    except Exception as e:
+        return {"error": f"Failed to get NNLB opportunities: {e}"}
+
+
+def get_channel_ages(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
+    """
+    Get channel age information.
+
+    Returns age and maturity classification for channels. Used by
+    cl-revenue-ops to adjust exploration vs exploitation in Thompson
+    sampling - new channels need more exploration, mature channels
+    should exploit known-good fees.
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel SCID. If None, returns all channels.
+
+    Returns:
+        Dict with channel ages:
+        {
+            "channels": {
+                "932263x1883x0": {
+                    "age_days": 45,
+                    "maturity": "mature",
+                    "first_forward_days_ago": 40,
+                    "total_forwards": 250
+                }
+            }
+        }
+    """
+    if not ctx.safe_plugin:
+        return {"error": "Plugin not initialized"}
+
+    try:
+        channels_data = {}
+        now = int(time.time())
+
+        # Get all channels
+        channels = ctx.safe_plugin.rpc.listpeerchannels()
+
+        for ch in channels.get('channels', []):
+            ch_scid = ch.get('short_channel_id')
+            if not ch_scid:
+                continue
+
+            # Skip if specific scid requested and this isn't it
+            if scid and ch_scid != scid:
+                continue
+
+            # Calculate age from funding confirmation
+            # SCID format: blockheight x txindex x output
+            # We can derive approximate age from blockheight
+            try:
+                parts = ch_scid.split('x')
+                if len(parts) >= 1:
+                    funding_block = int(parts[0])
+
+                    # Get current blockheight
+                    info = ctx.safe_plugin.rpc.getinfo()
+                    current_block = info.get('blockheight', funding_block)
+
+                    blocks_old = current_block - funding_block
+                    # Approximate 10 minutes per block
+                    age_days = (blocks_old * 10) / (60 * 24)
+                    age_days = max(0, age_days)
+                else:
+                    age_days = 0
+            except (ValueError, TypeError):
+                age_days = 0
+
+            # Classify maturity
+            if age_days < 14:
+                maturity = "new"
+            elif age_days < 60:
+                maturity = "developing"
+            else:
+                maturity = "mature"
+
+            # Get forward statistics if available from database
+            first_forward_days_ago = None
+            total_forwards = 0
+
+            if ctx.database:
+                # Check peer events for forward activity
+                peer_id = ch.get('peer_id', '')
+                if peer_id:
+                    events = ctx.database.get_peer_events(
+                        peer_id=peer_id,
+                        event_type='forward',
+                        limit=1000
+                    )
+                    if events:
+                        total_forwards = len(events)
+                        oldest_event = min(e.get('timestamp', now) for e in events)
+                        first_forward_days_ago = (now - oldest_event) / 86400
+
+            channels_data[ch_scid] = {
+                "age_days": round(age_days, 1),
+                "maturity": maturity,
+                "first_forward_days_ago": round(first_forward_days_ago, 1) if first_forward_days_ago else None,
+                "total_forwards": total_forwards,
+            }
+
+        return {"channels": channels_data}
+
+    except Exception as e:
+        return {"error": f"Failed to get channel ages: {e}"}
