@@ -193,7 +193,8 @@ def _validate_node_config(node_config: Dict, node_mode: str) -> Optional[str]:
 
 def _normalize_response(result: Any) -> Dict[str, Any]:
     if isinstance(result, dict) and "error" in result:
-        return {"ok": False, "error": result.get("error"), "details": result}
+        error_msg = result.get("error") or result.get("message") or "Unknown error"
+        return {"ok": False, "error": error_msg, "details": result}
     return {"ok": True, "data": result}
 
 
@@ -277,11 +278,19 @@ class NodeConnection:
                 body = e.response.json()
             except Exception:
                 body = {"error": e.response.text.strip()} if e.response.text else {}
-            logger.error(f"RPC error on {self.name}: {e}")
-            return {"error": str(e), "details": body}
+            # Extract the actual CLN error message from the response body
+            error_msg = (
+                body.get("message")  # CLN REST error format: {"code": ..., "message": "..."}
+                or body.get("error")  # fallback plain error
+                or str(e)
+                or f"HTTP {e.response.status_code} from {self.name}"
+            )
+            logger.error(f"RPC error on {self.name}: {error_msg}")
+            return {"error": error_msg, "details": body}
         except httpx.HTTPError as e:
-            logger.error(f"RPC error on {self.name}: {e}")
-            return {"error": str(e)}
+            error_msg = str(e) or f"{type(e).__name__} connecting to {self.name}"
+            logger.error(f"RPC error on {self.name}: {error_msg}")
+            return {"error": error_msg}
 
     async def _call_docker(self, method: str, params: Dict = None) -> Dict:
         """Call CLN via docker exec (for Polar testing)."""
@@ -316,7 +325,8 @@ class NodeConnection:
                 proc.communicate(), timeout=HIVE_DOCKER_TIMEOUT
             )
             if proc.returncode != 0:
-                return {"error": stderr.decode().strip()[:500]}
+                err_text = stderr.decode().strip()[:500]
+                return {"error": err_text or f"Command failed with exit code {proc.returncode}"}
             return json.loads(stdout.decode()) if stdout.strip() else {}
         except asyncio.TimeoutError:
             try:
@@ -327,7 +337,7 @@ class NodeConnection:
         except json.JSONDecodeError as e:
             return {"error": f"Invalid JSON response: {e}"}
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": str(e) or f"{type(e).__name__} in docker exec"}
 
 
 class HiveFleet:
@@ -427,7 +437,7 @@ class HiveFleet:
                 return (name, {"error": f"Timeout after {timeout}s"})
             except Exception as e:
                 logger.error(f"Error calling {method} on {name}: {e}")
-                return (name, {"error": str(e)})
+                return (name, {"error": str(e) or f"{type(e).__name__} calling {method}"})
 
         tasks = [call_with_timeout(name, node) for name, node in self.nodes.items()]
         results_list = await asyncio.gather(*tasks)
@@ -451,8 +461,8 @@ class HiveFleet:
             except asyncio.TimeoutError:
                 return (name, {"status": "timeout", "error": f"No response in {timeout}s"})
             except Exception as e:
-                return (name, {"status": "error", "error": str(e)})
-        
+                return (name, {"status": "error", "error": str(e) or type(e).__name__})
+
         tasks = [check_node(name, node) for name, node in self.nodes.items()]
         results_list = await asyncio.gather(*tasks)
         return dict(results_list)
@@ -3645,7 +3655,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
 
     except Exception as e:
         logger.exception(f"Error in tool {name}")
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        error_msg = str(e) or f"{type(e).__name__} in {name}"
+        return [TextContent(type="text", text=json.dumps({"error": error_msg}))]
 
 
 # =============================================================================

@@ -634,7 +634,7 @@ def _approve_all_actions(ctx: HiveContext) -> Dict[str, Any]:
                 })
 
         except Exception as e:
-            errors.append({"action_id": action_id, "error": str(e)})
+            errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
 
     if ctx.log:
         ctx.log(f"cl-hive: Approved {len(approved)} actions", 'info')
@@ -915,7 +915,7 @@ def _execute_channel_open(
         return result
 
     except Exception as e:
-        error_msg = str(e)
+        error_msg = str(e) or f"{type(e).__name__} during channel open"
         if ctx.log:
             ctx.log(f"cl-hive: fundchannel failed: {error_msg}", 'error')
 
