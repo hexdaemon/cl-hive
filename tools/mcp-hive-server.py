@@ -11425,6 +11425,7 @@ async def handle_fleet_health_summary(args: Dict) -> Dict:
     alerts_by_severity = {"critical": 0, "warning": 0, "info": 0}
     mcf_status = {}
     nnlb_struggling = []
+    seen_struggling_peers = set()  # For deduplication across nodes
 
     for node in nodes_to_check:
         # Gather data for this node in parallel
@@ -11492,14 +11493,27 @@ async def handle_fleet_health_summary(args: Dict) -> Dict:
                 "is_healthy": mcf.get("is_healthy", True)
             }
 
-        # NNLB struggling members
+        # NNLB struggling members (dedupe by peer_id, derive issue from health)
         if not isinstance(nnlb, Exception) and "error" not in nnlb:
             for member in nnlb.get("struggling_members", []):
-                nnlb_struggling.append({
-                    "alias": member.get("alias", ""),
-                    "issue": member.get("issue", "unknown"),
-                    "node": node.name
-                })
+                peer_id = member.get("peer_id", "")
+                health = member.get("health", 0)
+                # Derive issue from health score
+                if health < 20:
+                    issue = "critical"
+                elif health < 40:
+                    issue = "low_health"
+                else:
+                    issue = "below_threshold"
+                # Dedupe: only add if not already seen (first node wins)
+                if peer_id and peer_id not in seen_struggling_peers:
+                    seen_struggling_peers.add(peer_id)
+                    nnlb_struggling.append({
+                        "peer_id": peer_id[:16] + "...",  # Truncated for readability
+                        "health": health,
+                        "issue": issue,
+                        "reporting_node": node.name
+                    })
 
         # Connectivity alerts
         if not isinstance(conn_alerts, Exception) and "error" not in conn_alerts:
