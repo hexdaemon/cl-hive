@@ -4,6 +4,153 @@
 
 Optional Archon DID integration for cl-hive enables cryptographically signed, verifiable governance messaging between hive members. Messages are delivered via Archon dmail (encrypted DID-to-DID communication).
 
+---
+
+## Tiered Participation Model
+
+Archon integration follows a tiered model to balance accessibility with governance integrity.
+
+### Membership Tiers
+
+| Tier | Archon Required | Capabilities |
+|------|-----------------|--------------|
+| **Basic** | No | Routing, settlements, health monitoring, alerts via traditional channels |
+| **Governance** | Yes (DID) | All Basic + voting rights, proposal submission, verified receipts |
+
+### Rationale
+
+- **Lower barrier for small operators**: New node operators can join and route without DID setup overhead
+- **Higher commitment for governance**: Those who want to shape fleet policy must establish verifiable identity
+- **Sybil resistance**: Anonymous voting in cooperative routing pools creates perverse incentives; governance votes require verified identity
+- **Natural upgrade incentive**: "Want a vote on fee policy? Set up your DID."
+
+### Implementation
+
+```sql
+-- Add governance tier to member table
+ALTER TABLE members ADD COLUMN governance_tier TEXT DEFAULT 'basic';
+-- 'basic' = routing only, no DID required
+-- 'governance' = full participation, DID verified
+
+-- Governance actions require verified DID
+CREATE VIEW governance_eligible_members AS
+SELECT m.* FROM members m
+JOIN member_archon_contacts mac ON m.peer_id = mac.peer_id
+WHERE mac.verified_at IS NOT NULL
+  AND m.governance_tier = 'governance';
+```
+
+### Tier Transitions
+
+1. **basic → governance**: Member sets up DID, completes challenge-response verification
+2. **governance → basic**: Voluntary downgrade (keep DID but opt out of voting)
+3. Tier changes logged for audit trail
+
+---
+
+## Archon Polls Integration
+
+Use Archon's native Polls system for governance voting instead of custom vote credentials.
+
+### Why Archon Polls
+
+- **Native voting mechanics**: Built-in vote collection, tallying, deadline handling
+- **Archon Notifications**: Delivers ballots to poll owner automatically
+- **Standardization**: Interoperable with other Archon-based communities
+- **Audit trail**: All votes cryptographically signed and verifiable
+
+### Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Hive Plugin    │────▶│  Archon Polls   │────▶│  Vote Receipts  │
+│  (creates poll) │     │  (collects)     │     │  (VCs/dmails)   │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+         │                       │                       │
+         ▼                       ▼                       ▼
+   Poll creation          Vote submission         Decision record
+   via Keymaster          via Notifications       as credential
+```
+
+### Poll Types for Hive Governance
+
+| Governance Action | Poll Type | Quorum | Threshold |
+|-------------------|-----------|--------|-----------|
+| Promotion vote | Standard | 50% | Simple majority |
+| Ban proposal | Urgent | 67% | Supermajority to prevent |
+| Config change | Standard | 50% | Simple majority |
+| Emergency review | Retrospective | 50% | Simple majority |
+
+### Integration Flow
+
+1. **Create Poll** (hive plugin)
+   ```python
+   # On governance event (e.g., ban proposal)
+   poll_id = keymaster.create_poll(
+       title=f"Ban proposal: {alias}",
+       options=["ban", "no-ban"],
+       voters=[did for did in governance_members],
+       deadline=timestamp + 72h,
+       metadata={"type": "ban", "subject": peer_id, "evidence": evidence_cid}
+   )
+   ```
+
+2. **Notify Voters** (Archon Notifications)
+   ```
+   Archon automatically notifies eligible voters via their registered channels
+   ```
+
+3. **Vote Submission** (members)
+   ```bash
+   # Members vote via Archon wallet or CLI
+   keymaster vote {poll_id} --choice "ban" --reason "Evidence compelling"
+   ```
+
+4. **Collect Results** (hive plugin polls)
+   ```python
+   # Poll deadline reached or quorum met
+   result = keymaster.get_poll_result(poll_id)
+   if result.decision == "ban":
+       execute_ban(peer_id, result)
+       issue_decision_credential(result)
+   ```
+
+5. **Issue Decision Credential**
+   ```python
+   # Final outcome as verifiable credential
+   credential = issue_credential(
+       schema="ban-decision-schema",
+       data={
+           "community": hive_did,
+           "subject": banned_member_did,
+           "decision": "banned",
+           "voteTally": result.tally,
+           "pollId": poll_id
+       }
+   )
+   ```
+
+### RPC Methods (Polls)
+
+```python
+# Poll management
+hive-poll-create(type, title, options, deadline, metadata)
+hive-poll-status(poll_id)
+hive-poll-results(poll_id)
+hive-poll-list(status="active|completed|all")
+
+# Voting (wraps Archon)
+hive-vote(poll_id, choice, reason)
+hive-my-votes(limit)
+```
+
+### Credential vs Poll Relationship
+
+- **Archon Polls**: The voting mechanism (ephemeral, process-oriented)
+- **Verifiable Credentials**: The outcome record (permanent, proof-oriented)
+
+Individual vote credentials (ban-vote-schema) may still be issued for members who want portable proof of participation, but Polls handles the actual vote collection.
+
 ## Configuration
 
 ### Node Configuration
