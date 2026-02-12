@@ -643,62 +643,53 @@ CREATE INDEX idx_message_inbox_sender ON archon_message_inbox(sender_did, receiv
 
 ## Implementation Plan
 
-### Phase 1: Core Infrastructure
-1. Add `archon` config section to hive config schema
-2. Create database tables for contacts, queue, inbox, templates
-3. Implement `HiveArchonBridge` class for Keymaster integration
-4. Add basic send/receive RPC methods
-5. Error handling and retry logic for failed deliveries
+*Priority order based on RFC feedback (Morningstar 2026-02-12)*
 
-### Phase 2: Docker Setup Wizard Integration
-1. Add optional Archon DID prompt to `cl-hive-setup.sh` wizard
-2. Prompt: "Enable Archon governance messaging? (y/n)"
-3. If yes:
-   - Check if `npx @didcid/keymaster` is available
-   - Prompt for existing DID or create new one
-   - Securely store passphrase in Docker secrets or env file
-   - Configure gatekeeper URL (public vs local node)
-   - Set default notification preferences
-4. Generate `archon` config block in node config
-5. Document setup in container README
+### Phase 1: Settlement Receipts (Highest Value)
+1. Core `HiveArchonBridge` class for Keymaster integration
+2. Database tables: contacts, message queue, templates
+3. Settlement receipt template (signed, verifiable)
+4. `hive-settlement-receipt` RPC
+5. Auto-send on `handle_settlement_executed()`
 
-### Phase 3: Contact Registry
-1. `hive-register-contact` RPC — Map peer_id → Archon DID
-2. `hive-list-contacts` RPC
-3. `hive-verify-contact` — Optional challenge-response DID verification
+### Phase 2: DID Setup + Backup Integration
+1. Docker wizard: "Enable Archon governance messaging? (y/n)"
+2. `archon-backup` skill integration for vault recovery
+3. Three tiers: self-custody (default), fleet-custodial (opt-in), no DID
+4. Passphrase handling via Docker secrets
+5. Recovery path documentation
+
+### Phase 3: Nostr Hybrid for Health Alerts
+1. Add `nostr_npub` and `nostr_relays` to contacts table
+2. Dual-send for critical events (Nostr + Archon)
+3. Health critical alerts via both channels
+4. Nostr: push notification, Archon: permanent receipt
+5. Correlation logging for audit
+
+### Phase 4: Contact Registry + Verification
+1. `hive-register-contact` RPC — Map peer_id → DID + npub
+2. Challenge-response DID verification flow
+3. `verified_at` timestamp tracking
 4. Contact import/export (JSON format)
-5. Auto-discovery: Parse DID from member metadata if provided
 
-### Phase 4: Message Templates
-1. Define all governance message templates (20+ types)
-2. Template variable substitution engine (Jinja2-style)
-3. Admin template customization via RPC
-4. i18n support for multi-language templates (future)
+### Phase 5: Ban Governance
+1. Ban proposal templates with evidence
+2. Vote tracking and execution receipts
+3. Auto-notify on proposal, vote, execution
+4. Verifiable credentials for votes (future)
 
-### Phase 5: Event Integration
-1. Hook into governance events:
-   - Membership: join, leave, promotion, ban
-   - Settlement: cycle start, ready, complete, gaming detected
-   - Health: NNLB critical alerts
-2. Hook into channel coordination:
-   - Expansion recommendations
-   - Close recommendations
-   - Splice requests
-3. Configurable `auto_notify` rules per event type
-4. Rate limiting to prevent spam
+### Phase 6: Full Governance Suite
+1. Remaining templates (25+ types)
+2. Dispute resolution flow
+3. Config change governance
+4. Emergency coordinator actions with audit trail
+5. Message urgency categorization (immediate/batched/receipts)
 
-### Phase 6: Inbox & History
-1. Periodic inbox polling (configurable interval)
-2. `hive-dmail-inbox` RPC for message history
-3. Read receipts (optional, via Archon acknowledgment)
-4. Message archival and retention policy
-5. Search/filter inbox by sender, type, date
-
-### Phase 7: Advisor Integration
-1. Advisor can send dmails on behalf of fleet
-2. Health alerts trigger auto-dmail to affected operator
-3. Settlement receipts auto-sent on completion
-4. Configurable escalation: critical alerts → multiple recipients
+### Phase 7: Advisor + Rate Limiting
+1. Advisor sends dmails on behalf of fleet
+2. Per-sender rate limits with escalation path
+3. Inbox polling and message history
+4. Daily digest option for batched messages
 
 ---
 
@@ -728,11 +719,354 @@ hive-dmail-template-update(template_id, subject, body)
 
 ---
 
+---
+
+## Additional Governance Events (from RFC feedback)
+
+### 8. Dispute Resolution
+
+#### 8.1 Dispute Filed
+**Trigger:** Member files formal dispute
+**Recipients:** All voting members + dispute parties
+**Template:**
+```
+Subject: [HIVE] ⚖️ Dispute Filed: {dispute_title}
+
+A formal dispute has been filed.
+
+Complainant: {complainant_alias}
+Respondent: {respondent_alias}
+Type: {dispute_type}  # fee_disagreement, force_close, settlement_calculation, other
+
+Description:
+{dispute_description}
+
+Evidence:
+{evidence_summary}
+
+Resolution Deadline: {deadline}
+Arbitration Required: {yes/no}
+
+To respond:
+  lightning-cli hive-dispute-respond {dispute_id} response="..."
+
+— Hive Governance System
+```
+
+#### 8.2 Dispute Resolved
+**Trigger:** Resolution reached (vote, arbitration, or settlement)
+**Recipients:** All members + dispute parties
+**Template:**
+```
+Subject: [HIVE] ⚖️ Dispute Resolved: {dispute_title}
+
+The dispute has been resolved.
+
+Resolution: {resolution_summary}
+Method: {vote/arbitration/settlement}
+Decision: {in_favor_of}
+
+Actions Required:
+{for each action}
+  - {party}: {required_action}
+{/for}
+
+This decision is final and binding.
+
+— Hive Governance System
+Signed: {arbitrator_did}
+```
+
+---
+
+### 9. Config Change Governance
+
+#### 9.1 Config Change Proposed
+**Trigger:** Admin proposes fleet-wide parameter change
+**Recipients:** All voting members
+**Template:**
+```
+Subject: [HIVE] 🔧 Config Change Proposal: {param_name}
+
+A fleet-wide configuration change has been proposed.
+
+Parameter: {param_name}
+Category: {category}  # settlement, health, fees, governance
+Current Value: {current_value}
+Proposed Value: {new_value}
+Proposer: {proposer_alias}
+
+Rationale:
+{rationale}
+
+Impact Assessment:
+{impact_summary}
+
+Vote Deadline: {deadline}
+Quorum Required: {quorum_pct}%
+
+To vote:
+  lightning-cli hive-vote-config {proposal_id} approve="true|false"
+
+— Hive Governance System
+```
+
+#### 9.2 Config Change Executed
+**Trigger:** Quorum reached and config applied
+**Recipients:** All members
+**Template:**
+```
+Subject: [HIVE] 🔧 Config Updated: {param_name}
+
+A configuration change has been applied.
+
+Parameter: {param_name}
+Old Value: {old_value}
+New Value: {new_value}
+Effective: {timestamp}
+
+Final Vote: {approve_count} approve / {reject_count} reject
+
+All nodes will apply this change within {propagation_time}.
+
+— Hive Governance System
+```
+
+---
+
+### 10. Emergency Coordinator Actions
+
+#### 10.1 Emergency Override Executed
+**Trigger:** Coordinator bypasses normal governance for urgent action
+**Recipients:** All members
+**Template:**
+```
+Subject: [HIVE] 🚨 Emergency Action: {action_title}
+
+An emergency action has been taken by the coordinator.
+
+Action: {action_description}
+Coordinator: {coordinator_alias}
+Time: {timestamp}
+Severity: {severity}
+
+Justification:
+{justification}
+
+Affected:
+{for each affected}
+  - {member_alias}: {impact}
+{/for}
+
+This action was taken under emergency authority. A retrospective review
+will be conducted at the next governance meeting.
+
+— Hive Governance System
+Signed: {coordinator_did}
+```
+
+#### 10.2 Emergency Authority Invoked
+**Trigger:** Coordinator declares emergency state
+**Recipients:** All members
+**Template:**
+```
+Subject: [HIVE] 🚨 Emergency State Declared
+
+The fleet coordinator has declared an emergency state.
+
+Reason: {reason}
+Duration: {expected_duration}
+Authority Level: {level}  # advisory, limited, full
+
+During this period:
+- Normal governance votes may be expedited
+- Coordinator may take {allowed_actions}
+- All emergency actions will be logged and audited
+
+Emergency ends: {end_condition}
+
+— Hive Governance System
+```
+
+---
+
+## Nostr Hybrid Architecture
+
+For real-time notifications combined with permanent audit trails.
+
+### Design
+
+| Channel | Use Case | Properties |
+|---------|----------|------------|
+| **Nostr** | Real-time alerts | Push notifications, low latency, ephemeral |
+| **Archon dmail** | Permanent receipts | Verifiable, encrypted, audit trail |
+
+### Dual-Send Events
+
+Critical events send via both channels:
+- Nostr: Immediate notification
+- Archon: "Full receipt available via dmail [CID]"
+
+Events using dual-send:
+- Health critical alerts
+- Ban votes (proposal + execution)
+- Settlement complete
+- Emergency actions
+
+### Database Extension
+
+```sql
+-- Add Nostr npub to contacts
+ALTER TABLE member_archon_contacts ADD COLUMN nostr_npub TEXT;
+ALTER TABLE member_archon_contacts ADD COLUMN nostr_relays TEXT;  -- JSON array
+
+-- Track dual-send correlation
+ALTER TABLE archon_message_queue ADD COLUMN nostr_event_id TEXT;
+```
+
+### Implementation
+
+1. On critical event:
+   ```python
+   # Send Nostr first (real-time)
+   nostr_event_id = send_nostr_dm(npub, short_alert)
+   
+   # Send Archon (permanent receipt)
+   cid = send_archon_dmail(did, full_message)
+   
+   # Correlate for audit
+   log_dual_send(event_type, nostr_event_id, cid)
+   ```
+
+2. Nostr message format:
+   ```
+   🔔 [HIVE] {short_summary}
+   Full receipt: archon:dmail:{cid}
+   ```
+
+---
+
+## Message Urgency Categories
+
+### Immediate (send now)
+- Health critical alerts
+- Ban proposals and votes
+- Emergency actions
+- Settlement gaming detected
+
+### Batched (daily digest option)
+- Promotion proposals
+- Channel suggestions
+- Positioning proposals
+- Non-critical health updates
+
+### Receipts (immediate, permanent)
+- Settlement complete (signed receipt)
+- Ban executed
+- Config change executed
+- Dispute resolved
+
+---
+
+## DID Verification Flow
+
+Challenge-response verification to prove DID ownership:
+
+```
+1. Member claims DID: hive-register-contact peer_id=X archon_did=did:cid:Y
+
+2. Fleet generates random challenge:
+   challenge = random_bytes(32).hex()
+   store_challenge(peer_id, challenge, expires=1h)
+
+3. Fleet sends challenge to claimed DID:
+   Subject: [HIVE] Verify Your DID
+   Body: Sign this challenge: {challenge}
+         Reply with signature to complete verification.
+
+4. Member signs with DID private key:
+   signature = keymaster_sign(challenge)
+   hive-verify-contact peer_id=X signature=Z
+
+5. Fleet verifies signature:
+   if keymaster_verify(did, challenge, signature):
+       mark_verified(peer_id, timestamp)
+       send_confirmation()
+   else:
+       reject_verification()
+```
+
+---
+
+## Rate Limiting
+
+### Per-Sender Limits
+| Sender Type | Limit | Window |
+|-------------|-------|--------|
+| Regular member | 10 msgs | 1 hour |
+| Coordinator | 50 msgs | 1 hour |
+| System (auto) | 100 msgs | 1 hour |
+| Broadcast | 3 msgs | 24 hours |
+
+### Escalation Path
+Critical alerts bypass rate limits:
+- `priority = "critical"` → no rate limit
+- Requires coordinator signature
+- Logged for audit
+
+---
+
+## DID Recovery & Backup
+
+### Self-Custody (Default)
+Integration with `archon-backup` skill:
+
+1. During setup: Auto-backup DID credentials to personal vault
+2. On node rebuild: "Restore DID from vault or create new?"
+3. Recovery path documented in setup wizard
+
+```bash
+# Backup during setup
+archon-backup backup-to-vault ~/.archon/wallet.json node-did-vault
+
+# Restore on rebuild
+archon-backup restore-from-vault node-did-vault ~/.archon/wallet.json
+```
+
+### Fleet-Custodial (Opt-in)
+For operators who prefer convenience:
+
+1. Coordinator holds encrypted backup of member DIDs
+2. Member can request recovery via signed request
+3. Trade-off: convenience vs full sovereignty
+
+```sql
+-- Optional custodial backup storage
+CREATE TABLE member_did_backups (
+    peer_id TEXT PRIMARY KEY,
+    encrypted_backup BLOB,          -- Encrypted with member's recovery key
+    backup_created_at INTEGER,
+    recovery_key_hint TEXT,         -- Hint for recovery key, not the key itself
+    last_recovery_request INTEGER
+);
+```
+
+### Recovery Tiers
+| Tier | Method | Sovereignty | Convenience |
+|------|--------|-------------|-------------|
+| Full self-custody | Personal vault only | ★★★★★ | ★★☆☆☆ |
+| Fleet-custodial | Coordinator backup | ★★★☆☆ | ★★★★☆ |
+| No DID | Minimal mode | N/A | ★★★★★ |
+
+---
+
 ## Security Considerations
 
 1. **Passphrase handling**: Never log or expose `ARCHON_PASSPHRASE`
-2. **DID verification**: Optionally verify member owns claimed DID via challenge
-3. **Rate limiting**: Prevent message spam
+2. **DID verification**: Challenge-response verification before trusting claimed DIDs
+3. **Rate limiting**: Per-sender limits with critical escalation path
 4. **Encryption**: All dmails are E2E encrypted by Archon
 5. **Non-repudiation**: All messages signed by sender DID
 6. **Retention policy**: Auto-delete old messages per config
+7. **Emergency audit**: All emergency actions logged with coordinator signature
+8. **Backup security**: Custodial backups encrypted with member-controlled keys
