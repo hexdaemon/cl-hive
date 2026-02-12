@@ -12186,21 +12186,26 @@ async def handle_fleet_health_summary(args: Dict) -> Dict:
 
         nodes_status[node.name] = node_status
 
-        # Profitability distribution
+        # Profitability distribution - use summary from revenue-profitability
         if not isinstance(prof, Exception) and "error" not in prof:
-            for ch in prof.get("channels", []):
-                channel_stats["total"] += 1
-                classification = ch.get("profitability_class", "unknown")
-                if classification in ("profitable", "strong"):
-                    channel_stats["profitable"] += 1
-                elif classification in ("bleeder", "underwater"):
-                    channel_stats["underwater"] += 1
-                elif classification == "zombie":
-                    channel_stats["stagnant"] += 1
-                # Check for stagnant by balance
-                local_pct = ch.get("local_balance_pct", 50)
-                if local_pct >= 99:
-                    channel_stats["stagnant"] += 1
+            summary = prof.get("summary", {})
+            if summary:
+                # Use pre-computed summary stats
+                channel_stats["total"] += summary.get("total_channels", 0)
+                channel_stats["profitable"] += summary.get("profitable_count", 0)
+                channel_stats["underwater"] += summary.get("underwater_count", 0)
+                channel_stats["stagnant"] += summary.get("stagnant_candidate_count", 0) + summary.get("zombie_count", 0)
+            else:
+                # Fallback to iterating channels if summary not available
+                for ch in prof.get("channels", []):
+                    channel_stats["total"] += 1
+                    classification = ch.get("profitability_class", "unknown")
+                    if classification in ("profitable", "strong"):
+                        channel_stats["profitable"] += 1
+                    elif classification in ("bleeder", "underwater"):
+                        channel_stats["underwater"] += 1
+                    elif classification == "zombie":
+                        channel_stats["stagnant"] += 1
 
         # 24h routing stats
         if not isinstance(dashboard, Exception) and "error" not in dashboard:
