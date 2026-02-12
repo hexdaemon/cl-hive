@@ -28,10 +28,10 @@ class HealthTier(Enum):
     Each tier affects how the node manages its OWN operations.
     No fund transfers between nodes.
     """
-    STRUGGLING = "struggling"    # 0-30: Accept higher costs to recover
-    VULNERABLE = "vulnerable"    # 31-50: Elevated priority for self
-    STABLE = "stable"            # 51-70: Normal operation
-    THRIVING = "thriving"        # 71-100: Be selective, save fees
+    STRUGGLING = "struggling"    # 0-20: Accept higher costs to recover
+    VULNERABLE = "vulnerable"    # 21-40: Elevated priority for self
+    STABLE = "stable"            # 41-65: Normal operation
+    THRIVING = "thriving"        # 66-100: Be selective, save fees
 
 
 # Budget multipliers for OWN rebalancing operations
@@ -128,12 +128,19 @@ class HealthScoreAggregator:
         return total, tier
 
     def _score_to_tier(self, score: int) -> HealthTier:
-        """Convert health score to tier."""
-        if score <= 30:
+        """Convert health score to tier.
+        
+        Thresholds relaxed 2026-02-12 to reduce over-conservative classifications:
+        - STRUGGLING: ≤20 (was 30) - only truly problematic channels
+        - VULNERABLE: 21-40 (was 31-50) - narrower concern band
+        - STABLE: 41-65 (was 51-70) - wider operational range
+        - THRIVING: >65 (was >70) - easier to achieve healthy status
+        """
+        if score <= 20:
             return HealthTier.STRUGGLING
-        elif score <= 50:
+        elif score <= 40:
             return HealthTier.VULNERABLE
-        elif score <= 70:
+        elif score <= 65:
             return HealthTier.STABLE
         else:
             return HealthTier.THRIVING
