@@ -70,20 +70,24 @@ export NODE_OPTIONS="--max-old-space-size=2048"
 
 # Run Claude with MCP server
 # The advisor uses enhanced automation tools for efficient fleet management
-claude -p "Run the complete advisor workflow. CRITICAL RULES:
 
-## ANTI-HALLUCINATION (MANDATORY)
+# Build the prompt - pipe via stdin to avoid all shell escaping issues
+# NOTE: System prompt is embedded in user prompt to avoid shell escaping issues with --append-system-prompt
+ADVISOR_PROMPT_FILE=$(mktemp)
+cat > "$ADVISOR_PROMPT_FILE" << 'PROMPTEOF'
+You are the AI Advisor for the Lightning Hive fleet (hive-nexus-01 and hive-nexus-02).
+
+## CRITICAL RULES (MANDATORY)
 - Call each tool FIRST, then report its EXACT output values
-- Copy numbers exactly - do not round or estimate
-- Use TODAY's real date (from system context), never invent timestamps
-- If a tool fails, say 'Tool call failed' - never fabricate data
+- Copy numbers exactly - do not round, estimate, or paraphrase
+- If a tool fails, say "Tool call failed" - never fabricate data
 - Volume=0 with Revenue>0 is IMPOSSIBLE - verify data consistency
 
 ## WORKFLOW
-1. **Quick Assessment**: Call fleet_health_summary, membership_dashboard, routing_intelligence_health (both nodes)
-2. **Process Pending**: process_all_pending(dry_run=true), then process_all_pending(dry_run=false)
-3. **Health Analysis**: critical_velocity, stagnant_channels, advisor_get_trends
-4. **Generate Report**: Use EXACT values from tool outputs
+1. Quick Assessment: Call fleet_health_summary, membership_dashboard, routing_intelligence_health (BOTH nodes)
+2. Process Pending: process_all_pending(dry_run=true), then process_all_pending(dry_run=false)  
+3. Health Analysis: critical_velocity, stagnant_channels, advisor_get_trends (BOTH nodes)
+4. Generate Report: Use EXACT values from tool outputs
 
 ## FORBIDDEN ACTIONS
 - Do NOT call execute_safe_opportunities
@@ -91,13 +95,33 @@ claude -p "Run the complete advisor workflow. CRITICAL RULES:
 - Do NOT execute any fee changes
 - Report recommendations for HUMAN REVIEW only
 
-Call tools on BOTH nodes: hive-nexus-01 and hive-nexus-02." \
+## AUTO-APPROVE CRITERIA
+- Channel opens: Target has >=15 channels, median fee <500ppm, on-chain <20 sat/vB, size 2-10M sats
+- Fee changes: Change <=25% from current, new fee 50-1500 ppm range
+- Rebalances: Amount <=500k sats, EV-positive
+
+## AUTO-REJECT CRITERIA  
+- Channel opens: Target <10 channels, on-chain >30 sat/vB, amount <1M or >10M sats
+- Any action on "avoid" rated peers
+
+## ESCALATE TO HUMAN
+- Channel open >5M sats
+- Conflicting signals
+- Repeated failures (3+ similar rejections)
+- Any close/splice operation
+
+Run the complete advisor workflow now. Call tools on BOTH nodes.
+PROMPTEOF
+
+# Pipe prompt via stdin - avoids all command-line escaping issues
+cat "$ADVISOR_PROMPT_FILE" | claude -p \
     --mcp-config "$MCP_CONFIG_TMP" \
-    --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
     --allowedTools "mcp__hive__*" \
     --output-format text \
     2>&1 | tee -a "$LOG_FILE"
+
+rm -f "$ADVISOR_PROMPT_FILE"
 
 echo "=== Run completed: $(date) ===" | tee -a "$LOG_FILE"
 
