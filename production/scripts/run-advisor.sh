@@ -74,10 +74,11 @@ claude -p "Run the complete advisor workflow as defined in the system prompt:
 
 1. **Quick Assessment**: fleet_health_summary, membership_dashboard, routing_intelligence_health
 2. **Process Pending**: process_all_pending on all nodes (preview with dry_run=true, then execute)
-3. **Execute Opportunities**: execute_safe_opportunities on all nodes
-4. **Remediate Stagnant**: Check stagnant_channels, apply remediate_stagnant where appropriate
-5. **Health Analysis**: critical_velocity, connectivity_recommendations, advisor_get_trends
-6. **Generate Report**: Follow the output format in system prompt
+3. **Health Analysis**: critical_velocity, connectivity_recommendations, advisor_get_trends
+4. **Generate Report**: Follow the output format in system prompt
+
+**IMPORTANT**: Do NOT execute fee changes. Skip execute_safe_opportunities and remediate_stagnant.
+Report stagnant channels and fee recommendations for human review only.
 
 Run on ALL fleet nodes. Use the enhanced automation tools - they handle criteria evaluation automatically." \
     --mcp-config "$MCP_CONFIG_TMP" \

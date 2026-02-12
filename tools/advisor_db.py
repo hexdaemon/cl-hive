@@ -2233,3 +2233,331 @@ class AdvisorDB:
         """
         key = f"onboarded_{member_pubkey[:16]}"
         return self.get_metadata(key) is not None
+
+    # =========================================================================
+    # Config Adjustment Tracking
+    # =========================================================================
+
+    def _ensure_config_tables(self) -> None:
+        """Ensure config adjustment tables exist."""
+        with self._get_conn() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS config_adjustments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    node_name TEXT NOT NULL,
+                    config_key TEXT NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT NOT NULL,
+                    trigger_reason TEXT NOT NULL,
+                    reasoning TEXT,
+                    confidence REAL,
+                    context_metrics TEXT,
+                    outcome_measured_at INTEGER,
+                    outcome_metrics TEXT,
+                    outcome_success INTEGER,
+                    outcome_notes TEXT,
+                    rolled_back INTEGER DEFAULT 0,
+                    rolled_back_at INTEGER,
+                    rollback_reason TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_config_adj_node_key 
+                    ON config_adjustments(node_name, config_key);
+                CREATE INDEX IF NOT EXISTS idx_config_adj_time 
+                    ON config_adjustments(timestamp);
+
+                CREATE TABLE IF NOT EXISTS config_learned_ranges (
+                    node_name TEXT NOT NULL,
+                    config_key TEXT NOT NULL,
+                    optimal_min REAL,
+                    optimal_max REAL,
+                    current_recommendation REAL,
+                    adjustments_count INTEGER DEFAULT 0,
+                    successful_adjustments INTEGER DEFAULT 0,
+                    last_success_value REAL,
+                    context_ranges TEXT,
+                    updated_at INTEGER,
+                    PRIMARY KEY (node_name, config_key)
+                );
+            """)
+            conn.commit()
+
+    def record_config_adjustment(
+        self,
+        node_name: str,
+        config_key: str,
+        old_value: Any,
+        new_value: Any,
+        trigger_reason: str,
+        reasoning: str = None,
+        confidence: float = None,
+        context_metrics: Dict = None
+    ) -> int:
+        """
+        Record a config adjustment for tracking and learning.
+
+        Args:
+            node_name: Node where config was changed
+            config_key: Config key that was changed
+            old_value: Previous value
+            new_value: New value
+            trigger_reason: Why the change was made (e.g., 'drain_detected', 'stagnation')
+            reasoning: Detailed explanation
+            confidence: 0-1 confidence in the decision
+            context_metrics: Relevant metrics at time of change
+
+        Returns:
+            ID of the recorded adjustment
+        """
+        self._ensure_config_tables()
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO config_adjustments 
+                (timestamp, node_name, config_key, old_value, new_value, 
+                 trigger_reason, reasoning, confidence, context_metrics)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                int(datetime.now().timestamp()),
+                node_name,
+                config_key,
+                json.dumps(old_value) if old_value is not None else None,
+                json.dumps(new_value),
+                trigger_reason,
+                reasoning,
+                confidence,
+                json.dumps(context_metrics) if context_metrics else None
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def record_config_outcome(
+        self,
+        adjustment_id: int,
+        outcome_metrics: Dict,
+        success: bool,
+        notes: str = None
+    ) -> None:
+        """
+        Record the outcome of a config adjustment.
+
+        Args:
+            adjustment_id: ID from record_config_adjustment
+            outcome_metrics: Metrics measured after change
+            success: Whether the change had desired effect
+            notes: Optional notes about the outcome
+        """
+        self._ensure_config_tables()
+        with self._get_conn() as conn:
+            conn.execute("""
+                UPDATE config_adjustments 
+                SET outcome_measured_at = ?,
+                    outcome_metrics = ?,
+                    outcome_success = ?,
+                    outcome_notes = ?
+                WHERE id = ?
+            """, (
+                int(datetime.now().timestamp()),
+                json.dumps(outcome_metrics),
+                1 if success else 0,
+                notes,
+                adjustment_id
+            ))
+            conn.commit()
+
+            # Update learned ranges
+            row = conn.execute(
+                "SELECT node_name, config_key, new_value FROM config_adjustments WHERE id = ?",
+                (adjustment_id,)
+            ).fetchone()
+            if row:
+                self._update_learned_range(
+                    row["node_name"], row["config_key"], 
+                    json.loads(row["new_value"]), success
+                )
+
+    def _update_learned_range(
+        self, node_name: str, config_key: str, value: Any, success: bool
+    ) -> None:
+        """Update learned optimal range for a config key."""
+        with self._get_conn() as conn:
+            row = conn.execute("""
+                SELECT * FROM config_learned_ranges 
+                WHERE node_name = ? AND config_key = ?
+            """, (node_name, config_key)).fetchone()
+
+            now = int(datetime.now().timestamp())
+            
+            if row:
+                adjustments = row["adjustments_count"] + 1
+                successful = row["successful_adjustments"] + (1 if success else 0)
+                
+                # Update optimal range based on success
+                try:
+                    val = float(value) if isinstance(value, (int, float, str)) else None
+                except (ValueError, TypeError):
+                    val = None
+
+                if val is not None and success:
+                    opt_min = row["optimal_min"]
+                    opt_max = row["optimal_max"]
+                    if opt_min is None or val < opt_min:
+                        opt_min = val
+                    if opt_max is None or val > opt_max:
+                        opt_max = val
+                    
+                    conn.execute("""
+                        UPDATE config_learned_ranges 
+                        SET adjustments_count = ?,
+                            successful_adjustments = ?,
+                            last_success_value = ?,
+                            optimal_min = ?,
+                            optimal_max = ?,
+                            updated_at = ?
+                        WHERE node_name = ? AND config_key = ?
+                    """, (adjustments, successful, val, opt_min, opt_max, now, node_name, config_key))
+                else:
+                    conn.execute("""
+                        UPDATE config_learned_ranges 
+                        SET adjustments_count = ?,
+                            successful_adjustments = ?,
+                            updated_at = ?
+                        WHERE node_name = ? AND config_key = ?
+                    """, (adjustments, successful, now, node_name, config_key))
+            else:
+                try:
+                    val = float(value) if isinstance(value, (int, float, str)) else None
+                except (ValueError, TypeError):
+                    val = None
+                    
+                conn.execute("""
+                    INSERT INTO config_learned_ranges 
+                    (node_name, config_key, adjustments_count, successful_adjustments,
+                     last_success_value, optimal_min, optimal_max, updated_at)
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                """, (
+                    node_name, config_key, 
+                    1 if success else 0,
+                    val if success else None,
+                    val if success else None,
+                    val if success else None,
+                    now
+                ))
+            conn.commit()
+
+    def get_config_adjustment_history(
+        self,
+        node_name: str = None,
+        config_key: str = None,
+        days: int = 30,
+        limit: int = 50
+    ) -> List[Dict]:
+        """
+        Get history of config adjustments.
+
+        Args:
+            node_name: Filter by node (optional)
+            config_key: Filter by config key (optional)
+            days: How far back to look
+            limit: Max records to return
+
+        Returns:
+            List of adjustment records
+        """
+        self._ensure_config_tables()
+        since = int((datetime.now() - timedelta(days=days)).timestamp())
+        
+        query = "SELECT * FROM config_adjustments WHERE timestamp >= ?"
+        params = [since]
+        
+        if node_name:
+            query += " AND node_name = ?"
+            params.append(node_name)
+        if config_key:
+            query += " AND config_key = ?"
+            params.append(config_key)
+        
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        
+        with self._get_conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_config_effectiveness(
+        self,
+        node_name: str = None,
+        config_key: str = None
+    ) -> Dict[str, Any]:
+        """
+        Get effectiveness analysis for config adjustments.
+
+        Returns:
+            Dict with success rates, learned ranges, and recommendations
+        """
+        self._ensure_config_tables()
+        
+        with self._get_conn() as conn:
+            # Get learned ranges
+            query = "SELECT * FROM config_learned_ranges WHERE 1=1"
+            params = []
+            if node_name:
+                query += " AND node_name = ?"
+                params.append(node_name)
+            if config_key:
+                query += " AND config_key = ?"
+                params.append(config_key)
+            
+            ranges = conn.execute(query, params).fetchall()
+            
+            # Get recent adjustments summary
+            since = int((datetime.now() - timedelta(days=30)).timestamp())
+            summary_query = """
+                SELECT config_key, 
+                       COUNT(*) as total_adjustments,
+                       SUM(CASE WHEN outcome_success = 1 THEN 1 ELSE 0 END) as successful,
+                       SUM(CASE WHEN outcome_success = 0 THEN 1 ELSE 0 END) as failed,
+                       SUM(CASE WHEN outcome_measured_at IS NULL THEN 1 ELSE 0 END) as pending
+                FROM config_adjustments
+                WHERE timestamp >= ?
+            """
+            params = [since]
+            if node_name:
+                summary_query += " AND node_name = ?"
+                params.append(node_name)
+            summary_query += " GROUP BY config_key"
+            
+            summaries = conn.execute(summary_query, params).fetchall()
+            
+            return {
+                "learned_ranges": [dict(r) for r in ranges],
+                "adjustment_summaries": [dict(s) for s in summaries],
+                "total_adjustments": sum(s["total_adjustments"] for s in summaries) if summaries else 0,
+                "overall_success_rate": (
+                    sum(s["successful"] or 0 for s in summaries) / 
+                    max(sum((s["successful"] or 0) + (s["failed"] or 0) for s in summaries), 1)
+                ) if summaries else 0
+            }
+
+    def get_pending_outcome_measurements(self, hours_since: int = 24) -> List[Dict]:
+        """
+        Get adjustments that need outcome measurement.
+
+        Args:
+            hours_since: Only consider adjustments older than this
+
+        Returns:
+            List of adjustments needing measurement
+        """
+        self._ensure_config_tables()
+        cutoff = int((datetime.now() - timedelta(hours=hours_since)).timestamp())
+        
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM config_adjustments
+                WHERE outcome_measured_at IS NULL
+                  AND timestamp < ?
+                  AND rolled_back = 0
+                ORDER BY timestamp ASC
+            """, (cutoff,)).fetchall()
+            return [dict(row) for row in rows]

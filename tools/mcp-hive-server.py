@@ -1864,6 +1864,135 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
+            name="config_adjust",
+            description="""Adjust cl-revenue-ops config with tracking for learning and analysis.
+
+Records the adjustment in advisor database, enabling outcome measurement and 
+effectiveness analysis over time. Use instead of revenue_config when you want
+to track the decision and learn from outcomes.
+
+**Recommended config keys for advisor tuning:**
+- min_fee_ppm: Fee floor (raise if drain detected, lower if stagnating)
+- max_fee_ppm: Fee ceiling (adjust based on competitive positioning)
+- daily_budget_sats: Rebalance budget (scale with profitability)
+- rebalance_max_amount: Max rebalance size per operation
+- thompson_observation_decay_hours: Shorter (72h) in volatile, longer (168h) in stable
+- hive_prior_weight: Trust in hive intelligence (0-1)
+- scarcity_threshold: When to apply scarcity pricing (0-1)
+
+**Trigger reasons:** drain_detected, stagnation, profitability_low, profitability_high,
+budget_exhausted, market_conditions, competitive_pressure, channel_health""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "config_key": {
+                        "type": "string",
+                        "description": "Config key to adjust"
+                    },
+                    "new_value": {
+                        "type": ["string", "number", "boolean"],
+                        "description": "New value to set"
+                    },
+                    "trigger_reason": {
+                        "type": "string",
+                        "description": "Why making this change (e.g., drain_detected, stagnation)"
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "Detailed explanation of the decision"
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "0-1 confidence in the change"
+                    },
+                    "context_metrics": {
+                        "type": "object",
+                        "description": "Relevant metrics at time of change for outcome comparison"
+                    }
+                },
+                "required": ["node", "config_key", "new_value", "trigger_reason"]
+            }
+        ),
+        Tool(
+            name="config_adjustment_history",
+            description="""Get history of config adjustments for analysis and learning.
+
+Use this to review what changes were made, why, and their outcomes.
+Essential for understanding which adjustments worked and which didn't.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Filter by node (optional)"
+                    },
+                    "config_key": {
+                        "type": "string",
+                        "description": "Filter by specific config key (optional)"
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "How far back to look (default: 30)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max records (default: 50)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="config_effectiveness",
+            description="""Analyze effectiveness of config adjustments over time.
+
+Shows success rates, learned optimal ranges, and recommendations
+based on historical adjustment outcomes. Use to understand which
+config values work best for this fleet.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Filter by node (optional)"
+                    },
+                    "config_key": {
+                        "type": "string",
+                        "description": "Filter by specific config key (optional)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="config_measure_outcomes",
+            description="""Measure outcomes for pending config adjustments.
+
+Compares current metrics against metrics at time of adjustment
+to determine if changes were successful. Should be called periodically
+(e.g., 24-48h after adjustments) to evaluate effectiveness.
+
+This enables the learning loop: adjust -> measure -> learn -> improve.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hours_since": {
+                        "type": "integer",
+                        "description": "Only measure adjustments older than this (default: 24)"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, show what would be measured without recording"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
             name="revenue_debug",
             description="Get diagnostic information for troubleshooting fee or rebalance issues.",
             inputSchema={
@@ -7127,6 +7256,315 @@ async def handle_revenue_config(args: Dict) -> Dict:
         params["value"] = value
 
     return await node.call("revenue-config", params)
+
+
+async def handle_config_adjust(args: Dict) -> Dict:
+    """
+    Adjust cl-revenue-ops config with tracking for analysis and learning.
+    
+    Records the adjustment in advisor database with context metrics,
+    enabling outcome measurement and effectiveness analysis over time.
+    
+    Recommended config keys for advisor tuning:
+    - min_fee_ppm: Fee floor (raise if drain detected, lower if stagnating)
+    - max_fee_ppm: Fee ceiling (adjust based on competitive positioning)
+    - daily_budget_sats: Rebalance budget (scale with profitability)
+    - rebalance_max_amount: Max rebalance size
+    - thompson_observation_decay_hours: Shorter in volatile conditions
+    - hive_prior_weight: Trust in hive intelligence (0-1)
+    - scarcity_threshold: When to apply scarcity pricing
+    
+    Args:
+        node: Node name to adjust
+        config_key: Config key to change
+        new_value: New value to set
+        trigger_reason: Why making this change (e.g., 'drain_detected', 'stagnation', 
+                       'profitability_low', 'budget_exhausted', 'market_conditions')
+        reasoning: Detailed explanation of the decision
+        confidence: 0-1 confidence in the change
+        context_metrics: Optional dict of relevant metrics at time of change
+        
+    Returns:
+        Result including adjustment_id for later outcome tracking
+    """
+    node_name = args.get("node")
+    config_key = args.get("config_key")
+    new_value = args.get("new_value")
+    trigger_reason = args.get("trigger_reason")
+    reasoning = args.get("reasoning")
+    confidence = args.get("confidence")
+    context_metrics = args.get("context_metrics", {})
+    
+    if not all([node_name, config_key, new_value is not None, trigger_reason]):
+        return {"error": "Required: node, config_key, new_value, trigger_reason"}
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    # Get current value first
+    current_config = await node.call("revenue-config", {"action": "get", "key": config_key})
+    if "error" in current_config:
+        return current_config
+    
+    old_value = current_config.get("config", {}).get(config_key)
+    
+    # Apply the change
+    result = await node.call("revenue-config", {
+        "action": "set",
+        "key": config_key,
+        "value": str(new_value)  # revenue-config expects string values
+    })
+    
+    if "error" in result:
+        return result
+    
+    # Record in advisor database
+    db = ensure_advisor_db()
+    adjustment_id = db.record_config_adjustment(
+        node_name=node_name,
+        config_key=config_key,
+        old_value=old_value,
+        new_value=new_value,
+        trigger_reason=trigger_reason,
+        reasoning=reasoning,
+        confidence=confidence,
+        context_metrics=context_metrics
+    )
+    
+    return {
+        "success": True,
+        "adjustment_id": adjustment_id,
+        "node": node_name,
+        "config_key": config_key,
+        "old_value": old_value,
+        "new_value": new_value,
+        "trigger_reason": trigger_reason,
+        "message": f"Config {config_key} changed from {old_value} to {new_value}. "
+                   f"Track outcome with adjustment_id={adjustment_id}"
+    }
+
+
+async def handle_config_adjustment_history(args: Dict) -> Dict:
+    """
+    Get history of config adjustments for analysis.
+    
+    Use this to review what changes were made, why, and their outcomes.
+    
+    Args:
+        node: Filter by node (optional)
+        config_key: Filter by specific config key (optional)
+        days: How far back to look (default: 30)
+        limit: Max records (default: 50)
+        
+    Returns:
+        List of adjustment records with outcomes
+    """
+    node_name = args.get("node")
+    config_key = args.get("config_key")
+    days = args.get("days", 30)
+    limit = args.get("limit", 50)
+    
+    db = ensure_advisor_db()
+    history = db.get_config_adjustment_history(
+        node_name=node_name,
+        config_key=config_key,
+        days=days,
+        limit=limit
+    )
+    
+    # Parse JSON fields for readability
+    for record in history:
+        for field in ['old_value', 'new_value', 'context_metrics', 'outcome_metrics']:
+            if record.get(field):
+                try:
+                    record[field] = json.loads(record[field])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+    
+    return {
+        "count": len(history),
+        "adjustments": history
+    }
+
+
+async def handle_config_effectiveness(args: Dict) -> Dict:
+    """
+    Analyze effectiveness of config adjustments.
+    
+    Shows success rates, learned optimal ranges, and recommendations
+    based on historical adjustment outcomes.
+    
+    Args:
+        node: Filter by node (optional)
+        config_key: Filter by specific config key (optional)
+        
+    Returns:
+        Effectiveness analysis with learned ranges and success rates
+    """
+    node_name = args.get("node")
+    config_key = args.get("config_key")
+    
+    db = ensure_advisor_db()
+    effectiveness = db.get_config_effectiveness(
+        node_name=node_name,
+        config_key=config_key
+    )
+    
+    # Parse context_ranges JSON
+    for r in effectiveness.get("learned_ranges", []):
+        if r.get("context_ranges"):
+            try:
+                r["context_ranges"] = json.loads(r["context_ranges"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+    
+    return effectiveness
+
+
+async def handle_config_measure_outcomes(args: Dict) -> Dict:
+    """
+    Measure outcomes for pending config adjustments.
+    
+    Compares current metrics against metrics at time of adjustment
+    to determine if the change was successful.
+    
+    Should be called periodically (e.g., 24-48h after adjustments)
+    to evaluate effectiveness.
+    
+    Args:
+        hours_since: Only measure adjustments older than this (default: 24)
+        dry_run: If true, show what would be measured without recording
+        
+    Returns:
+        List of measured outcomes
+    """
+    hours_since = args.get("hours_since", 24)
+    dry_run = args.get("dry_run", False)
+    
+    db = ensure_advisor_db()
+    pending = db.get_pending_outcome_measurements(hours_since=hours_since)
+    
+    if not pending:
+        return {"message": "No pending outcome measurements", "measured": []}
+    
+    results = []
+    
+    for adj in pending:
+        node_name = adj["node_name"]
+        config_key = adj["config_key"]
+        
+        node = fleet.get_node(node_name)
+        if not node:
+            results.append({
+                "adjustment_id": adj["id"],
+                "error": f"Node {node_name} not found"
+            })
+            continue
+        
+        # Get current metrics based on config type
+        try:
+            if config_key in ["min_fee_ppm", "max_fee_ppm"]:
+                # Measure fee effectiveness via revenue
+                dashboard = await node.call("revenue-dashboard", {"window_days": 1})
+                current_metrics = {
+                    "revenue_sats": dashboard.get("period", {}).get("gross_revenue_sats", 0),
+                    "forward_count": dashboard.get("period", {}).get("forward_count", 0),
+                    "volume_sats": dashboard.get("period", {}).get("volume_sats", 0)
+                }
+            elif config_key in ["daily_budget_sats", "rebalance_max_amount"]:
+                # Measure rebalance effectiveness
+                dashboard = await node.call("revenue-dashboard", {"window_days": 1})
+                current_metrics = {
+                    "rebalance_cost_sats": dashboard.get("period", {}).get("rebalance_cost_sats", 0),
+                    "net_profit_sats": dashboard.get("financial_health", {}).get("net_profit_sats", 0)
+                }
+            else:
+                # Generic metrics
+                dashboard = await node.call("revenue-dashboard", {"window_days": 1})
+                current_metrics = {
+                    "net_profit_sats": dashboard.get("financial_health", {}).get("net_profit_sats", 0),
+                    "operating_margin_pct": dashboard.get("financial_health", {}).get("operating_margin_pct", 0)
+                }
+        except Exception as e:
+            results.append({
+                "adjustment_id": adj["id"],
+                "error": str(e)
+            })
+            continue
+        
+        # Compare with context metrics at time of change
+        context_metrics = {}
+        if adj.get("context_metrics"):
+            try:
+                context_metrics = json.loads(adj["context_metrics"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
+        # Determine success based on improvement
+        success = False
+        notes = []
+        
+        if config_key in ["min_fee_ppm", "max_fee_ppm"]:
+            # Success if revenue or volume improved
+            old_rev = context_metrics.get("revenue_sats", 0)
+            new_rev = current_metrics.get("revenue_sats", 0)
+            if new_rev >= old_rev:
+                success = True
+                notes.append(f"Revenue maintained/improved: {old_rev} -> {new_rev}")
+            else:
+                notes.append(f"Revenue decreased: {old_rev} -> {new_rev}")
+                
+        elif config_key in ["daily_budget_sats", "rebalance_max_amount"]:
+            # Success if net profit improved or costs reduced
+            old_profit = context_metrics.get("net_profit_sats", 0)
+            new_profit = current_metrics.get("net_profit_sats", 0)
+            if new_profit >= old_profit:
+                success = True
+                notes.append(f"Profit maintained/improved: {old_profit} -> {new_profit}")
+            else:
+                notes.append(f"Profit decreased: {old_profit} -> {new_profit}")
+        else:
+            # Default: check margin improvement
+            old_margin = context_metrics.get("operating_margin_pct", 0)
+            new_margin = current_metrics.get("operating_margin_pct", 0)
+            if new_margin >= old_margin:
+                success = True
+                notes.append(f"Margin maintained/improved: {old_margin} -> {new_margin}")
+            else:
+                notes.append(f"Margin decreased: {old_margin} -> {new_margin}")
+        
+        outcome = {
+            "adjustment_id": adj["id"],
+            "node": node_name,
+            "config_key": config_key,
+            "old_value": adj["old_value"],
+            "new_value": adj["new_value"],
+            "trigger_reason": adj["trigger_reason"],
+            "success": success,
+            "notes": "; ".join(notes),
+            "context_metrics": context_metrics,
+            "current_metrics": current_metrics
+        }
+        
+        if not dry_run:
+            db.record_config_outcome(
+                adjustment_id=adj["id"],
+                outcome_metrics=current_metrics,
+                success=success,
+                notes="; ".join(notes)
+            )
+        
+        results.append(outcome)
+    
+    return {
+        "dry_run": dry_run,
+        "measured_count": len(results),
+        "successful": sum(1 for r in results if r.get("success")),
+        "failed": sum(1 for r in results if r.get("success") is False),
+        "errors": sum(1 for r in results if "error" in r),
+        "results": results
+    }
 
 
 async def handle_revenue_debug(args: Dict) -> Dict:
@@ -12442,6 +12880,10 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_rebalance": handle_revenue_rebalance,
     "revenue_report": handle_revenue_report,
     "revenue_config": handle_revenue_config,
+    "config_adjust": handle_config_adjust,
+    "config_adjustment_history": handle_config_adjustment_history,
+    "config_effectiveness": handle_config_effectiveness,
+    "config_measure_outcomes": handle_config_measure_outcomes,
     "revenue_debug": handle_revenue_debug,
     "revenue_history": handle_revenue_history,
     "revenue_competitor_analysis": handle_revenue_competitor_analysis,
