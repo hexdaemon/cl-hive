@@ -70,17 +70,28 @@ export NODE_OPTIONS="--max-old-space-size=2048"
 
 # Run Claude with MCP server
 # The advisor uses enhanced automation tools for efficient fleet management
-claude -p "Run the complete advisor workflow as defined in the system prompt:
+claude -p "Run the complete advisor workflow. CRITICAL RULES:
 
-1. **Quick Assessment**: fleet_health_summary, membership_dashboard, routing_intelligence_health
-2. **Process Pending**: process_all_pending on all nodes (preview with dry_run=true, then execute)
-3. **Health Analysis**: critical_velocity, connectivity_recommendations, advisor_get_trends
-4. **Generate Report**: Follow the output format in system prompt
+## ANTI-HALLUCINATION (MANDATORY)
+- Call each tool FIRST, then report its EXACT output values
+- Copy numbers exactly - do not round or estimate
+- Use TODAY's real date (from system context), never invent timestamps
+- If a tool fails, say 'Tool call failed' - never fabricate data
+- Volume=0 with Revenue>0 is IMPOSSIBLE - verify data consistency
 
-**IMPORTANT**: Do NOT execute fee changes. Skip execute_safe_opportunities and remediate_stagnant.
-Report stagnant channels and fee recommendations for human review only.
+## WORKFLOW
+1. **Quick Assessment**: Call fleet_health_summary, membership_dashboard, routing_intelligence_health (both nodes)
+2. **Process Pending**: process_all_pending(dry_run=true), then process_all_pending(dry_run=false)
+3. **Health Analysis**: critical_velocity, stagnant_channels, advisor_get_trends
+4. **Generate Report**: Use EXACT values from tool outputs
 
-Run on ALL fleet nodes. Use the enhanced automation tools - they handle criteria evaluation automatically." \
+## FORBIDDEN ACTIONS
+- Do NOT call execute_safe_opportunities
+- Do NOT call remediate_stagnant with dry_run=false
+- Do NOT execute any fee changes
+- Report recommendations for HUMAN REVIEW only
+
+Call tools on BOTH nodes: hive-nexus-01 and hive-nexus-02." \
     --mcp-config "$MCP_CONFIG_TMP" \
     --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
