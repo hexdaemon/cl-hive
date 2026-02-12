@@ -1081,6 +1081,10 @@ class MockPersistenceDatabase:
         self.members = {}
         self._pheromones = []
         self._markers = []
+        self._defense_reports = []
+        self._defense_fees = []
+        self._remote_pheromones = []
+        self._fee_observations = []
 
     def get_all_members(self):
         return list(self.members.values()) if self.members else []
@@ -1109,6 +1113,31 @@ class MockPersistenceDatabase:
         if not self._markers:
             return None
         return max(m['timestamp'] for m in self._markers)
+
+    def save_defense_state(self, reports, active_fees):
+        self._defense_reports = list(reports)
+        self._defense_fees = list(active_fees)
+        return len(reports) + len(active_fees)
+
+    def load_defense_state(self):
+        return {
+            'reports': list(self._defense_reports),
+            'active_fees': list(self._defense_fees),
+        }
+
+    def save_remote_pheromones(self, pheromones):
+        self._remote_pheromones = list(pheromones)
+        return len(pheromones)
+
+    def load_remote_pheromones(self):
+        return list(self._remote_pheromones)
+
+    def save_fee_observations(self, observations):
+        self._fee_observations = list(observations)
+        return len(observations)
+
+    def load_fee_observations(self):
+        return list(self._fee_observations)
 
 
 class TestPersistence:
@@ -1265,3 +1294,205 @@ class TestPersistence:
         expected = math.pow(1 - BASE_EVAPORATION_RATE, hours_ago)
         actual = ctrl._pheromone["100x1x0"]
         assert abs(actual - expected) < 0.05, f"Expected ~{expected:.3f}, got {actual:.3f}"
+
+    def test_save_load_defense_warnings_round_trip(self):
+        """Create warnings via handle_warning, save, clear, restore, verify."""
+        defense = self.manager.defense_system
+        our_pubkey = "02" + "bb" * 32
+        defense.set_our_pubkey(our_pubkey)
+        threat_peer = "02" + "dd" * 32
+
+        # Create a self-detected warning (immediate defense)
+        warning = PeerWarning(
+            peer_id=threat_peer,
+            threat_type="drain",
+            severity=0.8,
+            reporter=our_pubkey,
+            timestamp=time.time(),
+            ttl=WARNING_TTL_HOURS * 3600,
+            evidence={"drain_rate": 5.2},
+        )
+        result = defense.handle_warning(warning)
+        assert result is not None
+        assert result['multiplier'] > 1.0
+
+        # Save
+        saved = self.manager.save_state_to_database()
+        assert saved['defense_reports'] == 1
+        assert saved['defense_fees'] == 1
+
+        # Clear in-memory state
+        with defense._lock:
+            defense._warnings.clear()
+            defense._warning_reports.clear()
+            defense._defensive_fees.clear()
+
+        assert len(defense._warnings) == 0
+        assert len(defense._defensive_fees) == 0
+
+        # Restore
+        restored = self.manager.restore_state_from_database()
+        assert restored['defense_reports'] == 1
+        assert restored['defense_fees'] == 1
+
+        # Verify reports rebuilt
+        assert threat_peer in defense._warning_reports
+        assert our_pubkey in defense._warning_reports[threat_peer]
+        restored_warning = defense._warning_reports[threat_peer][our_pubkey]
+        assert restored_warning.threat_type == "drain"
+        assert restored_warning.severity == 0.8
+        assert restored_warning.evidence == {"drain_rate": 5.2}
+
+        # Verify _warnings derived from reports
+        assert threat_peer in defense._warnings
+
+        # Verify defensive fees
+        assert threat_peer in defense._defensive_fees
+        assert defense._defensive_fees[threat_peer]['multiplier'] > 1.0
+
+    def test_save_filters_expired_warnings(self):
+        """Expired warnings are excluded from save."""
+        defense = self.manager.defense_system
+        our_pubkey = "02" + "bb" * 32
+        defense.set_our_pubkey(our_pubkey)
+        threat_peer = "02" + "dd" * 32
+
+        # Create an already-expired warning
+        warning = PeerWarning(
+            peer_id=threat_peer,
+            threat_type="drain",
+            severity=0.5,
+            reporter=our_pubkey,
+            timestamp=time.time() - 100,  # 100 seconds ago
+            ttl=50,  # TTL of 50 seconds -> expired 50 seconds ago
+            evidence={},
+        )
+        with defense._lock:
+            defense._warning_reports[threat_peer][our_pubkey] = warning
+            defense._warnings[threat_peer] = warning
+            defense._defensive_fees[threat_peer] = {
+                'multiplier': 2.0,
+                'expires_at': time.time() - 50,  # Already expired
+                'threat_type': 'drain',
+                'reporter': our_pubkey,
+                'report_count': 1,
+            }
+
+        saved = self.manager.save_state_to_database()
+        assert saved['defense_reports'] == 0
+        assert saved['defense_fees'] == 0
+
+    def test_save_load_remote_pheromones_round_trip(self):
+        """Populate via receive_pheromone_from_gossip, save, clear, restore, verify."""
+        ctrl = self.manager.adaptive_controller
+        peer_a = "02" + "aa" * 32
+        reporter_1 = "02" + "11" * 32
+
+        # Receive a pheromone
+        ctrl.receive_pheromone_from_gossip(
+            reporter_id=reporter_1,
+            pheromone_data={"peer_id": peer_a, "level": 2.5, "fee_ppm": 350},
+        )
+
+        # Save
+        saved = self.manager.save_state_to_database()
+        assert saved['remote_pheromones'] == 1
+
+        # Clear in-memory
+        with ctrl._lock:
+            ctrl._remote_pheromones.clear()
+
+        assert len(ctrl._remote_pheromones) == 0
+
+        # Restore
+        restored = self.manager.restore_state_from_database()
+        assert restored['remote_pheromones'] == 1
+
+        # Verify
+        assert peer_a in ctrl._remote_pheromones
+        assert len(ctrl._remote_pheromones[peer_a]) == 1
+        entry = ctrl._remote_pheromones[peer_a][0]
+        assert entry['reporter_id'] == reporter_1
+        assert entry['fee_ppm'] == 350
+
+    def test_save_load_fee_observations_round_trip(self):
+        """Record observations, save, clear, restore, verify."""
+        ctrl = self.manager.adaptive_controller
+
+        # Record some observations
+        ctrl.record_fee_observation(200)
+        ctrl.record_fee_observation(350)
+
+        # Save
+        saved = self.manager.save_state_to_database()
+        assert saved['fee_observations'] == 2
+
+        # Clear in-memory
+        with ctrl._fee_obs_lock:
+            ctrl._fee_observations.clear()
+
+        assert len(ctrl._fee_observations) == 0
+
+        # Restore
+        restored = self.manager.restore_state_from_database()
+        assert restored['fee_observations'] == 2
+
+        # Verify
+        assert len(ctrl._fee_observations) == 2
+        fees = [f for _, f in ctrl._fee_observations]
+        assert 200 in fees
+        assert 350 in fees
+
+    def test_restore_filters_old_fee_observations(self):
+        """Observations older than 1 hour are excluded on restore."""
+        # Directly populate mock DB with old and recent observations
+        now = time.time()
+        self.db._fee_observations = [
+            {'timestamp': now - 7200, 'fee_ppm': 100},  # 2 hours ago - too old
+            {'timestamp': now - 1800, 'fee_ppm': 200},  # 30 min ago - recent
+        ]
+
+        restored = self.manager.restore_state_from_database()
+        assert restored['fee_observations'] == 1
+
+        ctrl = self.manager.adaptive_controller
+        assert len(ctrl._fee_observations) == 1
+        assert ctrl._fee_observations[0][1] == 200
+
+    def test_defense_restore_derives_warnings_from_reports(self):
+        """Verify _warnings dict is correctly rebuilt from _warning_reports."""
+        defense = self.manager.defense_system
+        threat_peer = "02" + "dd" * 32
+        reporter_a = "02" + "aa" * 32
+        reporter_b = "02" + "cc" * 32
+        now = time.time()
+
+        # Directly populate mock DB with two reports at different severities
+        self.db._defense_reports = [
+            {
+                'peer_id': threat_peer,
+                'reporter_id': reporter_a,
+                'threat_type': 'drain',
+                'severity': 0.3,
+                'timestamp': now,
+                'ttl': WARNING_TTL_HOURS * 3600,
+                'evidence_json': '{}',
+            },
+            {
+                'peer_id': threat_peer,
+                'reporter_id': reporter_b,
+                'threat_type': 'drain',
+                'severity': 0.9,
+                'timestamp': now,
+                'ttl': WARNING_TTL_HOURS * 3600,
+                'evidence_json': '{"drain_rate": 8.0}',
+            },
+        ]
+
+        restored = self.manager.restore_state_from_database()
+        assert restored['defense_reports'] == 2
+
+        # _warnings should have the highest severity report
+        assert threat_peer in defense._warnings
+        assert defense._warnings[threat_peer].severity == 0.9
+        assert defense._warnings[threat_peer].evidence == {"drain_rate": 8.0}

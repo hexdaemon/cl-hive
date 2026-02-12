@@ -12,6 +12,7 @@ This module integrates with cl-revenue-ops for fee execution while
 maintaining coordination at the cl-hive layer.
 """
 
+import json
 import math
 import threading
 import time
@@ -2683,7 +2684,72 @@ class FeeCoordinationManager:
 
         self.database.save_stigmergic_markers(marker_snapshot)
 
-        return {'pheromones': len(pheromone_snapshot), 'markers': len(marker_snapshot)}
+        # Snapshot defense state under lock
+        now = time.time()
+        reports_snapshot = []
+        fees_snapshot = []
+        with self.defense_system._lock:
+            for peer_id, reporters in self.defense_system._warning_reports.items():
+                for reporter_id, warning in reporters.items():
+                    if warning.timestamp + warning.ttl > now:
+                        reports_snapshot.append({
+                            'peer_id': warning.peer_id,
+                            'reporter_id': reporter_id,
+                            'threat_type': warning.threat_type,
+                            'severity': warning.severity,
+                            'timestamp': warning.timestamp,
+                            'ttl': warning.ttl,
+                            'evidence_json': json.dumps(warning.evidence) if warning.evidence else '{}',
+                        })
+            for peer_id, fee_info in self.defense_system._defensive_fees.items():
+                if fee_info['expires_at'] > now:
+                    fees_snapshot.append({
+                        'peer_id': peer_id,
+                        'multiplier': fee_info['multiplier'],
+                        'expires_at': fee_info['expires_at'],
+                        'threat_type': fee_info['threat_type'],
+                        'reporter': fee_info['reporter'],
+                        'report_count': fee_info['report_count'],
+                    })
+
+        self.database.save_defense_state(reports_snapshot, fees_snapshot)
+
+        # Snapshot remote pheromones under lock
+        remote_snapshot = []
+        cutoff_48h = now - 48 * 3600
+        with self.adaptive_controller._lock:
+            for peer_id, entries in self.adaptive_controller._remote_pheromones.items():
+                for entry in entries:
+                    if entry.get('timestamp', 0) > cutoff_48h:
+                        remote_snapshot.append({
+                            'peer_id': peer_id,
+                            'reporter_id': entry.get('reporter_id', ''),
+                            'level': entry.get('level', 0),
+                            'fee_ppm': entry.get('fee_ppm', 0),
+                            'timestamp': entry.get('timestamp', 0),
+                            'weight': entry.get('weight', 0.3),
+                        })
+
+        self.database.save_remote_pheromones(remote_snapshot)
+
+        # Snapshot fee observations under lock
+        obs_snapshot = []
+        cutoff_1h = now - 3600
+        with self.adaptive_controller._fee_obs_lock:
+            for ts, fee in self.adaptive_controller._fee_observations:
+                if ts > cutoff_1h:
+                    obs_snapshot.append({'timestamp': ts, 'fee_ppm': fee})
+
+        self.database.save_fee_observations(obs_snapshot)
+
+        return {
+            'pheromones': len(pheromone_snapshot),
+            'markers': len(marker_snapshot),
+            'defense_reports': len(reports_snapshot),
+            'defense_fees': len(fees_snapshot),
+            'remote_pheromones': len(remote_snapshot),
+            'fee_observations': len(obs_snapshot),
+        }
 
     def restore_state_from_database(self) -> Dict[str, int]:
         """
@@ -2743,7 +2809,99 @@ class FeeCoordinationManager:
                 self.stigmergic_coord._markers[key].append(marker)
                 marker_count += 1
 
-        return {'pheromones': pheromone_count, 'markers': marker_count}
+        # Restore defense state
+        defense_report_count = 0
+        defense_fee_count = 0
+        defense_data = self.database.load_defense_state()
+
+        with self.defense_system._lock:
+            # Rebuild _warning_reports
+            for row in defense_data.get('reports', []):
+                if row['timestamp'] + row['ttl'] <= now:
+                    continue
+                try:
+                    evidence = json.loads(row.get('evidence_json', '{}') or '{}')
+                except (json.JSONDecodeError, TypeError):
+                    evidence = {}
+                warning = PeerWarning(
+                    peer_id=row['peer_id'],
+                    threat_type=row['threat_type'],
+                    severity=row['severity'],
+                    reporter=row['reporter_id'],
+                    timestamp=row['timestamp'],
+                    ttl=row['ttl'],
+                    evidence=evidence,
+                )
+                self.defense_system._warning_reports[row['peer_id']][row['reporter_id']] = warning
+                defense_report_count += 1
+
+            # Derive _warnings from reports: pick highest severity per peer
+            for peer_id, reporters in self.defense_system._warning_reports.items():
+                if reporters:
+                    best = max(reporters.values(), key=lambda w: w.severity)
+                    self.defense_system._warnings[peer_id] = best
+
+            # Rebuild _defensive_fees
+            for row in defense_data.get('active_fees', []):
+                if row['expires_at'] <= now:
+                    continue
+                self.defense_system._defensive_fees[row['peer_id']] = {
+                    'multiplier': row['multiplier'],
+                    'expires_at': row['expires_at'],
+                    'threat_type': row['threat_type'],
+                    'reporter': row['reporter'],
+                    'report_count': row['report_count'],
+                }
+                defense_fee_count += 1
+
+        # Restore remote pheromones
+        remote_count = 0
+        remote_rows = self.database.load_remote_pheromones()
+        cutoff_48h = now - 48 * 3600
+
+        with self.adaptive_controller._lock:
+            for row in remote_rows:
+                if row['timestamp'] <= cutoff_48h:
+                    continue
+                peer_id = row['peer_id']
+                entry = {
+                    'reporter_id': row['reporter_id'],
+                    'level': row['level'],
+                    'fee_ppm': row['fee_ppm'],
+                    'timestamp': row['timestamp'],
+                    'weight': row['weight'],
+                }
+                self.adaptive_controller._remote_pheromones[peer_id].append(entry)
+                remote_count += 1
+
+            # Cap at 10 per peer (same as receive_pheromone_from_gossip limit)
+            for peer_id in list(self.adaptive_controller._remote_pheromones.keys()):
+                entries = self.adaptive_controller._remote_pheromones[peer_id]
+                if len(entries) > 10:
+                    self.adaptive_controller._remote_pheromones[peer_id] = entries[-10:]
+
+        # Restore fee observations
+        obs_count = 0
+        obs_rows = self.database.load_fee_observations()
+        cutoff_1h = now - 3600
+
+        with self.adaptive_controller._fee_obs_lock:
+            for row in obs_rows:
+                if row['timestamp'] <= cutoff_1h:
+                    continue
+                self.adaptive_controller._fee_observations.append(
+                    (row['timestamp'], row['fee_ppm'])
+                )
+                obs_count += 1
+
+        return {
+            'pheromones': pheromone_count,
+            'markers': marker_count,
+            'defense_reports': defense_report_count,
+            'defense_fees': defense_fee_count,
+            'remote_pheromones': remote_count,
+            'fee_observations': obs_count,
+        }
 
     def should_auto_backfill(self) -> bool:
         """

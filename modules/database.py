@@ -1244,6 +1244,58 @@ class HiveDatabase:
             ON stigmergic_markers(source_peer_id, destination_peer_id)
         """)
 
+        # Defense warning report persistence
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS defense_warning_reports (
+                peer_id TEXT NOT NULL,
+                reporter_id TEXT NOT NULL,
+                threat_type TEXT NOT NULL,
+                severity REAL NOT NULL,
+                timestamp REAL NOT NULL,
+                ttl REAL NOT NULL,
+                evidence_json TEXT,
+                PRIMARY KEY (peer_id, reporter_id)
+            )
+        """)
+
+        # Defense active fee persistence
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS defense_active_fees (
+                peer_id TEXT PRIMARY KEY,
+                multiplier REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                threat_type TEXT NOT NULL,
+                reporter TEXT NOT NULL,
+                report_count INTEGER NOT NULL
+            )
+        """)
+
+        # Remote pheromone persistence (fleet-shared fee intelligence)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS remote_pheromones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id TEXT NOT NULL,
+                reporter_id TEXT NOT NULL,
+                level REAL NOT NULL,
+                fee_ppm INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                weight REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_remote_pheromones_peer
+            ON remote_pheromones(peer_id)
+        """)
+
+        # Fee observation persistence (network fee volatility samples)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fee_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                fee_ppm INTEGER NOT NULL
+            )
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -6848,3 +6900,116 @@ class HiveDatabase:
             "SELECT MAX(timestamp) as latest FROM stigmergic_markers"
         ).fetchone()
         return row['latest'] if row and row['latest'] is not None else None
+
+    def save_defense_state(self, reports: List[Dict[str, Any]],
+                           active_fees: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save defense warning reports and active fees (full-table replace).
+
+        Args:
+            reports: List of dicts with peer_id, reporter_id, threat_type,
+                     severity, timestamp, ttl, evidence_json
+            active_fees: List of dicts with peer_id, multiplier, expires_at,
+                         threat_type, reporter, report_count
+
+        Returns:
+            Total number of rows written across both tables.
+        """
+        conn = self._get_connection()
+        conn.execute("DELETE FROM defense_warning_reports")
+        conn.execute("DELETE FROM defense_active_fees")
+        for row in reports:
+            conn.execute(
+                """INSERT INTO defense_warning_reports
+                   (peer_id, reporter_id, threat_type, severity, timestamp, ttl, evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (row['peer_id'], row['reporter_id'], row['threat_type'],
+                 row['severity'], row['timestamp'], row['ttl'],
+                 row.get('evidence_json', '{}'))
+            )
+        for row in active_fees:
+            conn.execute(
+                """INSERT INTO defense_active_fees
+                   (peer_id, multiplier, expires_at, threat_type, reporter, report_count)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (row['peer_id'], row['multiplier'], row['expires_at'],
+                 row['threat_type'], row['reporter'], row['report_count'])
+            )
+        conn.commit()
+        return len(reports) + len(active_fees)
+
+    def load_defense_state(self) -> Dict[str, Any]:
+        """
+        Load persisted defense warning reports and active fees.
+
+        Returns:
+            Dict with 'reports' and 'active_fees' lists.
+        """
+        conn = self._get_connection()
+        report_rows = conn.execute(
+            "SELECT * FROM defense_warning_reports"
+        ).fetchall()
+        fee_rows = conn.execute(
+            "SELECT * FROM defense_active_fees"
+        ).fetchall()
+        return {
+            'reports': [dict(r) for r in report_rows],
+            'active_fees': [dict(r) for r in fee_rows],
+        }
+
+    def save_remote_pheromones(self, pheromones: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save remote pheromones (full-table replace).
+
+        Args:
+            pheromones: List of dicts with peer_id, reporter_id, level,
+                        fee_ppm, timestamp, weight
+
+        Returns:
+            Number of rows written.
+        """
+        conn = self._get_connection()
+        conn.execute("DELETE FROM remote_pheromones")
+        for row in pheromones:
+            conn.execute(
+                """INSERT INTO remote_pheromones
+                   (peer_id, reporter_id, level, fee_ppm, timestamp, weight)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (row['peer_id'], row['reporter_id'], row['level'],
+                 row['fee_ppm'], row['timestamp'], row['weight'])
+            )
+        conn.commit()
+        return len(pheromones)
+
+    def load_remote_pheromones(self) -> List[Dict[str, Any]]:
+        """Load all persisted remote pheromones."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM remote_pheromones").fetchall()
+        return [dict(r) for r in rows]
+
+    def save_fee_observations(self, observations: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save fee observations (full-table replace).
+
+        Args:
+            observations: List of dicts with timestamp, fee_ppm
+
+        Returns:
+            Number of rows written.
+        """
+        conn = self._get_connection()
+        conn.execute("DELETE FROM fee_observations")
+        for row in observations:
+            conn.execute(
+                """INSERT INTO fee_observations (timestamp, fee_ppm)
+                   VALUES (?, ?)""",
+                (row['timestamp'], row['fee_ppm'])
+            )
+        conn.commit()
+        return len(observations)
+
+    def load_fee_observations(self) -> List[Dict[str, Any]]:
+        """Load all persisted fee observations."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM fee_observations").fetchall()
+        return [dict(r) for r in rows]

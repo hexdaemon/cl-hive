@@ -1461,7 +1461,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     try:
         restored = fee_coordination_mgr.restore_state_from_database()
         plugin.log(f"cl-hive: Restored routing intelligence "
-                   f"(pheromones={restored['pheromones']}, markers={restored['markers']})")
+                   f"(pheromones={restored['pheromones']}, markers={restored['markers']}, "
+                   f"defense_reports={restored.get('defense_reports', 0)}, "
+                   f"defense_fees={restored.get('defense_fees', 0)}, "
+                   f"remote_pheromones={restored.get('remote_pheromones', 0)}, "
+                   f"fee_observations={restored.get('fee_observations', 0)})")
     except Exception as e:
         plugin.log(f"cl-hive: Failed to restore routing intelligence: {e}", level='warn')
 
@@ -9131,10 +9135,14 @@ def fee_intelligence_loop():
             try:
                 if fee_coordination_mgr:
                     saved = fee_coordination_mgr.save_state_to_database()
-                    if saved.get('pheromones', 0) > 0 or saved.get('markers', 0) > 0:
+                    if any(saved.get(k, 0) > 0 for k in saved):
                         safe_plugin.log(
                             f"cl-hive: Saved routing intelligence "
-                            f"(pheromones={saved['pheromones']}, markers={saved['markers']})",
+                            f"(pheromones={saved['pheromones']}, markers={saved['markers']}, "
+                            f"defense_reports={saved.get('defense_reports', 0)}, "
+                            f"defense_fees={saved.get('defense_fees', 0)}, "
+                            f"remote_pheromones={saved.get('remote_pheromones', 0)}, "
+                            f"fee_observations={saved.get('fee_observations', 0)})",
                             level='debug'
                         )
             except Exception as e:
