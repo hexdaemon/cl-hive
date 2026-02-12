@@ -1442,7 +1442,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         state_manager=state_manager
     )
     yield_metrics_mgr.set_our_pubkey(our_pubkey)
-    plugin.log("cl-hive: Yield metrics manager initialized (Phase 1)")
+    plugin.log("cl-hive: Yield metrics manager initialized")
 
     # Initialize Fee Coordination Manager (Phase 2 - Fee Coordination)
     global fee_coordination_mgr
@@ -1455,7 +1455,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     fee_coordination_mgr.set_our_pubkey(our_pubkey)
     fee_coordination_mgr.set_fee_intelligence_mgr(fee_intel_mgr)
-    plugin.log("cl-hive: Fee coordination manager initialized (Phase 2)")
+    plugin.log("cl-hive: Fee coordination manager initialized")
 
     # Restore persisted routing intelligence
     try:
@@ -1479,7 +1479,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         liquidity_coordinator=liquidity_coord
     )
     cost_reduction_mgr.set_our_pubkey(our_pubkey)
-    plugin.log("cl-hive: Cost reduction manager initialized (Phase 3)")
+    plugin.log("cl-hive: Cost reduction manager initialized")
 
     # Start MCF optimization background thread (Phase 15)
     mcf_thread = threading.Thread(
@@ -1488,7 +1488,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         daemon=True
     )
     mcf_thread.start()
-    plugin.log("cl-hive: MCF optimization thread started (Phase 15)")
+    plugin.log("cl-hive: MCF optimization thread started")
 
     # Initialize Rationalization Manager (Channel Rationalization)
     global rationalization_mgr
@@ -1518,7 +1518,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner=planner
     )
     strategic_positioning_mgr.set_our_pubkey(our_pubkey)
-    plugin.log("cl-hive: Strategic positioning manager initialized (Phase 5)")
+    plugin.log("cl-hive: Strategic positioning manager initialized")
 
     # Initialize Anticipatory Liquidity Manager (Phase 7.1 - Anticipatory Liquidity)
     global anticipatory_liquidity_mgr
@@ -1528,7 +1528,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         state_manager=state_manager,
         our_id=our_pubkey
     )
-    plugin.log("cl-hive: Anticipatory liquidity manager initialized (Phase 7.1)")
+    plugin.log("cl-hive: Anticipatory liquidity manager initialized")
 
     # Initialize Task Manager (Phase 10 - Task Delegation Protocol)
     global task_mgr
@@ -1537,7 +1537,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin=safe_plugin,
         our_pubkey=our_pubkey
     )
-    plugin.log("cl-hive: Task manager initialized (Phase 10)")
+    plugin.log("cl-hive: Task manager initialized")
 
     # Initialize Splice Manager (Phase 11 - Hive-Splice Coordination)
     global splice_mgr
@@ -1547,7 +1547,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         splice_coordinator=splice_coord,
         our_pubkey=our_pubkey
     )
-    plugin.log("cl-hive: Splice manager initialized (Phase 11)")
+    plugin.log("cl-hive: Splice manager initialized")
 
     # Initialize Outbox Manager (Phase D - Reliable Delivery)
     global outbox_mgr
@@ -1558,7 +1558,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         our_pubkey=our_pubkey,
         log_fn=lambda msg, level='info': safe_plugin.log(msg, level=level),
     )
-    plugin.log("cl-hive: Outbox manager initialized (Phase D)")
+    plugin.log("cl-hive: Outbox manager initialized")
 
     # Start outbox retry background thread
     outbox_thread = threading.Thread(
@@ -1567,12 +1567,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         daemon=True
     )
     outbox_thread.start()
-    plugin.log("cl-hive: Outbox retry thread started (Phase D)")
+    plugin.log("cl-hive: Outbox retry thread started")
 
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
-        plugin.log("cl-hive: Time-based fee adjustment enabled (Phase 7.4)")
+        plugin.log("cl-hive: Time-based fee adjustment enabled")
 
     # Link defense system to peer reputation manager for collective warnings
     if fee_coordination_mgr and peer_reputation_mgr:
