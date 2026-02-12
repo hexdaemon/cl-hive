@@ -84,7 +84,6 @@ Run on ALL fleet nodes. Use the enhanced automation tools - they handle criteria
     --mcp-config "$MCP_CONFIG_TMP" \
     --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
-    --max-budget-usd 1.00 \
     --allowedTools "mcp__hive__*" \
     --output-format text \
     2>&1 | tee -a "$LOG_FILE"
