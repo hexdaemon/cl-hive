@@ -58,6 +58,7 @@ The Thompson Sampling algorithm handles individual fee optimization; the advisor
 
 | Tool | Purpose |
 |------|---------|
+| `config_recommend` | **START HERE** - Get data-driven suggestions based on learned patterns |
 | `config_adjust` | **PRIMARY** - Adjust config with tracking for learning |
 | `config_adjustment_history` | Review past adjustments and outcomes |
 | `config_effectiveness` | Analyze which adjustments worked |
@@ -94,18 +95,58 @@ The Thompson Sampling algorithm handles individual fee optimization; the advisor
 | `thompson_observation_decay_hours` | 168 | ↓ (72h) in volatile conditions, ↑ (336h) in stable |
 | `hive_prior_weight` | 0.6 | ↑ if pheromone quality high, ↓ if data sparse |
 | `scarcity_threshold` | 0.3 | Adjust based on depletion patterns |
-| `vegas_decay_rate` | 0.85 | ↓ for faster adaptation, ↑ for stability |
+
+#### Sling Rebalancer Targets (Tier 3 - Conservative)
+**Only adjust ONE target at a time. Wait 48h+ between changes.**
+| Parameter | Default | Range | Trigger Conditions |
+|-----------|---------|-------|-------------------|
+| `sling_target_source` | 0.65 | 0.5-0.8 | ↓ if sources depleting too fast, ↑ if stuck full |
+| `sling_target_sink` | 0.4 | 0.2-0.5 | ↑ if sinks saturating, ↓ if too much inbound |
+| `sling_target_balanced` | 0.5 | 0.4-0.6 | Adjust based on which direction flows better |
+| `sling_chunk_size_sats` | 200k | 50k-500k | Scale with average channel size |
+| `rebalance_cooldown_hours` | 1 | 0.5-4 | ↑ if too much churn, ↓ if urgent imbalances |
+
+#### Advanced Algorithm (Tier 4 - Expert, Very Conservative)
+**These affect core algorithm behavior. Only adjust after 5+ successful Tier 1-3 adjustments.**
+| Parameter | Default | Range | Trigger Conditions |
+|-----------|---------|-------|-------------------|
+| `vegas_decay_rate` | 0.85 | 0.7-0.95 | ↓ for faster signal adaptation, ↑ for stability |
+| `ema_smoothing_alpha` | 0.3 | 0.1-0.5 | ↓ for smoother flow estimates, ↑ for responsiveness |
+| `kelly_fraction` | 0.6 | 0.3-0.8 | ↓ for conservative sizing, ↑ for aggressive |
+| `proportional_budget_pct` | 0.3 | 0.1-0.5 | Scale with profitability margin |
+
+## Parameter Groups (Isolation Enforced)
+
+**Parameters in the same group cannot be adjusted within 24h of each other:**
+- `fee_bounds`: min_fee_ppm, max_fee_ppm
+- `budget`: daily_budget_sats, rebalance_max_amount, rebalance_min_amount, proportional_budget_pct
+- `aimd`: aimd_additive_increase_ppm, aimd_multiplicative_decrease, aimd_failure_threshold, aimd_success_threshold
+- `thompson`: thompson_observation_decay_hours, thompson_prior_std_fee, thompson_max_observations
+- `liquidity`: low_liquidity_threshold, high_liquidity_threshold, scarcity_threshold
+- `sling_targets`: sling_target_source, sling_target_sink, sling_target_balanced
+- `sling_params`: sling_chunk_size_sats, sling_max_hops, sling_parallel_jobs
+- `algorithm`: vegas_decay_rate, ema_smoothing_alpha, kelly_fraction, hive_prior_weight
 
 ## Config Adjustment Learning Loop
 
-**CRITICAL: Always check history before adjusting.**
+**CRITICAL: Use learned patterns to make better decisions.**
 
 ### Before Any Adjustment:
 ```
-1. config_effectiveness(config_key=X) → What's the success rate for this param?
-2. config_adjustment_history(config_key=X, days=14) → Recent changes and outcomes?
-3. If success_rate < 50% for this param, reconsider or try different direction
-4. If same adjustment was tried <7 days ago and failed, don't repeat
+1. config_recommend(node=X) → Get data-driven suggestions based on:
+   - Current conditions (revenue, volume, costs, margins)
+   - Past adjustment outcomes (what worked, what didn't)
+   - Learned optimal ranges per parameter
+   - Isolation constraints (what can be adjusted now)
+
+2. Review recommendation confidence scores:
+   - confidence > 0.7: Strong signal, likely to work
+   - confidence 0.5-0.7: Moderate signal, proceed cautiously
+   - confidence < 0.5: Weak signal, consider alternatives
+
+3. Check if suggested param has good track record:
+   - past_success_rate > 0.7: Good history, trust suggestion
+   - past_success_rate < 0.3: Poor history, try different approach
 ```
 
 ### When Making Adjustments:
