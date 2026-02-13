@@ -6879,15 +6879,14 @@ class HiveDatabase:
         Returns:
             Number of rows written.
         """
-        conn = self._get_connection()
-        conn.execute("DELETE FROM pheromone_levels")
-        for row in levels:
-            conn.execute(
-                """INSERT INTO pheromone_levels (channel_id, level, fee_ppm, last_update)
-                   VALUES (?, ?, ?, ?)""",
-                (row['channel_id'], row['level'], row['fee_ppm'], row['last_update'])
-            )
-        conn.commit()
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM pheromone_levels")
+            for row in levels:
+                conn.execute(
+                    """INSERT INTO pheromone_levels (channel_id, level, fee_ppm, last_update)
+                       VALUES (?, ?, ?, ?)""",
+                    (row['channel_id'], row['level'], row['fee_ppm'], row['last_update'])
+                )
         return len(levels)
 
     def load_pheromone_levels(self) -> List[Dict[str, Any]]:
@@ -6908,20 +6907,19 @@ class HiveDatabase:
         Returns:
             Number of rows written.
         """
-        conn = self._get_connection()
-        conn.execute("DELETE FROM stigmergic_markers")
-        for row in markers:
-            conn.execute(
-                """INSERT INTO stigmergic_markers
-                   (depositor, source_peer_id, destination_peer_id,
-                    fee_ppm, success, volume_sats, timestamp, strength)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (row['depositor'], row['source_peer_id'],
-                 row['destination_peer_id'], row['fee_ppm'],
-                 1 if row['success'] else 0, row['volume_sats'],
-                 row['timestamp'], row['strength'])
-            )
-        conn.commit()
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM stigmergic_markers")
+            for row in markers:
+                conn.execute(
+                    """INSERT INTO stigmergic_markers
+                       (depositor, source_peer_id, destination_peer_id,
+                        fee_ppm, success, volume_sats, timestamp, strength)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (row['depositor'], row['source_peer_id'],
+                     row['destination_peer_id'], row['fee_ppm'],
+                     1 if row['success'] else 0, row['volume_sats'],
+                     row['timestamp'], row['strength'])
+                )
         return len(markers)
 
     def load_stigmergic_markers(self) -> List[Dict[str, Any]]:
@@ -6958,27 +6956,26 @@ class HiveDatabase:
         Returns:
             Total number of rows written across both tables.
         """
-        conn = self._get_connection()
-        conn.execute("DELETE FROM defense_warning_reports")
-        conn.execute("DELETE FROM defense_active_fees")
-        for row in reports:
-            conn.execute(
-                """INSERT INTO defense_warning_reports
-                   (peer_id, reporter_id, threat_type, severity, timestamp, ttl, evidence_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (row['peer_id'], row['reporter_id'], row['threat_type'],
-                 row['severity'], row['timestamp'], row['ttl'],
-                 row.get('evidence_json', '{}'))
-            )
-        for row in active_fees:
-            conn.execute(
-                """INSERT INTO defense_active_fees
-                   (peer_id, multiplier, expires_at, threat_type, reporter, report_count)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (row['peer_id'], row['multiplier'], row['expires_at'],
-                 row['threat_type'], row['reporter'], row['report_count'])
-            )
-        conn.commit()
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM defense_warning_reports")
+            conn.execute("DELETE FROM defense_active_fees")
+            for row in reports:
+                conn.execute(
+                    """INSERT INTO defense_warning_reports
+                       (peer_id, reporter_id, threat_type, severity, timestamp, ttl, evidence_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (row['peer_id'], row['reporter_id'], row['threat_type'],
+                     row['severity'], row['timestamp'], row['ttl'],
+                     row.get('evidence_json', '{}'))
+                )
+            for row in active_fees:
+                conn.execute(
+                    """INSERT INTO defense_active_fees
+                       (peer_id, multiplier, expires_at, threat_type, reporter, report_count)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (row['peer_id'], row['multiplier'], row['expires_at'],
+                     row['threat_type'], row['reporter'], row['report_count'])
+                )
         return len(reports) + len(active_fees)
 
     def load_defense_state(self) -> Dict[str, Any]:
@@ -7011,17 +7008,16 @@ class HiveDatabase:
         Returns:
             Number of rows written.
         """
-        conn = self._get_connection()
-        conn.execute("DELETE FROM remote_pheromones")
-        for row in pheromones:
-            conn.execute(
-                """INSERT INTO remote_pheromones
-                   (peer_id, reporter_id, level, fee_ppm, timestamp, weight)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (row['peer_id'], row['reporter_id'], row['level'],
-                 row['fee_ppm'], row['timestamp'], row['weight'])
-            )
-        conn.commit()
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM remote_pheromones")
+            for row in pheromones:
+                conn.execute(
+                    """INSERT INTO remote_pheromones
+                       (peer_id, reporter_id, level, fee_ppm, timestamp, weight)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (row['peer_id'], row['reporter_id'], row['level'],
+                     row['fee_ppm'], row['timestamp'], row['weight'])
+                )
         return len(pheromones)
 
     def load_remote_pheromones(self) -> List[Dict[str, Any]]:
@@ -7040,15 +7036,14 @@ class HiveDatabase:
         Returns:
             Number of rows written.
         """
-        conn = self._get_connection()
-        conn.execute("DELETE FROM fee_observations")
-        for row in observations:
-            conn.execute(
-                """INSERT INTO fee_observations (timestamp, fee_ppm)
-                   VALUES (?, ?)""",
-                (row['timestamp'], row['fee_ppm'])
-            )
-        conn.commit()
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM fee_observations")
+            for row in observations:
+                conn.execute(
+                    """INSERT INTO fee_observations (timestamp, fee_ppm)
+                       VALUES (?, ?)""",
+                    (row['timestamp'], row['fee_ppm'])
+                )
         return len(observations)
 
     def load_fee_observations(self) -> List[Dict[str, Any]]:
