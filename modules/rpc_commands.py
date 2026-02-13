@@ -2454,7 +2454,8 @@ def defense_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
                         "is_threat": True,
                         "threat_type": warning.get("threat_type"),
                         "severity": warning.get("severity", 0.5),
-                        "defensive_multiplier": warning.get("defensive_multiplier", 1.0)
+                        "defensive_multiplier": warning.get("defensive_multiplier", 1.0),
+                        "expires_at": warning.get("expires_at", 0)
                     }
                     break
 

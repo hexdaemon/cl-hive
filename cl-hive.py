@@ -9508,9 +9508,7 @@ def _check_settlement_gaming_and_propose_bans():
         if peer_id == our_pubkey:
             continue
 
-        # Skip admins (admins handle this via other means)
-        if member.get('tier') == MembershipTier.ADMIN.value:
-            continue
+        # Skip ourselves is handled above; no tier is exempt from gaming detection
 
         # Calculate participation rates
         vote_count = 0
@@ -14045,9 +14043,9 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     if not member:
         return {"error": "peer_not_member", "peer_id": peer_id}
 
-    # Cannot ban admin
+    # Cannot direct-ban full members; use hive-propose-ban + vote instead
     if member.get("tier") == MembershipTier.MEMBER.value:
-        return {"error": "cannot_ban_member", "peer_id": peer_id}
+        return {"error": "cannot_ban_member", "message": "Full members require proposal/vote via hive-propose-ban", "peer_id": peer_id}
 
     # Sign the ban reason
     now = int(time.time())

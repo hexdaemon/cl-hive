@@ -17,7 +17,7 @@ import math
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import network_metrics
@@ -1231,6 +1231,7 @@ class StigmergicCoordinator:
     def read_markers(self, source: str, destination: str) -> List[RouteMarker]:
         """
         Read markers left by other fleet members for this route.
+        Returns copies with decayed strength (does not mutate stored markers).
         """
         key = (source, destination)
         now = time.time()
@@ -1239,11 +1240,9 @@ class StigmergicCoordinator:
         with self._lock:
             markers = self._markers.get(key, [])
             for m in markers:
-                # Update strength based on decay
                 current_strength = self._calculate_marker_strength(m, now)
                 if current_strength > MARKER_MIN_STRENGTH:
-                    m.strength = current_strength
-                    result.append(m)
+                    result.append(replace(m, strength=current_strength))
 
         return result
 
@@ -1341,7 +1340,7 @@ class StigmergicCoordinator:
             return None
 
     def get_all_markers(self) -> List[RouteMarker]:
-        """Get all active markers."""
+        """Get all active markers. Returns copies with decayed strength."""
         result = []
         now = time.time()
 
@@ -1350,8 +1349,7 @@ class StigmergicCoordinator:
                 for m in markers:
                     current_strength = self._calculate_marker_strength(m, now)
                     if current_strength > MARKER_MIN_STRENGTH:
-                        m.strength = current_strength
-                        result.append(m)
+                        result.append(replace(m, strength=current_strength))
 
         return result
 
