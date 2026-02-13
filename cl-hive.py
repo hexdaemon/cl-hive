@@ -13510,7 +13510,8 @@ def hive_report_liquidity_state(
     depleted_channels: list = None,
     saturated_channels: list = None,
     rebalancing_active: bool = False,
-    rebalancing_peers: list = None
+    rebalancing_peers: list = None,
+    liquidity_needs: list = None
 ):
     """
     Report liquidity state from cl-revenue-ops.
@@ -13526,6 +13527,7 @@ def hive_report_liquidity_state(
         saturated_channels: List of {peer_id, local_pct, capacity_sats}
         rebalancing_active: Whether we're currently rebalancing
         rebalancing_peers: Which peers we're rebalancing through
+        liquidity_needs: Flow-aware enriched needs from cl-revenue-ops
 
     Returns:
         {"status": "recorded", "depleted_count": N, "saturated_count": M}
@@ -13541,6 +13543,41 @@ def hive_report_liquidity_state(
         member_id=our_pubkey,
         depleted_channels=depleted_channels or [],
         saturated_channels=saturated_channels or [],
+        rebalancing_active=rebalancing_active,
+        rebalancing_peers=rebalancing_peers,
+        enriched_needs=liquidity_needs
+    )
+
+
+@plugin.method("hive-update-rebalancing-activity")
+def hive_update_rebalancing_activity(
+    plugin: Plugin,
+    rebalancing_active: bool = False,
+    rebalancing_peers: list = None
+):
+    """
+    Targeted update of rebalancing activity from cl-revenue-ops rebalancer.
+
+    Unlike hive-report-liquidity-state which UPSERTs all fields, this only
+    updates rebalancing_active and rebalancing_peers, preserving existing
+    depleted/saturated channel data.
+
+    Called by the rebalancer's JobManager when sling jobs start or stop.
+
+    Args:
+        rebalancing_active: Whether we're currently rebalancing
+        rebalancing_peers: Which peers we're rebalancing through
+
+    Returns:
+        {"status": "updated", ...}
+
+    Permission: None (local cl-revenue-ops integration)
+    """
+    if not liquidity_coord or not our_pubkey:
+        return {"error": "Liquidity coordinator not initialized"}
+
+    return liquidity_coord.update_rebalancing_activity(
+        member_id=our_pubkey,
         rebalancing_active=rebalancing_active,
         rebalancing_peers=rebalancing_peers
     )

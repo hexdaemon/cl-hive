@@ -4278,6 +4278,49 @@ class HiveDatabase:
             1 if rebalancing_active else 0, peers_json, ts
         ))
 
+    def update_rebalancing_activity(
+        self,
+        member_id: str,
+        rebalancing_active: bool,
+        rebalancing_peers: List[str] = None,
+        timestamp: Optional[int] = None
+    ) -> None:
+        """
+        Targeted update of ONLY rebalancing columns in member_liquidity_state.
+
+        Unlike update_member_liquidity_state() which UPSERTs all columns,
+        this preserves existing depleted/saturated counts. Used by the
+        rebalancer's JobManager which doesn't have depleted/saturated data.
+
+        Args:
+            member_id: Hive member peer ID
+            rebalancing_active: Whether member is currently rebalancing
+            rebalancing_peers: Which peers they're rebalancing through
+            timestamp: When the report was made
+        """
+        import json
+        conn = self._get_connection()
+        ts = timestamp or int(time.time())
+        peers_json = json.dumps(rebalancing_peers or [])
+
+        # Try targeted UPDATE first (preserves depleted/saturated counts)
+        cursor = conn.execute("""
+            UPDATE member_liquidity_state
+            SET rebalancing_active = ?,
+                rebalancing_peers = ?,
+                timestamp = ?
+            WHERE peer_id = ?
+        """, (1 if rebalancing_active else 0, peers_json, ts, member_id))
+
+        if cursor.rowcount == 0:
+            # No prior record — insert with zeroed depleted/saturated counts
+            conn.execute("""
+                INSERT OR IGNORE INTO member_liquidity_state (
+                    peer_id, depleted_count, saturated_count,
+                    rebalancing_active, rebalancing_peers, timestamp
+                ) VALUES (?, 0, 0, ?, ?, ?)
+            """, (member_id, 1 if rebalancing_active else 0, peers_json, ts))
+
     def get_member_liquidity_state(
         self,
         member_id: str

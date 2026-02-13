@@ -69,7 +69,9 @@ class IntentType(str, Enum):
     Using str, Enum for JSON serialization compatibility.
     """
     CHANNEL_OPEN = 'channel_open'
-    REBALANCE = 'rebalance'
+    REBALANCE = 'rebalance'  # Reserved, unused by design. Rebalancing uses lightweight
+                              # activity tracking (hive-update-rebalancing-activity) instead
+                              # of formal intents (too frequent, soft conflicts only).
     BAN_PEER = 'ban_peer'
 
 

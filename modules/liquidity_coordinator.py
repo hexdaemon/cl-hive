@@ -639,12 +639,23 @@ class LiquidityCoordinator:
         """
         Assess what liquidity we currently need.
 
+        If cl-revenue-ops has provided enriched needs (flow-aware, with
+        turnover and flow_state context), prefer those over raw threshold
+        scanning.
+
         Args:
             funds: Result of listfunds() call
 
         Returns:
             List of liquidity needs
         """
+        # Prefer enriched needs from cl-revenue-ops if available
+        with self._lock:
+            our_state = self._member_liquidity_state.get(self.our_pubkey, {})
+            enriched = our_state.get("enriched_needs")
+        if enriched:
+            return enriched
+
         channels = funds.get("channels", [])
         needs = []
 
@@ -775,7 +786,8 @@ class LiquidityCoordinator:
         depleted_channels: List[Dict[str, Any]],
         saturated_channels: List[Dict[str, Any]],
         rebalancing_active: bool = False,
-        rebalancing_peers: List[str] = None
+        rebalancing_peers: List[str] = None,
+        enriched_needs: List[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Record a liquidity state report from a cl-revenue-ops instance.
@@ -789,6 +801,8 @@ class LiquidityCoordinator:
             saturated_channels: List of {peer_id, local_pct, capacity_sats}
             rebalancing_active: Whether member is currently rebalancing
             rebalancing_peers: Which peers they're rebalancing through
+            enriched_needs: Flow-aware liquidity needs from cl-revenue-ops
+                (overrides raw threshold-based assessment)
 
         Returns:
             {"status": "recorded", ...}
@@ -812,13 +826,16 @@ class LiquidityCoordinator:
 
         # Update in-memory tracking for fast access
         with self._lock:
-            self._member_liquidity_state[member_id] = {
+            state_entry = {
                 "depleted_channels": depleted_channels,
                 "saturated_channels": saturated_channels,
                 "rebalancing_active": rebalancing_active,
                 "rebalancing_peers": rebalancing_peers or [],
                 "timestamp": timestamp
             }
+            if enriched_needs:
+                state_entry["enriched_needs"] = enriched_needs[:10]  # Bound to 10
+            self._member_liquidity_state[member_id] = state_entry
 
         if self.plugin:
             self.plugin.log(
@@ -832,6 +849,62 @@ class LiquidityCoordinator:
             "status": "recorded",
             "depleted_count": len(depleted_channels),
             "saturated_count": len(saturated_channels)
+        }
+
+    def update_rebalancing_activity(
+        self,
+        member_id: str,
+        rebalancing_active: bool,
+        rebalancing_peers: List[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Targeted update of rebalancing activity for a member.
+
+        Unlike record_member_liquidity_report() which overwrites all fields,
+        this only updates rebalancing_active and rebalancing_peers, preserving
+        existing depleted/saturated channel data.
+
+        Args:
+            member_id: Reporting member's pubkey
+            rebalancing_active: Whether member is currently rebalancing
+            rebalancing_peers: Which peers they're rebalancing through
+
+        Returns:
+            {"status": "updated", ...} or {"error": ...}
+        """
+        # Verify member exists
+        member = self.database.get_member(member_id)
+        if not member:
+            return {"error": "member_not_found"}
+
+        peers = rebalancing_peers or []
+
+        # Targeted DB update (preserves depleted/saturated counts)
+        self.database.update_rebalancing_activity(
+            member_id=member_id,
+            rebalancing_active=rebalancing_active,
+            rebalancing_peers=peers
+        )
+
+        # Merge into in-memory state (preserve existing fields)
+        with self._lock:
+            existing = self._member_liquidity_state.get(member_id, {})
+            existing["rebalancing_active"] = rebalancing_active
+            existing["rebalancing_peers"] = peers
+            existing["timestamp"] = int(time.time())
+            self._member_liquidity_state[member_id] = existing
+
+        if self.plugin:
+            self.plugin.log(
+                f"cl-hive: Updated rebalancing activity for {member_id[:16]}...: "
+                f"active={rebalancing_active}, peers={len(peers)}",
+                level='debug'
+            )
+
+        return {
+            "status": "updated",
+            "rebalancing_active": rebalancing_active,
+            "rebalancing_peers_count": len(peers)
         }
 
     def get_fleet_liquidity_state(self) -> Dict[str, Any]:
