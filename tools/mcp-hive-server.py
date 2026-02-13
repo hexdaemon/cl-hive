@@ -9373,7 +9373,10 @@ async def handle_auto_evaluate_proposal(args: Dict) -> Dict:
         return {"error": f"Action {action_id} not found in pending actions"}
 
     action_type = action.get("action_type") or action.get("type", "unknown")
-    target = action.get("target") or action.get("peer_id") or action.get("target_pubkey", "")
+    payload = action.get("payload", {})
+    # Target can be at top level or inside payload
+    target = (action.get("target") or action.get("peer_id") or action.get("target_pubkey") or
+              payload.get("target") or payload.get("peer_id") or payload.get("target_pubkey", ""))
 
     decision = "escalate"
     reasoning = []
@@ -9381,6 +9384,18 @@ async def handle_auto_evaluate_proposal(args: Dict) -> Dict:
 
     # Evaluate based on action type
     if action_type in ("channel_open", "open_channel"):
+        # Validate we have a target pubkey
+        if not target or len(target) < 66:
+            decision = "escalate"
+            reasoning.append(f"Invalid or missing target pubkey in action")
+            return {
+                "action_id": action_id,
+                "action_type": action_type,
+                "decision": decision,
+                "reasoning": reasoning,
+                "action_executed": False
+            }
+
         # Get peer intel for channel open evaluation
         peer_intel = await handle_advisor_get_peer_intel({"peer_id": target})
         graph_data = peer_intel.get("network_graph", {})
