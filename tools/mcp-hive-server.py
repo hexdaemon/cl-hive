@@ -10038,12 +10038,14 @@ async def handle_execute_safe_opportunities(args: Dict) -> Dict:
                     "pheromone_fee_adjust", "stigmergic_coordination",
                     "fleet_consensus_fee", "bleeder_fix", "imbalanced_channel"
                 ):
-                    new_fee = opp.get("recommended_fee") or opp.get("new_fee_ppm")
+                    rec_fee = opp.get("recommended_fee")
+                    new_fee = rec_fee if rec_fee is not None else opp.get("new_fee_ppm")
 
                     # Calculate fee from current state if not explicitly set
                     if not new_fee and channel_id:
                         current_state = opp.get("current_state", {})
-                        current_fee = current_state.get("fee_ppm") or current_state.get("fee_per_millionth", 0)
+                        fee_ppm_val = current_state.get("fee_ppm")
+                        current_fee = fee_ppm_val if fee_ppm_val is not None else current_state.get("fee_per_millionth", 0)
 
                         if opp_type == "stagnant_channel":
                             # Stagnant: reduce to 50 ppm floor (match remediation logic)
