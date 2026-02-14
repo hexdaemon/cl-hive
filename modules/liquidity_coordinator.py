@@ -169,6 +169,7 @@ class LiquidityCoordinator:
         self._member_liquidity_state: Dict[str, Dict[str, Any]] = {}
 
         # Rate limiting
+        self._rate_lock = threading.Lock()
         self._need_rate: Dict[str, List[float]] = defaultdict(list)
         self._snapshot_rate: Dict[str, List[float]] = defaultdict(list)
 
@@ -191,13 +192,20 @@ class LiquidityCoordinator:
         max_count, period = limit
         now = time.time()
 
-        # Clean old entries
-        rate_tracker[sender] = [
-            ts for ts in rate_tracker[sender]
-            if now - ts < period
-        ]
+        with self._rate_lock:
+            # Clean old entries for this sender
+            rate_tracker[sender] = [
+                ts for ts in rate_tracker[sender]
+                if now - ts < period
+            ]
 
-        return len(rate_tracker[sender]) < max_count
+            # Evict empty/stale keys to prevent unbounded dict growth
+            if len(rate_tracker) > 200:
+                stale = [k for k, v in rate_tracker.items() if not v]
+                for k in stale:
+                    del rate_tracker[k]
+
+            return len(rate_tracker[sender]) < max_count
 
     def _record_message(
         self,
@@ -205,7 +213,8 @@ class LiquidityCoordinator:
         rate_tracker: Dict[str, List[float]]
     ):
         """Record a message for rate limiting."""
-        rate_tracker[sender].append(time.time())
+        with self._rate_lock:
+            rate_tracker[sender].append(time.time())
 
     def create_liquidity_need_message(
         self,
@@ -357,7 +366,8 @@ class LiquidityCoordinator:
 
         # Store in memory using composite key (consistent with batch path)
         key = f"{reporter_id}:{need.target_peer_id}"
-        self._liquidity_needs[key] = need
+        with self._lock:
+            self._liquidity_needs[key] = need
 
         # Prune old needs if over limit
         self._prune_old_needs()
@@ -471,7 +481,8 @@ class LiquidityCoordinator:
 
             # Use composite key for multiple needs from same reporter
             key = f"{reporter_id}:{need.target_peer_id}"
-            self._liquidity_needs[key] = need
+            with self._lock:
+                self._liquidity_needs[key] = need
 
             # Store in database
             self.database.store_liquidity_need(
@@ -569,18 +580,19 @@ class LiquidityCoordinator:
 
     def _prune_old_needs(self):
         """Remove old liquidity needs to stay under limit."""
-        if len(self._liquidity_needs) <= MAX_PENDING_NEEDS:
-            return
+        with self._lock:
+            if len(self._liquidity_needs) <= MAX_PENDING_NEEDS:
+                return
 
-        # Sort by timestamp, remove oldest
-        sorted_needs = sorted(
-            self._liquidity_needs.items(),
-            key=lambda x: x[1].timestamp
-        )
+            # Sort by timestamp, remove oldest
+            sorted_needs = sorted(
+                self._liquidity_needs.items(),
+                key=lambda x: x[1].timestamp
+            )
 
-        to_remove = len(sorted_needs) - MAX_PENDING_NEEDS
-        for key, _ in sorted_needs[:to_remove]:
-            del self._liquidity_needs[key]
+            to_remove = len(sorted_needs) - MAX_PENDING_NEEDS
+            for key, _ in sorted_needs[:to_remove]:
+                del self._liquidity_needs[key]
 
     def get_prioritized_needs(self) -> List[LiquidityNeed]:
         """
@@ -591,7 +603,8 @@ class LiquidityCoordinator:
         Returns:
             List of needs sorted by priority (highest first)
         """
-        needs = list(self._liquidity_needs.values())
+        with self._lock:
+            needs = list(self._liquidity_needs.values())
 
         def nnlb_priority(need: LiquidityNeed) -> float:
             """Calculate NNLB priority score."""
@@ -602,6 +615,8 @@ class LiquidityCoordinator:
             else:
                 health_score = 50
 
+            # Clamp health_score to valid range before priority calc
+            health_score = max(0, min(100, health_score))
             # Lower health = higher priority (inverted)
             health_priority = 1.0 - (health_score / 100.0)
 
@@ -624,12 +639,23 @@ class LiquidityCoordinator:
         """
         Assess what liquidity we currently need.
 
+        If cl-revenue-ops has provided enriched needs (flow-aware, with
+        turnover and flow_state context), prefer those over raw threshold
+        scanning.
+
         Args:
             funds: Result of listfunds() call
 
         Returns:
             List of liquidity needs
         """
+        # Prefer enriched needs from cl-revenue-ops if available
+        with self._lock:
+            our_state = self._member_liquidity_state.get(self.our_pubkey, {})
+            enriched = our_state.get("enriched_needs")
+        if enriched is not None:
+            return enriched
+
         channels = funds.get("channels", [])
         needs = []
 
@@ -705,13 +731,14 @@ class LiquidityCoordinator:
         """Clean up old liquidity needs."""
         now = time.time()
 
-        # Remove old needs (older than 1 hour)
-        old_needs = [
-            rid for rid, need in self._liquidity_needs.items()
-            if now - need.timestamp > 3600
-        ]
-        for rid in old_needs:
-            del self._liquidity_needs[rid]
+        with self._lock:
+            # Remove old needs (older than 1 hour)
+            old_needs = [
+                rid for rid, need in self._liquidity_needs.items()
+                if now - need.timestamp > 3600
+            ]
+            for rid in old_needs:
+                del self._liquidity_needs[rid]
 
     def get_status(self) -> Dict[str, Any]:
         """
@@ -722,19 +749,21 @@ class LiquidityCoordinator:
         """
         nnlb_status = self.get_nnlb_assistance_status()
 
-        # Count need types
-        inbound_needs = sum(
-            1 for n in self._liquidity_needs.values()
-            if n.need_type == NEED_INBOUND
-        )
-        outbound_needs = sum(
-            1 for n in self._liquidity_needs.values()
-            if n.need_type == NEED_OUTBOUND
-        )
+        # Count need types under lock to prevent RuntimeError during iteration
+        with self._lock:
+            inbound_needs = sum(
+                1 for n in self._liquidity_needs.values()
+                if n.need_type == NEED_INBOUND
+            )
+            outbound_needs = sum(
+                1 for n in self._liquidity_needs.values()
+                if n.need_type == NEED_OUTBOUND
+            )
+            pending_count = len(self._liquidity_needs)
 
         return {
             "status": "active",
-            "pending_needs": len(self._liquidity_needs),
+            "pending_needs": pending_count,
             "inbound_needs": inbound_needs,
             "outbound_needs": outbound_needs,
             "nnlb_status": nnlb_status
@@ -757,7 +786,8 @@ class LiquidityCoordinator:
         depleted_channels: List[Dict[str, Any]],
         saturated_channels: List[Dict[str, Any]],
         rebalancing_active: bool = False,
-        rebalancing_peers: List[str] = None
+        rebalancing_peers: List[str] = None,
+        enriched_needs: List[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Record a liquidity state report from a cl-revenue-ops instance.
@@ -771,6 +801,8 @@ class LiquidityCoordinator:
             saturated_channels: List of {peer_id, local_pct, capacity_sats}
             rebalancing_active: Whether member is currently rebalancing
             rebalancing_peers: Which peers they're rebalancing through
+            enriched_needs: Flow-aware liquidity needs from cl-revenue-ops
+                (overrides raw threshold-based assessment)
 
         Returns:
             {"status": "recorded", ...}
@@ -793,13 +825,17 @@ class LiquidityCoordinator:
         )
 
         # Update in-memory tracking for fast access
-        self._member_liquidity_state[member_id] = {
-            "depleted_channels": depleted_channels,
-            "saturated_channels": saturated_channels,
-            "rebalancing_active": rebalancing_active,
-            "rebalancing_peers": rebalancing_peers or [],
-            "timestamp": timestamp
-        }
+        with self._lock:
+            state_entry = {
+                "depleted_channels": depleted_channels,
+                "saturated_channels": saturated_channels,
+                "rebalancing_active": rebalancing_active,
+                "rebalancing_peers": rebalancing_peers or [],
+                "timestamp": timestamp
+            }
+            if enriched_needs is not None:
+                state_entry["enriched_needs"] = enriched_needs[:10]  # Bound to 10
+            self._member_liquidity_state[member_id] = state_entry
 
         if self.plugin:
             self.plugin.log(
@@ -813,6 +849,62 @@ class LiquidityCoordinator:
             "status": "recorded",
             "depleted_count": len(depleted_channels),
             "saturated_count": len(saturated_channels)
+        }
+
+    def update_rebalancing_activity(
+        self,
+        member_id: str,
+        rebalancing_active: bool,
+        rebalancing_peers: List[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Targeted update of rebalancing activity for a member.
+
+        Unlike record_member_liquidity_report() which overwrites all fields,
+        this only updates rebalancing_active and rebalancing_peers, preserving
+        existing depleted/saturated channel data.
+
+        Args:
+            member_id: Reporting member's pubkey
+            rebalancing_active: Whether member is currently rebalancing
+            rebalancing_peers: Which peers they're rebalancing through
+
+        Returns:
+            {"status": "updated", ...} or {"error": ...}
+        """
+        # Verify member exists
+        member = self.database.get_member(member_id)
+        if not member:
+            return {"error": "member_not_found"}
+
+        peers = rebalancing_peers or []
+
+        # Targeted DB update (preserves depleted/saturated counts)
+        self.database.update_rebalancing_activity(
+            member_id=member_id,
+            rebalancing_active=rebalancing_active,
+            rebalancing_peers=peers
+        )
+
+        # Merge into in-memory state (preserve existing fields)
+        with self._lock:
+            existing = self._member_liquidity_state.get(member_id, {})
+            existing["rebalancing_active"] = rebalancing_active
+            existing["rebalancing_peers"] = peers
+            existing["timestamp"] = int(time.time())
+            self._member_liquidity_state[member_id] = existing
+
+        if self.plugin:
+            self.plugin.log(
+                f"cl-hive: Updated rebalancing activity for {member_id[:16]}...: "
+                f"active={rebalancing_active}, peers={len(peers)}",
+                level='debug'
+            )
+
+        return {
+            "status": "updated",
+            "rebalancing_active": rebalancing_active,
+            "rebalancing_peers_count": len(peers)
         }
 
     def get_fleet_liquidity_state(self) -> Dict[str, Any]:
@@ -832,12 +924,16 @@ class LiquidityCoordinator:
         members_rebalancing = 0
         all_rebalancing_peers = set()
 
+        # Snapshot shared state under lock
+        with self._lock:
+            state_snapshot = dict(self._member_liquidity_state)
+
         # Get our own state
-        our_state = self._member_liquidity_state.get(self.our_pubkey, {})
+        our_state = state_snapshot.get(self.our_pubkey, {})
 
         for member in members:
             member_id = member.get("peer_id")
-            state = self._member_liquidity_state.get(member_id)
+            state = state_snapshot.get(member_id)
 
             if state:
                 if state.get("depleted_channels"):
@@ -883,7 +979,10 @@ class LiquidityCoordinator:
         """
         needs = []
 
-        for member_id, state in self._member_liquidity_state.items():
+        with self._lock:
+            state_snapshot = dict(self._member_liquidity_state)
+
+        for member_id, state in state_snapshot.items():
             if member_id == self.our_pubkey:
                 continue  # Skip ourselves
 
@@ -949,6 +1048,11 @@ class LiquidityCoordinator:
 
         Based on whether we have a channel to this peer and our balance state.
         Higher score = we're better positioned to influence flow via fees.
+
+        Note: Makes an RPC call (listpeerchannels). Callers are responsible for
+        ensuring RPC serialization (e.g., via RPC_LOCK or ThreadSafeRpcProxy).
+        Currently called from get_fleet_liquidity_needs() which uses
+        ThreadSafeRpcProxy for RPC serialization.
         """
         try:
             channels = self.plugin.rpc.listpeerchannels(id=peer_id)
@@ -993,7 +1097,10 @@ class LiquidityCoordinator:
         """
         peer_issue_count: Dict[str, int] = defaultdict(int)
 
-        for state in self._member_liquidity_state.values():
+        with self._lock:
+            state_values = list(self._member_liquidity_state.values())
+
+        for state in state_values:
             for ch in state.get("depleted_channels", []):
                 peer_id = ch.get("peer_id")
                 if peer_id:
@@ -1024,7 +1131,10 @@ class LiquidityCoordinator:
         Returns:
             Conflict info if found
         """
-        for member_id, state in self._member_liquidity_state.items():
+        with self._lock:
+            state_snapshot = dict(self._member_liquidity_state)
+
+        for member_id, state in state_snapshot.items():
             if member_id == self.our_pubkey:
                 continue
 
@@ -1335,10 +1445,17 @@ class LiquidityCoordinator:
         """
         mcf_needs = []
 
+        # Snapshot shared state under lock
+        with self._lock:
+            liquidity_needs_snapshot = list(self._liquidity_needs.values())
+            remote_mcf_snapshot = list(self._remote_mcf_needs.items())
+
+        now = time.time()
+
         # Add needs from _liquidity_needs (received via gossip)
-        for need in self._liquidity_needs.values():
+        for need in liquidity_needs_snapshot:
             # Skip stale needs (older than 30 minutes)
-            if time.time() - need.timestamp > 1800:
+            if now - need.timestamp > 1800:
                 continue
 
             mcf_needs.append({
@@ -1371,10 +1488,10 @@ class LiquidityCoordinator:
             self._log(f"Error assessing our needs for MCF: {e}", "debug")
 
         # Add remote MCF needs (received from other fleet members)
-        for reporter_id, need in self._remote_mcf_needs.items():
+        for reporter_id, need in remote_mcf_snapshot:
             # Skip stale needs (older than 30 minutes)
             received_at = need.get("received_at", 0)
-            if time.time() - received_at > 1800:
+            if now - received_at > 1800:
                 continue
 
             mcf_needs.append({
@@ -1415,26 +1532,27 @@ class LiquidityCoordinator:
             return False
 
         # Store by reporter_id (latest need per member)
-        self._remote_mcf_needs[reporter_id] = {
-            "reporter_id": reporter_id,
-            "need_type": need_type,
-            "target_peer": need.get("target_peer", ""),
-            "amount_sats": amount_sats,
-            "urgency": need.get("urgency", "medium"),
-            "max_fee_ppm": need.get("max_fee_ppm", 1000),
-            "channel_id": need.get("channel_id", ""),
-            "received_at": need.get("received_at", int(time.time())),
-        }
+        with self._lock:
+            self._remote_mcf_needs[reporter_id] = {
+                "reporter_id": reporter_id,
+                "need_type": need_type,
+                "target_peer": need.get("target_peer", ""),
+                "amount_sats": amount_sats,
+                "urgency": need.get("urgency", "medium"),
+                "max_fee_ppm": need.get("max_fee_ppm", 1000),
+                "channel_id": need.get("channel_id", ""),
+                "received_at": need.get("received_at", int(time.time())),
+            }
 
-        # Enforce size limit
-        if len(self._remote_mcf_needs) > self._max_remote_needs:
-            # Remove oldest entries
-            sorted_needs = sorted(
-                self._remote_mcf_needs.items(),
-                key=lambda x: x[1].get("received_at", 0)
-            )
-            for k, _ in sorted_needs[:100]:
-                del self._remote_mcf_needs[k]
+            # Enforce size limit
+            if len(self._remote_mcf_needs) > self._max_remote_needs:
+                # Remove oldest entries
+                sorted_needs = sorted(
+                    self._remote_mcf_needs.items(),
+                    key=lambda x: x[1].get("received_at", 0)
+                )
+                for k, _ in sorted_needs[:100]:
+                    del self._remote_mcf_needs[k]
 
         return True
 
@@ -1453,12 +1571,13 @@ class LiquidityCoordinator:
             Number of needs removed
         """
         now = time.time()
-        stale_keys = [
-            k for k, v in self._remote_mcf_needs.items()
-            if now - v.get("received_at", 0) > max_age_seconds
-        ]
-        for k in stale_keys:
-            del self._remote_mcf_needs[k]
+        with self._lock:
+            stale_keys = [
+                k for k, v in self._remote_mcf_needs.items()
+                if now - v.get("received_at", 0) > max_age_seconds
+            ]
+            for k in stale_keys:
+                del self._remote_mcf_needs[k]
         return len(stale_keys)
 
     def receive_mcf_assignment(
@@ -1481,7 +1600,9 @@ class LiquidityCoordinator:
             True if assignment was accepted
         """
         # Generate assignment ID
-        assignment_id = f"mcf_{solution_timestamp}_{assignment_data.get('priority', 0)}"
+        from_ch = assignment_data.get("from_channel", "")[-8:]
+        to_ch = assignment_data.get("to_channel", "")[-8:]
+        assignment_id = f"mcf_{solution_timestamp}_{assignment_data.get('priority', 0)}_{from_ch}_{to_ch}"
 
         # Check for duplicate
         if assignment_id in self._mcf_assignments:
@@ -1509,12 +1630,16 @@ class LiquidityCoordinator:
         )
 
         # Enforce limits
-        if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
-            self._cleanup_old_mcf_assignments()
+        with self._lock:
+            if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
+                self._cleanup_old_mcf_assignments_unlocked()
+                # If still at limit after cleanup, reject
+                if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
+                    return False
 
-        self._mcf_assignments[assignment_id] = assignment
-        self._last_mcf_solution_timestamp = solution_timestamp
-        self._mcf_ack_sent = False
+            self._mcf_assignments[assignment_id] = assignment
+            self._last_mcf_solution_timestamp = solution_timestamp
+            self._mcf_ack_sent = False
 
         self._log(
             f"Received MCF assignment {assignment_id}: "
@@ -1531,18 +1656,19 @@ class LiquidityCoordinator:
         Returns:
             List of pending assignments (status='pending'), sorted by priority
         """
-        self._cleanup_old_mcf_assignments()
-
-        pending = [
-            a for a in self._mcf_assignments.values()
-            if a.status == "pending"
-        ]
+        with self._lock:
+            self._cleanup_old_mcf_assignments_unlocked()
+            pending = [
+                a for a in self._mcf_assignments.values()
+                if a.status == "pending"
+            ]
 
         return sorted(pending, key=lambda a: a.priority)
 
     def get_mcf_assignment(self, assignment_id: str) -> Optional[MCFAssignment]:
         """Get a specific MCF assignment by ID."""
-        return self._mcf_assignments.get(assignment_id)
+        with self._lock:
+            return self._mcf_assignments.get(assignment_id)
 
     def update_mcf_assignment_status(
         self,
@@ -1565,17 +1691,18 @@ class LiquidityCoordinator:
         Returns:
             True if assignment was found and updated
         """
-        assignment = self._mcf_assignments.get(assignment_id)
-        if not assignment:
-            return False
+        with self._lock:
+            assignment = self._mcf_assignments.get(assignment_id)
+            if not assignment:
+                return False
 
-        assignment.status = status
-        assignment.actual_amount_sats = actual_amount_sats
-        assignment.actual_cost_sats = actual_cost_sats
-        assignment.error_message = error_message
+            assignment.status = status
+            assignment.actual_amount_sats = actual_amount_sats
+            assignment.actual_cost_sats = actual_cost_sats
+            assignment.error_message = error_message
 
-        if status in ("completed", "failed", "rejected"):
-            assignment.completed_at = int(time.time())
+            if status in ("completed", "failed", "rejected"):
+                assignment.completed_at = int(time.time())
 
         self._log(
             f"MCF assignment {assignment_id} status updated to {status}",
@@ -1584,6 +1711,45 @@ class LiquidityCoordinator:
 
         return True
 
+    def claim_pending_assignment(self, assignment_id: str = None) -> Optional[MCFAssignment]:
+        """
+        Atomically find and claim a pending MCF assignment.
+
+        Prevents TOCTOU race by doing lookup + status update in a single lock.
+
+        Args:
+            assignment_id: Specific assignment to claim, or None for highest priority
+
+        Returns:
+            The claimed MCFAssignment (now status='executing'), or None
+        """
+        with self._lock:
+            self._cleanup_old_mcf_assignments_unlocked()
+
+            if assignment_id:
+                # Claim specific assignment
+                assignment = self._mcf_assignments.get(assignment_id)
+                if not assignment or assignment.status != "pending":
+                    return None
+            else:
+                # Claim highest priority pending assignment
+                pending = [
+                    a for a in self._mcf_assignments.values()
+                    if a.status == "pending"
+                ]
+                if not pending:
+                    return None
+                assignment = min(pending, key=lambda a: a.priority)
+
+            # Atomically mark as executing
+            assignment.status = "executing"
+
+        self._log(
+            f"MCF assignment {assignment.assignment_id} claimed (executing)",
+            "info"
+        )
+        return assignment
+
     def create_mcf_ack_message(self) -> Optional[bytes]:
         """
         Create MCF_ASSIGNMENT_ACK message for current solution.
@@ -1591,24 +1757,26 @@ class LiquidityCoordinator:
         Returns:
             Serialized message or None if no pending solution
         """
-        if self._mcf_ack_sent:
-            return None
-
-        if not self._last_mcf_solution_timestamp:
-            return None
+        with self._lock:
+            if self._mcf_ack_sent:
+                return None
+            if not self._last_mcf_solution_timestamp:
+                return None
+            solution_ts = self._last_mcf_solution_timestamp
 
         pending = self.get_pending_mcf_assignments()
         assignment_count = len(pending)
 
         try:
             msg = create_mcf_assignment_ack(
-                solution_timestamp=self._last_mcf_solution_timestamp,
+                solution_timestamp=solution_ts,
                 assignment_count=assignment_count,
                 rpc=self.plugin.rpc,
                 our_pubkey=self.our_pubkey
             )
             if msg:
-                self._mcf_ack_sent = True
+                with self._lock:
+                    self._mcf_ack_sent = True
             return msg
         except Exception as e:
             self._log(f"Error creating MCF ACK: {e}", "warn")
@@ -1627,20 +1795,25 @@ class LiquidityCoordinator:
         Returns:
             Serialized message or None on error
         """
-        assignment = self._mcf_assignments.get(assignment_id)
-        if not assignment:
-            return None
-
-        if assignment.status not in ("completed", "failed", "rejected"):
-            return None
+        with self._lock:
+            assignment = self._mcf_assignments.get(assignment_id)
+            if not assignment:
+                return None
+            if assignment.status not in ("completed", "failed", "rejected"):
+                return None
+            # Snapshot fields under lock
+            success = (assignment.status == "completed")
+            actual_amount = assignment.actual_amount_sats
+            actual_cost = assignment.actual_cost_sats
+            error_msg = assignment.error_message
 
         try:
             return create_mcf_completion_report(
                 assignment_id=assignment_id,
-                success=(assignment.status == "completed"),
-                actual_amount_sats=assignment.actual_amount_sats,
-                actual_cost_sats=assignment.actual_cost_sats,
-                error_message=assignment.error_message,
+                success=success,
+                actual_amount_sats=actual_amount,
+                actual_cost_sats=actual_cost,
+                error_message=error_msg,
                 rpc=self.plugin.rpc,
                 our_pubkey=self.our_pubkey
             )
@@ -1655,17 +1828,21 @@ class LiquidityCoordinator:
         Returns:
             Dict with assignment counts and details
         """
-        self._cleanup_old_mcf_assignments()
+        with self._lock:
+            self._cleanup_old_mcf_assignments_unlocked()
 
-        all_assignments = list(self._mcf_assignments.values())
+            all_assignments = list(self._mcf_assignments.values())
+            solution_ts = self._last_mcf_solution_timestamp
+            ack_sent = self._mcf_ack_sent
+
         pending = [a for a in all_assignments if a.status == "pending"]
         executing = [a for a in all_assignments if a.status == "executing"]
         completed = [a for a in all_assignments if a.status == "completed"]
         failed = [a for a in all_assignments if a.status in ("failed", "rejected")]
 
         return {
-            "last_solution_timestamp": self._last_mcf_solution_timestamp,
-            "ack_sent": self._mcf_ack_sent,
+            "last_solution_timestamp": solution_ts,
+            "ack_sent": ack_sent,
             "assignment_counts": {
                 "total": len(all_assignments),
                 "pending": len(pending),
@@ -1677,8 +1854,8 @@ class LiquidityCoordinator:
             "total_pending_amount_sats": sum(a.amount_sats for a in pending),
         }
 
-    def _cleanup_old_mcf_assignments(self) -> None:
-        """Remove old/expired MCF assignments."""
+    def _cleanup_old_mcf_assignments_unlocked(self) -> None:
+        """Remove old/expired MCF assignments. Caller MUST hold self._lock."""
         now = time.time()
         expired = []
 
@@ -1700,6 +1877,44 @@ class LiquidityCoordinator:
 
         if expired:
             self._log(f"Cleaned up {len(expired)} old MCF assignments", "debug")
+
+    def _cleanup_old_mcf_assignments(self) -> None:
+        """Remove old/expired MCF assignments (acquires lock)."""
+        with self._lock:
+            self._cleanup_old_mcf_assignments_unlocked()
+
+    def get_all_assignments(self) -> List:
+        """Return a snapshot of all MCF assignments (thread-safe)."""
+        with self._lock:
+            return list(self._mcf_assignments.values())
+
+    def timeout_stuck_assignments(self, max_execution_time: int = 1800) -> List[str]:
+        """
+        Check for and timeout assignments stuck in 'executing' state.
+
+        Args:
+            max_execution_time: Max seconds in executing state (default: 30 min)
+
+        Returns:
+            List of assignment IDs that were timed out
+        """
+        now = int(time.time())
+        timed_out = []
+
+        with self._lock:
+            for assignment in list(self._mcf_assignments.values()):
+                if assignment.status == "executing":
+                    age = now - assignment.received_at
+                    if age > max_execution_time:
+                        assignment.status = "failed"
+                        assignment.error_message = "execution_timeout"
+                        assignment.completed_at = now
+                        timed_out.append(assignment.assignment_id)
+
+        for aid in timed_out:
+            self._log(f"MCF assignment {aid[:20]}... timed out after {max_execution_time}s", "warn")
+
+        return timed_out
 
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""

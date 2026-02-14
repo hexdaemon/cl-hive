@@ -21,6 +21,7 @@ Author: Lightning Goats Team
 """
 
 import json
+import threading
 import time
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -118,9 +119,20 @@ class DecisionEngine:
         self.plugin = plugin
 
         # Failsafe mode state tracking (budget and rate limits)
+        self._failsafe_lock = threading.Lock()
         self._daily_spend_sats: int = 0
-        self._daily_spend_reset_day: int = 0  # Day of year for reset
+        self._daily_spend_reset_day: int = int(time.time() // 86400)  # Day since epoch for reset
         self._hourly_actions: List[int] = []  # Timestamps of recent actions
+
+        # Load persisted failsafe budget from database if available
+        if self.db:
+            try:
+                date_key = self.db.get_today_date_key()
+                saved_spend = self.db.get_daily_spend(date_key)
+                if isinstance(saved_spend, int) and saved_spend >= 0:
+                    self._daily_spend_sats = saved_spend
+            except Exception:
+                pass
 
         # Executor callbacks (set by cl-hive.py)
         self._executors: Dict[str, Callable] = {}
@@ -275,50 +287,67 @@ class DecisionEngine:
             )
             return self._handle_advisor_mode(packet, cfg)
 
-        # Check daily budget
+        # Atomically check budget+rate, execute, and update tracking
         amount_sats = packet.context.get('amount_sats', 0)
+        if not isinstance(amount_sats, (int, float)):
+            try:
+                amount_sats = int(amount_sats)
+            except (ValueError, TypeError):
+                amount_sats = 0
         if isinstance(amount_sats, (int, float)) and amount_sats < 0:
             amount_sats = 0
-        if not self._check_budget(amount_sats, cfg):
-            self._log(
-                f"Daily budget exceeded ({self._daily_spend_sats} + {amount_sats} > "
-                f"{cfg.failsafe_budget_per_day}), queueing action",
-                level='warn'
-            )
-            return self._handle_advisor_mode(packet, cfg)
 
-        # Check rate limit
-        if not self._check_rate_limit(cfg):
-            self._log(
-                f"Hourly rate limit exceeded ({len(self._hourly_actions)} >= "
-                f"{cfg.failsafe_actions_per_hour}), queueing action",
-                level='warn'
-            )
-            return self._handle_advisor_mode(packet, cfg)
-
-        # Execute the emergency action
-        executor = self._executors.get(packet.action_type)
-        if executor:
-            try:
-                executor(packet.target, packet.context)
-
-                # Update tracking
-                self._daily_spend_sats += amount_sats
-                self._hourly_actions.append(int(time.time()))
-
-                self._log(f"Emergency action executed (FAILSAFE mode)")
-
-                return DecisionResponse(
-                    result=DecisionResult.APPROVED,
-                    reason="Emergency action executed (FAILSAFE mode)"
+        with self._failsafe_lock:
+            if not self._check_budget(amount_sats, cfg):
+                self._log(
+                    f"Daily budget exceeded ({self._daily_spend_sats} + {amount_sats} > "
+                    f"{cfg.failsafe_budget_per_day}), queueing action",
+                    level='warn'
                 )
-            except Exception as e:
-                self._log(f"Execution failed: {e}, queueing action", level='warn')
                 return self._handle_advisor_mode(packet, cfg)
-        else:
-            # No executor registered - queue for manual handling
-            self._log(f"No executor for {packet.action_type}, queueing action")
-            return self._handle_advisor_mode(packet, cfg)
+
+            if not self._check_rate_limit(cfg):
+                self._log(
+                    f"Hourly rate limit exceeded ({len(self._hourly_actions)} >= "
+                    f"{cfg.failsafe_actions_per_hour}), queueing action",
+                    level='warn'
+                )
+                return self._handle_advisor_mode(packet, cfg)
+
+            # Execute the emergency action
+            executor = self._executors.get(packet.action_type)
+            if executor:
+                try:
+                    executor(packet.target, packet.context)
+
+                    # Update tracking (atomic with checks above)
+                    self._daily_spend_sats += amount_sats
+                    self._hourly_actions.append(int(time.time()))
+
+                    # Persist budget spend to database
+                    if self.db and amount_sats > 0:
+                        try:
+                            self.db.record_budget_spend(
+                                action_type=packet.action_type,
+                                amount_sats=amount_sats,
+                                target=packet.target
+                            )
+                        except Exception:
+                            pass
+
+                    self._log(f"Emergency action executed (FAILSAFE mode)")
+
+                    return DecisionResponse(
+                        result=DecisionResult.APPROVED,
+                        reason="Emergency action executed (FAILSAFE mode)"
+                    )
+                except Exception as e:
+                    self._log(f"Execution failed: {e}, queueing action", level='warn')
+                    return self._handle_advisor_mode(packet, cfg)
+            else:
+                # No executor registered - queue for manual handling
+                self._log(f"No executor for {packet.action_type}, queueing action")
+                return self._handle_advisor_mode(packet, cfg)
 
     def _check_budget(self, amount_sats: int, cfg) -> bool:
         """
@@ -370,18 +399,20 @@ class DecisionEngine:
         now = int(time.time())
         cutoff = now - 3600
 
-        # Prune old actions for accurate count
-        recent_actions = [ts for ts in self._hourly_actions if ts > cutoff]
+        with self._failsafe_lock:
+            # Prune old actions for accurate count
+            recent_actions = [ts for ts in self._hourly_actions if ts > cutoff]
 
-        return {
-            'daily_spend_sats': self._daily_spend_sats,
-            'daily_spend_reset_day': self._daily_spend_reset_day,
-            'hourly_action_count': len(recent_actions),
-            'registered_executors': list(self._executors.keys()),
-        }
+            return {
+                'daily_spend_sats': self._daily_spend_sats,
+                'daily_spend_reset_day': self._daily_spend_reset_day,
+                'hourly_action_count': len(recent_actions),
+                'registered_executors': list(self._executors.keys()),
+            }
 
     def reset_limits(self) -> None:
         """Reset all rate limits and budget tracking (for testing)."""
-        self._daily_spend_sats = 0
-        self._daily_spend_reset_day = 0
-        self._hourly_actions = []
+        with self._failsafe_lock:
+            self._daily_spend_sats = 0
+            self._daily_spend_reset_day = 0
+            self._hourly_actions = []

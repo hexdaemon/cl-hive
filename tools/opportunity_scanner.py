@@ -157,7 +157,7 @@ class Opportunity:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
-        return {
+        result = {
             "opportunity_type": self.opportunity_type.value,
             "action_type": self.action_type.value,
             "channel_id": self.channel_id,
@@ -177,6 +177,9 @@ class Opportunity:
             "goal_alignment_bonus": round(self.goal_alignment_bonus, 4),
             "detected_at": self.detected_at
         }
+        if self.current_state:
+            result["current_state"] = self.current_state
+        return result
 
 
 # =============================================================================

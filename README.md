@@ -50,6 +50,21 @@ Global fleet-wide rebalancing optimization using Successive Shortest Paths algor
 ### Anticipatory Liquidity Management
 Predictive liquidity positioning using Kalman-filtered flow velocity estimation and intra-day pattern detection. Detects temporal patterns (surge, drain, quiet periods) and recommends proactive rebalancing before demand spikes.
 
+### Stigmergic Markers & Pheromone Trails
+Bio-inspired coordination using pheromone-based fee signals. Nodes deposit "scent markers" on channels they route through, creating emergent fee corridors that the fleet collectively optimizes without central planning — similar to how ant colonies find optimal paths.
+
+### Settlement System (BOLT12)
+Decentralized fee distribution using BOLT12 offers. Members propose settlements for completed periods, auto-vote when data hashes match (51% quorum), and each node pays their share. Period-based idempotency prevents double settlement.
+
+### Idempotent Message Delivery & Reliable Outbox
+Deduplication of all protocol messages via event ID tracking. Reliable delivery with automatic retry and exponential backoff ensures messages reach all peers even through transient disconnections.
+
+### Routing Intelligence
+Fleet-wide routing path intelligence sharing. Nodes share probe results and failure data to collectively build a superior view of the network graph, improving payment success rates for the entire fleet.
+
+### Budget Manager
+Autonomous mode budget tracking with per-day spend limits, reserve percentage enforcement, and per-channel spend caps. Prevents runaway spending in failsafe mode.
+
 ### VPN Transport Support
 Optional WireGuard VPN integration for secure fleet communication.
 
@@ -57,8 +72,8 @@ Optional WireGuard VPN integration for secure fleet communication.
 
 | Mode | Behavior |
 |------|----------|
-| `advisor` | Log recommendations and queue actions for manual approval (default) |
-| `autonomous` | Execute actions automatically within strict safety bounds |
+| `advisor` | Log recommendations and queue actions for AI/human approval via MCP server (default) |
+| `failsafe` | Emergency mode - auto-execute only critical safety actions (bans) within strict limits |
 
 ## Join the Lightning Hive
 
@@ -84,7 +99,7 @@ See [Joining the Hive](docs/JOINING_THE_HIVE.md) for the complete guide.
 
 ### Prerequisites
 - Core Lightning (CLN) v23.05+
-- Python 3.8+
+- Python 3.10+ (required for `match` statements used in newer modules)
 - `cl-revenue-ops` v1.4.0+ (Recommended for full functionality)
 
 ### Optional Integrations
@@ -118,7 +133,7 @@ lightningd --plugin=/path/to/cl-hive/cl-hive.py
 | `hive-status` | Get current membership tier, fleet size, and governance mode |
 | `hive-members` | List all Hive members and their current stats |
 | `hive-config` | View current configuration |
-| `hive-set-mode <mode>` | Change governance mode (advisor/autonomous/oracle) |
+| `hive-set-mode <mode>` | Change governance mode (advisor/failsafe) |
 
 ### Membership & Governance
 
@@ -259,7 +274,7 @@ All options can be set in your CLN config file or passed as CLI arguments. Most 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `hive-db-path` | `~/.lightning/cl_hive.db` | SQLite database path (immutable) |
-| `hive-governance-mode` | `advisor` | Governance mode: advisor, autonomous, oracle |
+| `hive-governance-mode` | `advisor` | Governance mode: advisor, failsafe |
 | `hive-max-members` | `50` | Maximum Hive members (Dunbar cap) |
 
 ### Membership Settings
@@ -349,6 +364,8 @@ See:
 
 ## Testing
 
+1,340 tests across 46 test files covering all modules.
+
 ```bash
 # Run all tests
 python3 -m pytest tests/
@@ -359,6 +376,19 @@ python3 -m pytest tests/test_planner.py
 # Run with verbose output
 python3 -m pytest tests/ -v
 ```
+
+## Recent Hardening
+
+Extensive security and stability work across the codebase:
+
+- **Thread safety**: Locks added to all shared mutable state in coordination modules (fee controllers, stigmergic coordinator, defense system, VPN transport)
+- **Cache bounds**: All peer/route caches bounded to 500-1000 entries to prevent memory bloat
+- **Governance enforcement**: All expansion paths now route through governance engine
+- **Outbox reliability**: Parse/serialization errors fail permanently instead of infinite retry
+- **Crash fixes**: AttributeError, TypeError, and None-handling fixes across 12+ modules
+- **MCF hardening**: Solution validation, force-close counting, coordinator election staleness failover
+- **Splicing fixes**: 6 bugs fixed across splice manager, coordinator, and PSBT exchange
+- **Anticipatory liquidity**: Thread safety, AttributeError fixes, key mismatch corrections
 
 ## License
 

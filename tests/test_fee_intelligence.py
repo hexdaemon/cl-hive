@@ -244,13 +244,13 @@ class TestFeeIntelligenceManager:
         # Healthy node recommendation
         healthy_rec = self.manager.get_fee_recommendation(
             target_peer_id=target,
-            our_health=60
+            our_health=70
         )
 
-        # Struggling node recommendation
+        # Struggling node recommendation (must be < HEALTH_STRUGGLING=20)
         struggling_rec = self.manager.get_fee_recommendation(
             target_peer_id=target,
-            our_health=20
+            our_health=10
         )
 
         # Struggling node should get lower fees
@@ -729,3 +729,119 @@ class TestFeeIntelligenceSnapshot:
             FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT
         )
         assert allowed is False
+
+
+# =============================================================================
+# FIX 8: MULTI-FACTOR WEIGHTED FEE CALCULATION TESTS
+# =============================================================================
+
+class TestMultiFactorFeeCalculation:
+    """Test the multi-factor weighted optimal fee calculation."""
+
+    def setup_method(self):
+        self.db = MockDatabase()
+        self.manager = FeeIntelligenceManager(
+            database=self.db,
+            plugin=MagicMock(),
+            our_pubkey="02" + "a" * 64
+        )
+
+    def test_weights_sum_to_one(self):
+        """Test that factor weights sum to 1.0."""
+        total = WEIGHT_QUALITY + WEIGHT_ELASTICITY + WEIGHT_COMPETITION + WEIGHT_FAIRNESS
+        assert abs(total - 1.0) < 0.001
+
+    def test_high_reporter_count_closer_to_avg(self):
+        """Test that high reporter count gives result closer to avg_fee."""
+        # Many reporters: quality factor should strongly weight avg_fee
+        fee_many = self.manager._calculate_optimal_fee(
+            avg_fee=300, elasticity=0.0, reporter_count=10
+        )
+
+        # Few reporters: quality factor weights toward default
+        fee_few = self.manager._calculate_optimal_fee(
+            avg_fee=300, elasticity=0.0, reporter_count=1
+        )
+
+        # With many reporters, result should be closer to avg_fee (300)
+        # than with few reporters (which blends toward DEFAULT_BASE_FEE=100)
+        assert abs(fee_many - 300) < abs(fee_few - 300)
+
+    def test_elastic_demand_lowers_fee(self):
+        """Test that very elastic demand produces lower optimal fee."""
+        fee_elastic = self.manager._calculate_optimal_fee(
+            avg_fee=500, elasticity=-0.8, reporter_count=5  # Very elastic
+        )
+        fee_inelastic = self.manager._calculate_optimal_fee(
+            avg_fee=500, elasticity=0.5, reporter_count=5  # Inelastic
+        )
+
+        assert fee_elastic < fee_inelastic
+
+    def test_result_bounded(self):
+        """Test that result is always within MIN_FEE_PPM..MAX_FEE_PPM."""
+        # Very low avg
+        fee_low = self.manager._calculate_optimal_fee(
+            avg_fee=0.1, elasticity=-0.9, reporter_count=1
+        )
+        assert fee_low >= MIN_FEE_PPM
+
+        # Very high avg
+        fee_high = self.manager._calculate_optimal_fee(
+            avg_fee=100000, elasticity=0.9, reporter_count=10
+        )
+        assert fee_high <= MAX_FEE_PPM
+
+    def test_zero_reporters_uses_default_blend(self):
+        """Test that zero reporters blends entirely toward DEFAULT_BASE_FEE."""
+        fee = self.manager._calculate_optimal_fee(
+            avg_fee=1000, elasticity=0.0, reporter_count=0
+        )
+        # Quality factor: 0 confidence → entirely DEFAULT_BASE_FEE for quality component
+        # Other factors still use avg_fee, so result should be between default and avg
+        assert fee >= MIN_FEE_PPM
+        assert fee <= MAX_FEE_PPM
+
+    def test_aggregation_uses_multi_factor(self):
+        """Test that aggregate_fee_profiles produces different results with reporter count."""
+        now = int(time.time())
+        target = "03" + "b" * 64
+
+        # Single reporter
+        self.db.fee_intelligence.append({
+            "reporter_id": "02" + "c" * 64,
+            "target_peer_id": target,
+            "timestamp": now,
+            "our_fee_ppm": 500,
+            "forward_count": 10,
+            "forward_volume_sats": 1000000,
+            "revenue_sats": 500,
+            "flow_direction": "balanced",
+            "utilization_pct": 0.5,
+        })
+
+        self.manager.aggregate_fee_profiles()
+        profile_1 = self.db.get_peer_fee_profile(target)
+        fee_1_reporter = profile_1["optimal_fee_estimate"]
+
+        # Add 4 more reporters with same fee
+        for i in range(4):
+            self.db.fee_intelligence.append({
+                "reporter_id": f"02{chr(ord('d') + i)}" + "0" * 63,
+                "target_peer_id": target,
+                "timestamp": now,
+                "our_fee_ppm": 500,
+                "forward_count": 10,
+                "forward_volume_sats": 1000000,
+                "revenue_sats": 500,
+                "flow_direction": "balanced",
+                "utilization_pct": 0.5,
+            })
+
+        self.manager.aggregate_fee_profiles()
+        profile_5 = self.db.get_peer_fee_profile(target)
+        fee_5_reporters = profile_5["optimal_fee_estimate"]
+
+        # 5 reporters should give result closer to avg_fee (500)
+        # 1 reporter blends toward DEFAULT_BASE_FEE (100)
+        assert abs(fee_5_reporters - 500) <= abs(fee_1_reporter - 500)

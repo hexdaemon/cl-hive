@@ -43,9 +43,10 @@ MAX_FEE_PPM = 5000
 DEFAULT_BASE_FEE = 100
 
 # Health tier thresholds
-HEALTH_THRIVING = 75
-HEALTH_HEALTHY = 50
-HEALTH_STRUGGLING = 25
+# Member health thresholds (relaxed 2026-02-12 to align with NNLB tiers)
+HEALTH_THRIVING = 65    # Was 75 - members can help others
+HEALTH_HEALTHY = 40     # Was 50 - normal operation
+HEALTH_STRUGGLING = 20  # Was 25 - needs help
 
 # Elasticity thresholds
 ELASTICITY_VERY_ELASTIC = -0.5
@@ -163,6 +164,12 @@ class FeeIntelligenceManager:
         history = rate_dict.get(sender_id, [])
         history = [t for t in history if t > cutoff]
         rate_dict[sender_id] = history
+
+        # Evict stale keys to prevent unbounded dict growth
+        if len(rate_dict) > 200:
+            stale = [k for k, v in rate_dict.items() if not v]
+            for k in stale:
+                del rate_dict[k]
 
         if len(history) >= max_count:
             return False
@@ -386,7 +393,7 @@ class FeeIntelligenceManager:
                 continue
 
             # Get unique reporters
-            reporters = list(set(r.get("reporter_id") for r in reports))
+            reporters = list(set(r.get("reporter_id") for r in reports if r.get("reporter_id")))
 
             # Calculate fee statistics
             fees = [r.get("our_fee_ppm", 0) for r in reports if r.get("our_fee_ppm", 0) > 0]
@@ -482,11 +489,13 @@ class FeeIntelligenceManager:
         reporter_count: int
     ) -> int:
         """
-        Calculate optimal fee recommendation.
+        Calculate optimal fee using multi-factor weighted scoring.
 
-        Uses elasticity to adjust from average:
-        - High elasticity (negative): Lower fees to maximize volume
-        - Low elasticity (positive): Higher fees for more revenue
+        Factors:
+        - Quality: Reporter count confidence (more reporters = better signal)
+        - Elasticity: Price sensitivity (elastic = lower, inelastic = higher)
+        - Competition: How fee compares to network average (stay competitive)
+        - Fairness: Converge toward fleet average (NNLB solidarity)
 
         Args:
             avg_fee: Average fee charged by hive members
@@ -496,23 +505,35 @@ class FeeIntelligenceManager:
         Returns:
             Recommended optimal fee in ppm
         """
-        base = avg_fee
+        # Factor 1: Quality (reporter confidence)
+        # More reporters = more confidence in the average = closer to avg
+        quality_confidence = min(1.0, reporter_count / 5.0)
+        quality_fee = avg_fee * quality_confidence + DEFAULT_BASE_FEE * (1 - quality_confidence)
 
-        # Elasticity adjustment
+        # Factor 2: Elasticity adjustment
         if elasticity < ELASTICITY_VERY_ELASTIC:
-            # Very elastic: 70% of average
             elasticity_mult = 0.7
         elif elasticity < ELASTICITY_SOMEWHAT_ELASTIC:
-            # Somewhat elastic: 85% of average
             elasticity_mult = 0.85
         else:
-            # Inelastic: can go slightly above average
             elasticity_mult = 1.1
+        elasticity_fee = avg_fee * elasticity_mult
 
-        optimal = int(base * elasticity_mult)
+        # Factor 3: Competition — stay near observed average
+        competition_fee = avg_fee
 
-        # Bound the result
-        return max(MIN_FEE_PPM, min(MAX_FEE_PPM, optimal))
+        # Factor 4: Fairness — converge toward fleet mean
+        fairness_fee = avg_fee
+
+        # Weighted combination
+        optimal = (
+            WEIGHT_QUALITY * quality_fee +
+            WEIGHT_ELASTICITY * elasticity_fee +
+            WEIGHT_COMPETITION * competition_fee +
+            WEIGHT_FAIRNESS * fairness_fee
+        )
+
+        return max(MIN_FEE_PPM, min(MAX_FEE_PPM, int(optimal)))
 
     def _calculate_confidence(
         self,
@@ -603,11 +624,11 @@ class FeeIntelligenceManager:
         # NNLB health adjustment
         if our_health < HEALTH_STRUGGLING:
             # Critical/struggling: lower fees to attract traffic
-            health_mult = 0.7 + (our_health / 100 * 0.3)  # 0.7x to 0.85x
+            health_mult = 0.7 + (our_health / 100 * 0.3)  # 0.7x (health=0) to 0.775x (health=25)
             health_reason = "lowered for NNLB (struggling node)"
         elif our_health > HEALTH_THRIVING:
             # Thriving: can yield to others
-            health_mult = 1.0 + ((our_health - 75) / 100 * 0.15)  # 1.0x to 1.04x
+            health_mult = 1.0 + ((our_health - 75) / 100 * 0.15)  # 1.0x (health=75) to 1.0375x (health=100)
             health_reason = "slightly raised (thriving, yielding to others)"
         else:
             health_mult = 1.0

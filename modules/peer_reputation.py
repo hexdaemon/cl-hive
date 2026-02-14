@@ -11,6 +11,7 @@ Security: All reputation reports require cryptographic signatures.
 Skepticism: No single reporter can significantly impact aggregated scores.
 """
 
+import threading
 import time
 import statistics
 from dataclasses import dataclass, field
@@ -108,6 +109,9 @@ class PeerReputationManager:
         self.plugin = plugin
         self.our_pubkey = our_pubkey
 
+        # Lock protecting mutable in-memory state
+        self._lock = threading.Lock()
+
         # In-memory aggregated reputations
         # Key: peer_id
         self._aggregated: Dict[str, AggregatedReputation] = {}
@@ -122,16 +126,23 @@ class PeerReputationManager:
         limit: tuple
     ) -> bool:
         """Check if sender is within rate limit."""
-        max_count, period = limit
-        now = time.time()
+        with self._lock:
+            max_count, period = limit
+            now = time.time()
 
-        # Clean old entries
-        rate_tracker[sender] = [
-            ts for ts in rate_tracker[sender]
-            if now - ts < period
-        ]
+            # Clean old entries for this sender
+            rate_tracker[sender] = [
+                ts for ts in rate_tracker[sender]
+                if now - ts < period
+            ]
 
-        return len(rate_tracker[sender]) < max_count
+            # Periodically evict empty/stale keys (every 100th sender check)
+            if len(rate_tracker) > 200:
+                stale = [k for k, v in rate_tracker.items() if not v]
+                for k in stale:
+                    del rate_tracker[k]
+
+            return len(rate_tracker[sender]) < max_count
 
     def _record_message(
         self,
@@ -139,7 +150,8 @@ class PeerReputationManager:
         rate_tracker: Dict[str, List[float]]
     ):
         """Record a message for rate limiting."""
-        rate_tracker[sender].append(time.time())
+        with self._lock:
+            rate_tracker[sender].append(time.time())
 
     def create_reputation_snapshot_message(
         self,
@@ -332,8 +344,9 @@ class PeerReputationManager:
         )
 
         if not reports:
-            if peer_id in self._aggregated:
-                del self._aggregated[peer_id]
+            with self._lock:
+                if peer_id in self._aggregated:
+                    del self._aggregated[peer_id]
             return
 
         # Apply skepticism: filter outliers
@@ -355,7 +368,7 @@ class PeerReputationManager:
         htlc_rates = [r.get("htlc_success_rate", 1.0) for r in weighted_reports]
         fee_stabilities = [r.get("fee_stability", 1.0) for r in weighted_reports]
         response_times = [r.get("response_time_ms", 0) for r in weighted_reports]
-        force_closes = sum(r.get("force_close_count", 0) for r in filtered)
+        force_closes = max((r.get("force_close_count", 0) for r in filtered), default=0)
 
         # Aggregate warnings
         warnings_count: Dict[str, int] = defaultdict(int)
@@ -365,7 +378,7 @@ class PeerReputationManager:
                     warnings_count[warning] += 1
 
         # Determine confidence
-        unique_reporters = set(r.get("reporter_id") for r in filtered)
+        unique_reporters = set(r.get("reporter_id") for r in filtered if r.get("reporter_id"))
         if len(unique_reporters) >= MIN_REPORTERS_FOR_CONFIDENCE:
             confidence = "high"
         elif len(unique_reporters) >= 2:
@@ -397,21 +410,22 @@ class PeerReputationManager:
 
         timestamps = [r.get("timestamp", 0) for r in filtered]
 
-        self._aggregated[peer_id] = AggregatedReputation(
-            peer_id=peer_id,
-            avg_uptime=avg_uptime,
-            avg_htlc_success=avg_htlc,
-            avg_fee_stability=avg_fee_stability,
-            avg_response_time_ms=int(statistics.mean(response_times)) if response_times else 0,
-            total_force_closes=force_closes,
-            reporters=unique_reporters,
-            report_count=len(filtered),
-            warnings=dict(warnings_count),
-            confidence=confidence,
-            last_update=max(timestamps) if timestamps else 0,
-            oldest_report=min(timestamps) if timestamps else 0,
-            reputation_score=reputation_score
-        )
+        with self._lock:
+            self._aggregated[peer_id] = AggregatedReputation(
+                peer_id=peer_id,
+                avg_uptime=avg_uptime,
+                avg_htlc_success=avg_htlc,
+                avg_fee_stability=avg_fee_stability,
+                avg_response_time_ms=int(statistics.mean(response_times)) if response_times else 0,
+                total_force_closes=force_closes,
+                reporters=unique_reporters,
+                report_count=len(filtered),
+                warnings=dict(warnings_count),
+                confidence=confidence,
+                last_update=max(timestamps) if timestamps else 0,
+                oldest_report=min(timestamps) if timestamps else 0,
+                reputation_score=reputation_score
+            )
 
     def _filter_outliers(
         self,
@@ -459,18 +473,21 @@ class PeerReputationManager:
         Returns:
             AggregatedReputation if available, None otherwise
         """
-        return self._aggregated.get(peer_id)
+        with self._lock:
+            return self._aggregated.get(peer_id)
 
     def get_all_reputations(self) -> Dict[str, AggregatedReputation]:
         """Get all aggregated reputations."""
-        return dict(self._aggregated)
+        with self._lock:
+            return dict(self._aggregated)
 
     def get_peers_with_warnings(self) -> List[AggregatedReputation]:
         """Get peers that have active warnings."""
-        return [
-            rep for rep in self._aggregated.values()
-            if rep.warnings
-        ]
+        with self._lock:
+            return [
+                rep for rep in self._aggregated.values()
+                if rep.warnings
+            ]
 
     def get_low_reputation_peers(
         self,
@@ -485,10 +502,11 @@ class PeerReputationManager:
         Returns:
             List of low-reputation peers
         """
-        return [
-            rep for rep in self._aggregated.values()
-            if rep.reputation_score < threshold
-        ]
+        with self._lock:
+            return [
+                rep for rep in self._aggregated.values()
+                if rep.reputation_score < threshold
+            ]
 
     def get_reputation_stats(self) -> Dict[str, Any]:
         """
@@ -497,29 +515,36 @@ class PeerReputationManager:
         Returns:
             Dict with reputation statistics
         """
-        total_peers = len(self._aggregated)
+        with self._lock:
+            total_peers = len(self._aggregated)
 
-        if not self._aggregated:
-            return {
-                "total_peers_tracked": 0,
-                "high_confidence_count": 0,
-                "low_reputation_count": 0,
-                "peers_with_warnings": 0,
-                "avg_reputation_score": 0,
-            }
+            if not self._aggregated:
+                return {
+                    "total_peers_tracked": 0,
+                    "high_confidence_count": 0,
+                    "low_reputation_count": 0,
+                    "peers_with_warnings": 0,
+                    "avg_reputation_score": 0,
+                }
 
-        high_confidence = sum(
-            1 for r in self._aggregated.values()
-            if r.confidence == "high"
-        )
+            high_confidence = sum(
+                1 for r in self._aggregated.values()
+                if r.confidence == "high"
+            )
 
-        low_reputation = len(self.get_low_reputation_peers())
+            low_reputation = sum(
+                1 for r in self._aggregated.values()
+                if r.reputation_score < 40
+            )
 
-        with_warnings = len(self.get_peers_with_warnings())
+            with_warnings = sum(
+                1 for r in self._aggregated.values()
+                if r.warnings
+            )
 
-        avg_score = statistics.mean(
-            r.reputation_score for r in self._aggregated.values()
-        )
+            avg_score = statistics.mean(
+                r.reputation_score for r in self._aggregated.values()
+            )
 
         return {
             "total_peers_tracked": total_peers,
@@ -556,12 +581,13 @@ class PeerReputationManager:
         now = time.time()
         stale_cutoff = now - (REPUTATION_STALENESS_HOURS * 3600)
 
-        stale_peers = [
-            peer_id for peer_id, rep in self._aggregated.items()
-            if rep.last_update < stale_cutoff
-        ]
+        with self._lock:
+            stale_peers = [
+                peer_id for peer_id, rep in self._aggregated.items()
+                if rep.last_update < stale_cutoff
+            ]
 
-        for peer_id in stale_peers:
-            del self._aggregated[peer_id]
+            for peer_id in stale_peers:
+                del self._aggregated[peer_id]
 
         return len(stale_peers)

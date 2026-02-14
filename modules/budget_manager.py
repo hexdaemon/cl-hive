@@ -10,6 +10,7 @@ Phase 8: Hive-wide Affordability Consensus
 Author: Lightning Goats Team
 """
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass, asdict
@@ -118,6 +119,9 @@ class BudgetHoldManager:
         self.our_pubkey = our_pubkey
         self.plugin = plugin
 
+        # Lock protecting in-memory holds
+        self._lock = threading.Lock()
+
         # In-memory cache for active holds (hold_id -> BudgetHold)
         self._holds: Dict[str, BudgetHold] = {}
 
@@ -150,41 +154,42 @@ class BudgetHoldManager:
         Returns:
             hold_id if successful, None if failed (e.g., max holds reached)
         """
-        # Cleanup expired holds first
-        self.cleanup_expired_holds()
+        with self._lock:
+            # Cleanup expired holds first (inside lock)
+            self._cleanup_expired_holds_unlocked()
 
-        # Check concurrent hold limit
-        active_holds = self.get_active_holds()
-        if len(active_holds) >= MAX_CONCURRENT_HOLDS:
-            self._log(f"Cannot create hold: max concurrent holds ({MAX_CONCURRENT_HOLDS}) reached")
-            return None
+            # Check concurrent hold limit
+            active_holds = [h for h in self._holds.values() if h.is_active()]
+            if len(active_holds) >= MAX_CONCURRENT_HOLDS:
+                self._log(f"Cannot create hold: max concurrent holds ({MAX_CONCURRENT_HOLDS}) reached")
+                return None
 
-        # Check if we already have a hold for this round
-        for hold in active_holds:
-            if hold.round_id == round_id:
-                self._log(f"Hold already exists for round {round_id[:8]}...")
-                return hold.hold_id
+            # Check if we already have a hold for this round
+            for hold in active_holds:
+                if hold.round_id == round_id:
+                    self._log(f"Hold already exists for round {round_id[:8]}...")
+                    return hold.hold_id
 
-        # Cap duration
-        duration = min(duration_seconds, MAX_HOLD_DURATION_SECONDS)
+            # Cap duration
+            duration = min(duration_seconds, MAX_HOLD_DURATION_SECONDS)
 
-        now = int(time.time())
-        hold_id = self._generate_hold_id()
+            now = int(time.time())
+            hold_id = self._generate_hold_id()
 
-        hold = BudgetHold(
-            hold_id=hold_id,
-            round_id=round_id,
-            peer_id=self.our_pubkey,
-            amount_sats=amount_sats,
-            created_at=now,
-            expires_at=now + duration,
-            status="active",
-        )
+            hold = BudgetHold(
+                hold_id=hold_id,
+                round_id=round_id,
+                peer_id=self.our_pubkey,
+                amount_sats=amount_sats,
+                created_at=now,
+                expires_at=now + duration,
+                status="active",
+            )
 
-        # Store in memory
-        self._holds[hold_id] = hold
+            # Store in memory
+            self._holds[hold_id] = hold
 
-        # Persist to database
+        # Persist to database (outside lock — DB has its own thread safety)
         if self.db:
             self.db.create_budget_hold(
                 hold_id=hold_id,
@@ -213,29 +218,30 @@ class BudgetHoldManager:
         Returns:
             True if released, False if not found or already released
         """
-        hold = self._holds.get(hold_id)
-        if not hold:
-            # Try loading from database
-            if self.db:
-                hold_data = self.db.get_budget_hold(hold_id)
-                if hold_data:
-                    hold = BudgetHold.from_dict(hold_data)
+        with self._lock:
+            hold = self._holds.get(hold_id)
+            if not hold:
+                # Try loading from database
+                if self.db:
+                    hold_data = self.db.get_budget_hold(hold_id)
+                    if hold_data:
+                        hold = BudgetHold.from_dict(hold_data)
 
-        if not hold:
-            self._log(f"Cannot release hold {hold_id}: not found")
-            return False
+            if not hold:
+                self._log(f"Cannot release hold {hold_id}: not found")
+                return False
 
-        if hold.status != "active":
-            self._log(f"Cannot release hold {hold_id}: status is {hold.status}")
-            return False
+            if hold.status != "active":
+                self._log(f"Cannot release hold {hold_id}: status is {hold.status}")
+                return False
 
-        # Update status
-        hold.status = "released"
+            # Update status
+            hold.status = "released"
 
-        # Update in memory
-        self._holds[hold_id] = hold
+            # Update in memory
+            self._holds[hold_id] = hold
 
-        # Update in database
+        # Update in database (outside lock)
         if self.db:
             self.db.release_budget_hold(hold_id)
 
@@ -253,17 +259,27 @@ class BudgetHoldManager:
             Number of holds released
         """
         released = 0
-        for hold in list(self._holds.values()):
-            if hold.round_id == round_id and hold.status == "active":
-                if self.release_hold(hold.hold_id):
-                    released += 1
+
+        # Collect hold IDs to release under lock
+        with self._lock:
+            to_release = [
+                hold.hold_id for hold in self._holds.values()
+                if hold.round_id == round_id and hold.status == "active"
+            ]
+
+        # Release each one (release_hold acquires lock internally)
+        for hold_id in to_release:
+            if self.release_hold(hold_id):
+                released += 1
 
         # Also check database for holds not in memory
         if self.db:
             db_holds = self.db.get_holds_for_round(round_id)
+            with self._lock:
+                in_memory_ids = set(self._holds.keys())
             for hold_data in db_holds:
                 hold_id = hold_data.get("hold_id")
-                if hold_id and hold_id not in self._holds:
+                if hold_id and hold_id not in in_memory_ids:
                     if hold_data.get("status") == "active":
                         self.db.release_budget_hold(hold_id)
                         released += 1
@@ -283,32 +299,34 @@ class BudgetHoldManager:
             consumed_by: The action_id or channel_id that consumed the budget
 
         Returns:
-            True if consumed, False if not found or not active
+            True if consumed, False if not found, expired, or not active
         """
-        hold = self._holds.get(hold_id)
-        if not hold:
-            if self.db:
-                hold_data = self.db.get_budget_hold(hold_id)
-                if hold_data:
-                    hold = BudgetHold.from_dict(hold_data)
+        with self._lock:
+            hold = self._holds.get(hold_id)
+            if not hold:
+                if self.db:
+                    hold_data = self.db.get_budget_hold(hold_id)
+                    if hold_data:
+                        hold = BudgetHold.from_dict(hold_data)
 
-        if not hold:
-            self._log(f"Cannot consume hold {hold_id}: not found")
-            return False
+            if not hold:
+                self._log(f"Cannot consume hold {hold_id}: not found")
+                return False
 
-        if hold.status != "active":
-            self._log(f"Cannot consume hold {hold_id}: status is {hold.status}")
-            return False
+            # Check is_active() which validates both status AND expiry time
+            if not hold.is_active():
+                self._log(f"Cannot consume hold {hold_id}: not active (status={hold.status})")
+                return False
 
-        # Update status
-        hold.status = "consumed"
-        hold.consumed_by = consumed_by
-        hold.consumed_at = int(time.time())
+            # Update status
+            hold.status = "consumed"
+            hold.consumed_by = consumed_by
+            hold.consumed_at = int(time.time())
 
-        # Update in memory
-        self._holds[hold_id] = hold
+            # Update in memory
+            self._holds[hold_id] = hold
 
-        # Update in database
+        # Update in database (outside lock)
         if self.db:
             self.db.consume_budget_hold(hold_id, consumed_by)
 
@@ -343,22 +361,25 @@ class BudgetHoldManager:
     def get_total_held(self) -> int:
         """Get total amount held across all active holds."""
         self.cleanup_expired_holds()
-        total = 0
-        for hold in self._holds.values():
-            if hold.is_active():
-                total += hold.amount_sats
-        return total
+        with self._lock:
+            total = 0
+            for hold in self._holds.values():
+                if hold.is_active():
+                    total += hold.amount_sats
+            return total
 
     def get_active_holds(self) -> List[BudgetHold]:
         """Get all currently active holds."""
         self.cleanup_expired_holds()
-        return [h for h in self._holds.values() if h.is_active()]
+        with self._lock:
+            return [h for h in self._holds.values() if h.is_active()]
 
     def get_hold(self, hold_id: str) -> Optional[BudgetHold]:
         """Get a specific hold by ID."""
-        hold = self._holds.get(hold_id)
-        if hold:
-            return hold
+        with self._lock:
+            hold = self._holds.get(hold_id)
+            if hold:
+                return hold
 
         # Try database
         if self.db:
@@ -370,14 +391,16 @@ class BudgetHoldManager:
 
     def get_hold_for_round(self, round_id: str) -> Optional[BudgetHold]:
         """Get the active hold for a specific round, if any."""
-        for hold in self._holds.values():
-            if hold.round_id == round_id and hold.is_active():
-                return hold
+        with self._lock:
+            for hold in self._holds.values():
+                if hold.round_id == round_id and hold.is_active():
+                    return hold
         return None
 
     def get_next_expiry(self) -> int:
         """Get the timestamp of the next hold expiry, or 0 if no active holds."""
-        active = self.get_active_holds()
+        with self._lock:
+            active = [h for h in self._holds.values() if h.is_active()]
         if not active:
             return 0
         return min(h.expires_at for h in active)
@@ -386,13 +409,8 @@ class BudgetHoldManager:
     # MAINTENANCE
     # =========================================================================
 
-    def cleanup_expired_holds(self) -> int:
-        """
-        Mark expired holds as expired.
-
-        Returns:
-            Number of holds expired
-        """
+    def _cleanup_expired_holds_unlocked(self) -> int:
+        """Mark expired holds as expired and evict non-active entries. No lock."""
         now = int(time.time())
 
         # Rate limit cleanup
@@ -401,6 +419,7 @@ class BudgetHoldManager:
 
         self._last_cleanup = now
         expired_count = 0
+        to_evict = []
 
         for hold_id, hold in list(self._holds.items()):
             if hold.status == "active" and now >= hold.expires_at:
@@ -413,7 +432,19 @@ class BudgetHoldManager:
                 expired_count += 1
                 self._log(f"Expired budget hold {hold_id[:12]}...")
 
+            # Evict non-active holds from memory (they're persisted in DB)
+            if hold.status in ("released", "consumed", "expired"):
+                to_evict.append(hold_id)
+
+        for hold_id in to_evict:
+            del self._holds[hold_id]
+
         return expired_count
+
+    def cleanup_expired_holds(self) -> int:
+        """Mark expired holds as expired and evict non-active entries (thread-safe)."""
+        with self._lock:
+            return self._cleanup_expired_holds_unlocked()
 
     def load_from_database(self) -> int:
         """
@@ -428,11 +459,12 @@ class BudgetHoldManager:
         holds = self.db.get_active_holds_for_peer(self.our_pubkey)
         loaded = 0
 
-        for hold_data in holds:
-            hold = BudgetHold.from_dict(hold_data)
-            if hold.is_active():
-                self._holds[hold.hold_id] = hold
-                loaded += 1
+        with self._lock:
+            for hold_data in holds:
+                hold = BudgetHold.from_dict(hold_data)
+                if hold.is_active():
+                    self._holds[hold.hold_id] = hold
+                    loaded += 1
 
         self._log(f"Loaded {loaded} active budget holds from database")
         return loaded

@@ -142,10 +142,20 @@ def vpn_add_peer(ctx: HiveContext, pubkey: str, vpn_address: str) -> Dict[str, A
     if not ctx.vpn_transport:
         return {"error": "VPN transport not initialized"}
 
+    # Validate pubkey format (66 hex chars for compressed secp256k1 key)
+    import re
+    if not re.match(r'^[0-9a-fA-F]{66}$', pubkey):
+        return {"error": "Invalid pubkey format: expected 66 hex characters"}
+
     # Parse address
     if ':' in vpn_address:
         ip, port_str = vpn_address.rsplit(':', 1)
-        port = int(port_str)
+        try:
+            port = int(port_str)
+        except (ValueError, TypeError):
+            return {"error": "Invalid port number"}
+        if not (1 <= port <= 65535):
+            return {"error": f"Port {port} out of valid range (1-65535)"}
     else:
         ip = vpn_address
         port = 9735
@@ -222,10 +232,20 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
     if ctx.our_pubkey:
         our_member = ctx.database.get_member(ctx.our_pubkey)
         if our_member:
+            uptime_raw = our_member.get("uptime_pct", 0.0)
+            # Normalize to 0-100 scale (DB stores 0.0-1.0)
+            if uptime_raw <= 1.0:
+                uptime_raw = round(uptime_raw * 100, 2)
+            contribution_ratio = our_member.get("contribution_ratio", 0.0)
+            # Enrich with live contribution ratio if available (Issue #59)
+            if ctx.membership_mgr:
+                contribution_ratio = ctx.membership_mgr.calculate_contribution_ratio(ctx.our_pubkey)
             our_membership = {
                 "tier": our_member.get("tier"),
                 "joined_at": our_member.get("joined_at"),
                 "pubkey": ctx.our_pubkey,
+                "uptime_pct": uptime_raw,
+                "contribution_ratio": contribution_ratio,
             }
 
     return {
@@ -312,6 +332,16 @@ def members(ctx: HiveContext) -> Dict[str, Any]:
         return {"error": "Hive not initialized"}
 
     all_members = ctx.database.get_all_members()
+
+    # Enrich with live contribution ratio from ledger (Issue #59)
+    if ctx.membership_mgr:
+        for m in all_members:
+            peer_id = m.get("peer_id")
+            if peer_id:
+                m["contribution_ratio"] = ctx.membership_mgr.calculate_contribution_ratio(peer_id)
+                # Format uptime as percentage (stored as 0.0-1.0 decimal)
+                m["uptime_pct"] = round(m.get("uptime_pct", 0.0) * 100, 2)
+
     return {
         "count": len(all_members),
         "members": all_members,
@@ -339,13 +369,14 @@ def pending_actions(ctx: HiveContext) -> Dict[str, Any]:
     }
 
 
-def reject_action(ctx: HiveContext, action_id) -> Dict[str, Any]:
+def reject_action(ctx: HiveContext, action_id, reason=None) -> Dict[str, Any]:
     """
     Reject pending action(s).
 
     Args:
         ctx: HiveContext
         action_id: ID of the action to reject, or "all" to reject all pending actions
+        reason: Optional reason for rejection (stored for learning)
 
     Returns:
         Dict with rejection result.
@@ -362,7 +393,7 @@ def reject_action(ctx: HiveContext, action_id) -> Dict[str, Any]:
 
     # Handle "all" option
     if action_id == "all":
-        return _reject_all_actions(ctx)
+        return _reject_all_actions(ctx, reason=reason)
 
     # Single action rejection - validate action_id
     try:
@@ -379,28 +410,32 @@ def reject_action(ctx: HiveContext, action_id) -> Dict[str, Any]:
         return {"error": f"Action already {action['status']}", "action_id": action_id}
 
     # Also abort the associated intent if it exists
-    payload = action['payload']
+    payload = action.get('payload', {})
     intent_id = payload.get('intent_id')
     if intent_id:
-        ctx.database.update_intent_status(intent_id, 'aborted')
+        ctx.database.update_intent_status(intent_id, 'aborted', reason="action_rejected")
 
-    # Update action status
-    ctx.database.update_action_status(action_id, 'rejected')
+    # Update action status with optional reason
+    ctx.database.update_action_status(action_id, 'rejected', reason=reason)
 
     if ctx.log:
-        ctx.log(f"cl-hive: Rejected action {action_id}", 'info')
+        reason_str = f" (reason: {reason})" if reason else ""
+        ctx.log(f"cl-hive: Rejected action {action_id}{reason_str}", 'info')
 
-    return {
+    result = {
         "status": "rejected",
         "action_id": action_id,
         "action_type": action['action_type'],
     }
+    if reason:
+        result["reason"] = reason
+    return result
 
 
 MAX_BULK_ACTIONS = 100  # CLAUDE.md: "Bound everything"
 
 
-def _reject_all_actions(ctx: HiveContext) -> Dict[str, Any]:
+def _reject_all_actions(ctx: HiveContext, reason=None) -> Dict[str, Any]:
     """Reject all pending actions (up to MAX_BULK_ACTIONS)."""
     actions = ctx.database.get_pending_actions()
 
@@ -421,10 +456,10 @@ def _reject_all_actions(ctx: HiveContext) -> Dict[str, Any]:
             payload = action.get('payload', {})
             intent_id = payload.get('intent_id')
             if intent_id:
-                ctx.database.update_intent_status(intent_id, 'aborted')
+                ctx.database.update_intent_status(intent_id, 'aborted', reason="action_rejected")
 
-            # Update action status
-            ctx.database.update_action_status(action_id, 'rejected')
+            # Update action status with optional reason
+            ctx.database.update_action_status(action_id, 'rejected', reason=reason)
             rejected.append({
                 "action_id": action_id,
                 "action_type": action['action_type']
@@ -455,7 +490,7 @@ def budget_summary(ctx: HiveContext, days: int = 7) -> Dict[str, Any]:
 
     Args:
         ctx: HiveContext
-        days: Number of days of history to include (default: 7)
+        days: Number of days of history to include (default: 7, max: 365)
 
     Returns:
         Dict with budget utilization and spending history.
@@ -469,6 +504,12 @@ def budget_summary(ctx: HiveContext, days: int = 7) -> Dict[str, Any]:
 
     if not ctx.database:
         return {"error": "Database not initialized"}
+
+    # Bound days parameter (CLAUDE.md: "Bound everything")
+    try:
+        days = min(max(int(days), 1), 365)
+    except (ValueError, TypeError):
+        days = 7
 
     cfg = ctx.config.snapshot() if ctx.config else None
     if not cfg:
@@ -511,6 +552,8 @@ def approve_action(ctx: HiveContext, action_id, amount_sats: int = None) -> Dict
 
     # Handle "all" option
     if action_id == "all":
+        if amount_sats is not None:
+            return {"error": "amount_sats override not supported with 'all' — approve individually to set custom amounts"}
         return _approve_all_actions(ctx)
 
     # Single action approval - validate action_id
@@ -606,7 +649,7 @@ def _approve_all_actions(ctx: HiveContext) -> Dict[str, Any]:
                 })
 
         except Exception as e:
-            errors.append({"action_id": action_id, "error": str(e)})
+            errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
 
     if ctx.log:
         ctx.log(f"cl-hive: Approved {len(approved)} actions", 'info')
@@ -657,11 +700,17 @@ def _execute_channel_open(
         payload.get('channel_size_sats') or
         1_000_000  # Default 1M sats
     )
-    proposed_size = int(proposed_size)  # Ensure int type
+    try:
+        proposed_size = int(proposed_size)
+    except (ValueError, TypeError):
+        return {"error": "Invalid channel_size_sats in action payload", "action_id": action_id}
 
     # Apply member override if provided
     if amount_sats is not None:
-        channel_size_sats = int(amount_sats)
+        try:
+            channel_size_sats = int(amount_sats)
+        except (ValueError, TypeError):
+            return {"error": "Invalid amount_sats", "action_id": action_id}
         override_applied = True
     else:
         channel_size_sats = proposed_size
@@ -694,8 +743,30 @@ def _execute_channel_open(
         if ctx.log:
             ctx.log(f"cl-hive: Could not check existing channels: {e}", 'debug')
 
-    # Calculate intelligent budget limits
+    # Re-check feerate gate at approval time (feerates may have changed since proposal)
     cfg = ctx.config.snapshot() if ctx.config else None
+    if cfg and ctx.safe_plugin:
+        max_feerate = getattr(cfg, 'max_expansion_feerate_perkb', 5000)
+        if max_feerate != 0:
+            try:
+                feerates = ctx.safe_plugin.rpc.feerates("perkb")
+                opening_feerate = feerates.get("perkb", {}).get("opening")
+                if opening_feerate is None:
+                    opening_feerate = feerates.get("perkb", {}).get("min_acceptable", 0)
+                if opening_feerate > 0 and opening_feerate > max_feerate:
+                    ctx.database.update_action_status(action_id, 'failed')
+                    return {
+                        "error": "Feerate gate: on-chain fees too high for channel open",
+                        "action_id": action_id,
+                        "opening_feerate_perkb": opening_feerate,
+                        "max_feerate_perkb": max_feerate,
+                        "hint": "Wait for feerates to drop or increase hive-max-expansion-feerate"
+                    }
+            except Exception as e:
+                if ctx.log:
+                    ctx.log(f"cl-hive: Could not check feerates: {e}", 'debug')
+
+    # Calculate intelligent budget limits
     budget_info = {}
     if cfg:
         # Get onchain balance for reserve calculation
@@ -796,8 +867,9 @@ def _execute_channel_open(
                         "msg": msg.hex()
                     })
                     broadcast_count += 1
-                except Exception:
-                    pass
+                except Exception as send_err:
+                    if ctx.log:
+                        ctx.log(f"cl-hive: Intent send to {member_id[:16]}... failed: {send_err}", 'debug')
 
             if ctx.log:
                 ctx.log(f"cl-hive: Broadcast intent to {broadcast_count} hive members", 'info')
@@ -809,8 +881,8 @@ def _execute_channel_open(
     # Step 2: Connect to target if not already connected
     try:
         # Check if already connected
-        peers = ctx.safe_plugin.rpc.listpeers(target)
-        if not peers.get('peers'):
+        peerchannels = ctx.safe_plugin.rpc.listpeerchannels(target)
+        if not peerchannels.get('channels'):
             # Try to connect (will fail if no address known, but that's OK)
             try:
                 ctx.safe_plugin.rpc.connect(target)
@@ -852,7 +924,7 @@ def _execute_channel_open(
 
         # Update intent status if we have one
         if intent_id and ctx.database:
-            ctx.database.update_intent_status(intent_id, 'committed')
+            ctx.database.update_intent_status(intent_id, 'committed', reason="action_executed")
 
         # Update action status
         ctx.database.update_action_status(action_id, 'executed')
@@ -887,12 +959,16 @@ def _execute_channel_open(
         return result
 
     except Exception as e:
-        error_msg = str(e)
+        error_msg = str(e) or f"{type(e).__name__} during channel open"
         if ctx.log:
             ctx.log(f"cl-hive: fundchannel failed: {error_msg}", 'error')
 
         # Update action status to failed
-        ctx.database.update_action_status(action_id, 'failed')
+        try:
+            ctx.database.update_action_status(action_id, 'failed')
+        except Exception as db_err:
+            if ctx.log:
+                ctx.log(f"cl-hive: Failed to update action status: {db_err}", 'error')
 
         # Classify the error to determine if delegation is appropriate
         failure_info = _classify_channel_open_failure(error_msg)
@@ -1301,7 +1377,7 @@ def pending_bans(ctx: HiveContext) -> Dict[str, Any]:
         result.append({
             "proposal_id": p["proposal_id"],
             "target_peer_id": target_id,
-            "target_tier": ctx.database.get_member(target_id).get("tier") if ctx.database.get_member(target_id) else "unknown",
+            "target_tier": next((m.get("tier", "unknown") for m in all_members if m["peer_id"] == target_id), "unknown"),
             "proposer": p["proposer_peer_id"][:16] + "...",
             "reason": p["reason"],
             "proposed_at": p["proposed_at"],
@@ -1502,7 +1578,7 @@ def expansion_recommendations(ctx: HiveContext, limit: int = 10) -> Dict[str, An
             "alias": alias,
             "recommendation": rec.recommendation_type,
             "score": round(rec.score, 4),
-            "hive_coverage": f"{rec.hive_members_count}/{ctx.planner._get_hive_members().__len__()} members ({rec.hive_coverage_pct:.0%})",
+            "hive_coverage": f"{rec.hive_members_count}/{len(ctx.planner._get_hive_members())} members ({rec.hive_coverage_pct:.0%})",
             "hive_coverage_pct": round(rec.hive_coverage_pct * 100, 1),
             "hive_members_count": rec.hive_members_count,
             "competition_level": rec.competition_level,
@@ -1590,7 +1666,11 @@ def contribution(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
 
     if member:
         result["tier"] = member.get("tier")
-        result["uptime_pct"] = member.get("uptime_pct")
+        uptime_raw = member.get("uptime_pct", 0.0)
+        # Normalize to 0-100 scale (DB stores 0.0-1.0)
+        if uptime_raw is not None and uptime_raw <= 1.0:
+            uptime_raw = round(uptime_raw * 100, 2)
+        result["uptime_pct"] = uptime_raw
 
     return result
 
@@ -1727,7 +1807,7 @@ def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
         if period is None:
             now = datetime.datetime.now(tz=datetime.timezone.utc)
             year, week, _ = now.isocalendar()
-            period = f"{year}-W{week:02d}"
+            period = f"{year}-{week:02d}"
 
         # Sync uptime from presence data before snapshotting
         # This ensures uptime_pct in hive_members is current
@@ -1783,7 +1863,7 @@ def pool_distribution(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
         if period is None:
             now = datetime.datetime.now(tz=datetime.timezone.utc)
             year, week, _ = now.isocalendar()
-            period = f"{year}-W{week:02d}"
+            period = f"{year}-{week:02d}"
 
         # Get revenue for the period
         revenue_info = ctx.routing_pool.db.get_pool_revenue(period=period)
@@ -1842,7 +1922,7 @@ def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> D
             now = datetime.datetime.now(tz=datetime.timezone.utc)
             last_week = now - datetime.timedelta(days=7)
             year, week, _ = last_week.isocalendar()
-            period = f"{year}-W{week:02d}"
+            period = f"{year}-{week:02d}"
 
         if dry_run:
             # Just calculate
@@ -2284,9 +2364,27 @@ def deposit_marker(
 
     Returns:
         Dict with deposited marker info.
+
+    Permission: Member only
     """
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
     if not ctx.fee_coordination_mgr:
         return {"error": "Fee coordination not initialized"}
+
+    # Input validation
+    try:
+        fee_ppm = int(fee_ppm)
+        volume_sats = int(volume_sats)
+    except (ValueError, TypeError):
+        return {"error": "fee_ppm and volume_sats must be numeric"}
+    if fee_ppm < 0 or fee_ppm > 50000:
+        return {"error": "fee_ppm must be between 0 and 50000"}
+    if volume_sats < 0 or volume_sats > 10_000_000_000:  # 100 BTC
+        return {"error": "volume_sats out of range"}
 
     try:
         marker = ctx.fee_coordination_mgr.stigmergic_coord.deposit_marker(
@@ -2325,7 +2423,21 @@ def defense_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
         return {"error": "Fee coordination not initialized"}
 
     try:
-        result = ctx.fee_coordination_mgr.defense_system.get_defense_status()
+        defense = ctx.fee_coordination_mgr.defense_system
+
+        # Get active (non-expired) warnings and enrich with computed fields
+        active_warnings = []
+        for w in defense.get_active_warnings():
+            warning_dict = w.to_dict()
+            warning_dict["expires_at"] = w.timestamp + w.ttl
+            warning_dict["defensive_multiplier"] = defense.get_defensive_multiplier(w.peer_id)
+            active_warnings.append(warning_dict)
+
+        result = {
+            "active_warnings": active_warnings,
+            "warning_count": len(active_warnings),
+            "defensive_fees_active": len(defense._defensive_fees),
+        }
 
         # If peer_id specified, add peer-specific threat info
         if peer_id:
@@ -2336,14 +2448,14 @@ def defense_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
                 "defensive_multiplier": 1.0
             }
 
-            # Check if this peer has any active warnings
-            for warning in result.get("active_warnings", []):
+            for warning in active_warnings:
                 if warning.get("peer_id") == peer_id:
                     peer_threat = {
                         "is_threat": True,
                         "threat_type": warning.get("threat_type"),
                         "severity": warning.get("severity", 0.5),
-                        "defensive_multiplier": warning.get("defensive_multiplier", 1.0)
+                        "defensive_multiplier": warning.get("defensive_multiplier", 1.0),
+                        "expires_at": warning.get("expires_at", 0)
                     }
                     break
 
@@ -2432,10 +2544,17 @@ def pheromone_levels(ctx: HiveContext, channel_id: str = None) -> Dict[str, Any]
 
         if channel_id:
             level = all_levels.get(channel_id, 0.0)
+            above = level > 10.0
             return {
                 "channel_id": channel_id,
                 "pheromone_level": round(level, 2),
-                "above_exploit_threshold": level > 10.0
+                "above_exploit_threshold": above,
+                # Also return in list format for cl-revenue-ops compatibility
+                "pheromone_levels": [{
+                    "channel_id": channel_id,
+                    "level": round(level, 2),
+                    "above_threshold": above
+                }]
             }
 
         # Sort by level descending
@@ -2453,11 +2572,167 @@ def pheromone_levels(ctx: HiveContext, channel_id: str = None) -> Dict[str, Any]
             "levels": [
                 {"channel_id": k, "level": round(v, 2)}
                 for k, v in sorted_levels[:50]
+            ],
+            "pheromone_levels": [
+                {
+                    "channel_id": k,
+                    "level": round(v, 2),
+                    "above_threshold": v > 10.0
+                }
+                for k, v in sorted_levels[:50]
             ]
         }
 
     except Exception as e:
         return {"error": f"Failed to get pheromone levels: {e}"}
+
+
+def get_routing_intelligence(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
+    """
+    Get routing intelligence for channel(s).
+
+    Exports pheromone levels, trends, and corridor membership for use by
+    external fee optimization systems (e.g., cl-revenue-ops Thompson sampling).
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel short_channel_id. If None, returns all.
+
+    Returns:
+        Dict with routing intelligence:
+        {
+            "channels": {
+                "932263x1883x0": {
+                    "pheromone_level": 3.98,
+                    "pheromone_trend": "stable",  # rising/falling/stable
+                    "last_forward_age_hours": 2.5,
+                    "marker_count": 3,
+                    "on_active_corridor": true
+                },
+                ...
+            },
+            "timestamp": 1234567890
+        }
+    """
+    import time
+
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        adaptive = ctx.fee_coordination_mgr.adaptive_controller
+        stigmergic = ctx.fee_coordination_mgr.stigmergic_coord
+
+        # Get all pheromone levels
+        all_levels = adaptive.get_all_pheromone_levels()
+
+        # Get pheromone timestamps and fees
+        with adaptive._lock:
+            pheromone_timestamps = dict(adaptive._pheromone_last_update)
+            pheromone_fees = dict(adaptive._pheromone_fee)
+            channel_peer_map = dict(adaptive._channel_peer_map)
+
+        # Get all active markers
+        all_markers = stigmergic.get_all_markers()
+
+        # Build a set of (source, dest) pairs that have active markers
+        active_corridors = set()
+        marker_counts = {}  # (source, dest) -> count
+        for marker in all_markers:
+            key = (marker.source_peer_id, marker.destination_peer_id)
+            active_corridors.add(key)
+            marker_counts[key] = marker_counts.get(key, 0) + 1
+
+        now = time.time()
+
+        def get_channel_intel(channel_id: str) -> Dict[str, Any]:
+            """Build intelligence dict for a single channel."""
+            level = all_levels.get(channel_id, 0.0)
+            last_update = pheromone_timestamps.get(channel_id, 0)
+            peer_id = channel_peer_map.get(channel_id)
+
+            # Calculate last forward age in hours
+            if last_update > 0:
+                last_forward_age_hours = round((now - last_update) / 3600, 2)
+            else:
+                last_forward_age_hours = None
+
+            # Determine pheromone trend
+            # If we have a recent update (last 6 hours) and high pheromone, it's rising
+            # If pheromone is decaying (old update), it's falling
+            # Otherwise stable
+            if last_update > 0:
+                hours_since_update = (now - last_update) / 3600
+                if hours_since_update < 6 and level > 1.0:
+                    trend = "rising"
+                elif hours_since_update > 24 and level > 0.1:
+                    trend = "falling"
+                else:
+                    trend = "stable"
+            else:
+                trend = "stable"
+
+            # Check if this channel is on an active corridor
+            on_active_corridor = False
+            channel_marker_count = 0
+
+            if peer_id:
+                # Check all corridors involving this peer
+                for (src, dst), count in marker_counts.items():
+                    if src == peer_id or dst == peer_id:
+                        on_active_corridor = True
+                        channel_marker_count += count
+
+            return {
+                "pheromone_level": round(level, 2),
+                "pheromone_trend": trend,
+                "last_forward_age_hours": last_forward_age_hours,
+                "marker_count": channel_marker_count,
+                "on_active_corridor": on_active_corridor
+            }
+
+        # Build result
+        if scid:
+            # Single channel requested
+            if scid not in all_levels and scid not in channel_peer_map:
+                return {
+                    "channels": {
+                        scid: {
+                            "pheromone_level": 0.0,
+                            "pheromone_trend": "stable",
+                            "last_forward_age_hours": None,
+                            "marker_count": 0,
+                            "on_active_corridor": False
+                        }
+                    },
+                    "timestamp": int(now)
+                }
+            return {
+                "channels": {scid: get_channel_intel(scid)},
+                "timestamp": int(now)
+            }
+
+        # All channels
+        channels = {}
+        # Include all channels with pheromone levels
+        for channel_id in all_levels.keys():
+            channels[channel_id] = get_channel_intel(channel_id)
+
+        # Also include channels that have peer mappings but no pheromone yet
+        for channel_id in channel_peer_map.keys():
+            if channel_id not in channels:
+                channels[channel_id] = get_channel_intel(channel_id)
+
+        return {
+            "channels": channels,
+            "timestamp": int(now),
+            "total_channels": len(channels),
+            "channels_with_pheromone": len(all_levels),
+            "active_corridors": len(active_corridors)
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get routing intelligence: {e}"}
 
 
 def fee_coordination_status(ctx: HiveContext) -> Dict[str, Any]:
@@ -2583,7 +2858,8 @@ def record_rebalance_outcome(
     amount_sats: int,
     cost_sats: int,
     success: bool,
-    via_fleet: bool = False
+    via_fleet: bool = False,
+    failure_reason: str = ""
 ) -> Dict[str, Any]:
     """
     Record a rebalance outcome for tracking and circular flow detection.
@@ -2599,6 +2875,7 @@ def record_rebalance_outcome(
         cost_sats: Cost paid
         success: Whether rebalance succeeded
         via_fleet: Whether routed through fleet members
+        failure_reason: Error description if failed
 
     Returns:
         Dict with recording result and any circular flow warnings.
@@ -2607,7 +2884,7 @@ def record_rebalance_outcome(
         return {"error": "Cost reduction not initialized"}
 
     try:
-        return ctx.cost_reduction_mgr.record_rebalance_outcome(
+        result = ctx.cost_reduction_mgr.record_rebalance_outcome(
             from_channel=from_channel,
             to_channel=to_channel,
             amount_sats=amount_sats,
@@ -2615,6 +2892,39 @@ def record_rebalance_outcome(
             success=success,
             via_fleet=via_fleet
         )
+        if failure_reason and not success:
+            result["failure_reason"] = failure_reason
+
+        # Deposit stigmergic marker for routing intelligence
+        marker_deposited = False
+        if ctx.fee_coordination_mgr and ctx.safe_plugin:
+            try:
+                # Resolve SCIDs to peer_ids
+                channels = ctx.safe_plugin.rpc.listpeerchannels()
+                scid_to_peer = {}
+                for ch in channels.get('channels', []):
+                    ch_scid = ch.get('short_channel_id')
+                    if ch_scid:
+                        scid_to_peer[ch_scid] = ch.get('peer_id', '')
+
+                from_peer = scid_to_peer.get(from_channel)
+                to_peer = scid_to_peer.get(to_channel)
+
+                if from_peer and to_peer:
+                    fee_ppm = cost_sats * 1_000_000 // max(amount_sats, 1)
+                    ctx.fee_coordination_mgr.stigmergic_coord.deposit_marker(
+                        source=from_peer,
+                        destination=to_peer,
+                        fee_charged=fee_ppm,
+                        success=success,
+                        volume_sats=amount_sats if success else 0
+                    )
+                    marker_deposited = True
+            except Exception:
+                pass  # Non-fatal: marker deposit is best-effort
+
+        result["marker_deposited"] = marker_deposited
+        return result
 
     except Exception as e:
         return {"error": f"Failed to record rebalance outcome: {e}"}
@@ -2696,13 +3006,20 @@ def execute_hive_circular_rebalance(
     if not ctx.cost_reduction_mgr:
         return {"error": "Cost reduction not initialized"}
 
+    # Permission check: fund movements require member tier
+    if not dry_run:
+        perm_err = check_permission(ctx, "member")
+        if perm_err:
+            return perm_err
+
     try:
         return ctx.cost_reduction_mgr.execute_hive_circular_rebalance(
             from_channel=from_channel,
             to_channel=to_channel,
             amount_sats=amount_sats,
             via_members=via_members,
-            dry_run=dry_run
+            dry_run=dry_run,
+            bridge=ctx.bridge
         )
 
     except Exception as e:
@@ -2836,12 +3153,18 @@ def create_close_actions(ctx: HiveContext) -> Dict[str, Any]:
     Puts high-confidence close recommendations into the pending_actions
     queue for AI/human approval.
 
+    Permission: Member or higher (prevents neophytes from creating close proposals).
+
     Args:
         ctx: HiveContext
 
     Returns:
         Dict with number of actions created.
     """
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
     if not ctx.rationalization_mgr:
         return {"error": "Rationalization not initialized"}
 
@@ -3091,9 +3414,21 @@ def report_flow_intensity(
 
     Returns:
         Dict with acknowledgment.
+
+    Permission: Member only
     """
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
     if not ctx.strategic_positioning_mgr:
         return {"error": "Strategic positioning not initialized"}
+
+    # Input validation
+    intensity = float(intensity)
+    if intensity < 0.0 or intensity > 100.0:
+        return {"error": "intensity must be between 0.0 and 100.0"}
 
     try:
         return ctx.strategic_positioning_mgr.report_flow_intensity(
@@ -3226,7 +3561,7 @@ def rebalance_hubs(
         for hub in hubs:
             hub_dict = hub.to_dict()
             # Get alias if available from state manager
-            if ctx.state_manager:
+            if getattr(ctx, 'state_manager', None):
                 state = ctx.state_manager.get_peer_state(hub.member_id)
                 if state and hasattr(state, 'alias') and state.alias:
                     hub_dict['alias'] = state.alias
@@ -3288,7 +3623,7 @@ def rebalance_path(
         enriched_path = []
         for peer_id in path:
             node_info = {"peer_id": peer_id}
-            if ctx.state_manager:
+            if getattr(ctx, 'state_manager', None):
                 state = ctx.state_manager.get_peer_state(peer_id)
                 if state and hasattr(state, 'alias') and state.alias:
                     node_info['alias'] = state.alias
@@ -3580,12 +3915,11 @@ def mcf_solve(ctx: HiveContext, dry_run: bool = True) -> Dict[str, Any]:
         }
 
         if not dry_run:
-            # Broadcast solution (integration will be added when cl-hive.py wrapper is created)
-            result["broadcast"] = True
-            result["message"] = "Solution broadcast to fleet"
+            result["broadcast"] = False
+            result["message"] = "Solution generated. Fleet broadcast not yet implemented — use assignments to execute manually."
         else:
             result["broadcast"] = False
-            result["message"] = "Dry run - solution not broadcast (use dry_run=false to broadcast)"
+            result["message"] = "Dry run - solution not broadcast (use dry_run=false to generate)"
 
         return result
 
@@ -3614,8 +3948,8 @@ def mcf_assignments(ctx: HiveContext) -> Dict[str, Any]:
 
         # Get all assignments by status
         all_assignments = []
-        if hasattr(ctx.liquidity_coordinator, '_mcf_assignments'):
-            all_assignments = list(ctx.liquidity_coordinator._mcf_assignments.values())
+        if hasattr(ctx.liquidity_coordinator, 'get_all_assignments'):
+            all_assignments = ctx.liquidity_coordinator.get_all_assignments()
 
         pending = [a for a in all_assignments if a.status == "pending"]
         executing = [a for a in all_assignments if a.status == "executing"]
@@ -3651,3 +3985,633 @@ def mcf_assignments(ctx: HiveContext) -> Dict[str, Any]:
 
     except Exception as e:
         return {"error": f"Failed to get MCF assignments: {e}"}
+
+
+# =============================================================================
+# REVENUE OPS INTEGRATION COMMANDS
+# =============================================================================
+# These RPC methods provide data to cl-revenue-ops for improved fee optimization
+# and rebalancing decisions. They expose cl-hive's intelligence layer.
+
+
+def get_defense_status(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
+    """
+    Get defense status for channel(s).
+
+    Returns whether channels are under defensive fee protection due to
+    drain attacks, spam, or fee wars. Used by cl-revenue-ops to avoid
+    overriding defensive fees during optimization.
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel SCID. If None, returns all channels.
+
+    Returns:
+        Dict with defense status for each channel:
+        {
+            "channels": {
+                "932263x1883x0": {
+                    "under_defense": false,
+                    "defense_type": null,
+                    "defensive_fee_ppm": null,
+                    "defense_started_at": null,
+                    "defense_reason": null
+                }
+            }
+        }
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    try:
+        channels_data = {}
+
+        # Get all channels with defense status
+        if ctx.safe_plugin:
+            channels = ctx.safe_plugin.rpc.listpeerchannels()
+
+            for ch in channels.get('channels', []):
+                ch_scid = ch.get('short_channel_id')
+                if not ch_scid:
+                    continue
+
+                # Skip if specific scid requested and this isn't it
+                if scid and ch_scid != scid:
+                    continue
+
+                peer_id = ch.get('peer_id', '')
+
+                # Check defense status from fee coordination manager
+                defense_info = ctx.fee_coordination_mgr.get_channel_defense_status(
+                    ch_scid, peer_id
+                ) if hasattr(ctx.fee_coordination_mgr, 'get_channel_defense_status') else {}
+
+                # Also check active warnings
+                active_warnings = ctx.fee_coordination_mgr.get_active_warnings_for_peer(
+                    peer_id
+                ) if hasattr(ctx.fee_coordination_mgr, 'get_active_warnings_for_peer') else []
+
+                under_defense = defense_info.get('under_defense', False) or len(active_warnings) > 0
+                defense_type = defense_info.get('defense_type')
+
+                if not defense_type and active_warnings:
+                    # Derive from warnings
+                    for warn in active_warnings:
+                        if warn.get('threat_type') == 'drain':
+                            defense_type = 'drain_protection'
+                            break
+                        elif warn.get('threat_type') == 'unreliable':
+                            defense_type = 'spam_defense'
+                            break
+
+                channels_data[ch_scid] = {
+                    "under_defense": under_defense,
+                    "defense_type": defense_type,
+                    "defensive_fee_ppm": defense_info.get('defensive_fee_ppm'),
+                    "defense_started_at": defense_info.get('defense_started_at'),
+                    "defense_reason": defense_info.get('defense_reason'),
+                    "active_warnings": len(active_warnings),
+                }
+
+        return {"channels": channels_data}
+
+    except Exception as e:
+        return {"error": f"Failed to get defense status: {e}"}
+
+
+def get_peer_quality(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
+    """
+    Get peer quality assessments from the hive's collective intelligence.
+
+    Returns quality ratings based on uptime, routing success, fee stability,
+    and fleet-wide reputation. Used by cl-revenue-ops to adjust optimization
+    intensity - don't invest heavily in bad peers.
+
+    Args:
+        ctx: HiveContext
+        peer_id: Optional specific peer ID. If None, returns all peers.
+
+    Returns:
+        Dict with peer quality assessments:
+        {
+            "peers": {
+                "03abc...": {
+                    "quality": "good",
+                    "quality_score": 0.85,
+                    "reasons": ["high_uptime", "good_routing_partner"],
+                    "recommendation": "expand",
+                    "last_assessed": 1707600000
+                }
+            }
+        }
+    """
+    if not ctx.quality_scorer:
+        return {"error": "Quality scorer not initialized"}
+
+    try:
+        peers_data = {}
+
+        # Get peers to assess
+        peer_list = []
+        if peer_id:
+            peer_list = [peer_id]
+        elif ctx.safe_plugin:
+            # Get all connected peers
+            channels = ctx.safe_plugin.rpc.listpeerchannels()
+            peer_list = list(set(
+                ch.get('peer_id') for ch in channels.get('channels', [])
+                if ch.get('peer_id')
+            ))
+
+        for pid in peer_list:
+            # Get quality score from quality_scorer
+            score_result = ctx.quality_scorer.score_peer(pid)
+
+            quality_score = score_result.quality_score if score_result else 0.5
+            recommendation = score_result.quality_recommendation if score_result else "maintain"
+
+            # Classify quality tier
+            if quality_score >= 0.7:
+                quality = "good"
+            elif quality_score >= 0.4:
+                quality = "neutral"
+            else:
+                quality = "avoid"
+
+            # Build reasons list
+            reasons = []
+            if score_result:
+                if hasattr(score_result, 'uptime_score') and score_result.uptime_score >= 0.9:
+                    reasons.append("high_uptime")
+                if hasattr(score_result, 'success_rate_score') and score_result.success_rate_score >= 0.8:
+                    reasons.append("good_routing_partner")
+                if hasattr(score_result, 'fee_stability_score') and score_result.fee_stability_score >= 0.8:
+                    reasons.append("stable_fees")
+                if hasattr(score_result, 'force_close_penalty') and score_result.force_close_penalty > 0:
+                    reasons.append("force_close_history")
+                if quality_score < 0.4:
+                    reasons.append("low_quality_score")
+
+            # Get last assessment time from peer reputation manager
+            last_assessed = None
+            if ctx.database:
+                # Check for peer events
+                events = ctx.database.get_peer_events(peer_id=pid, limit=1)
+                if events:
+                    last_assessed = events[0].get('timestamp')
+
+            peers_data[pid] = {
+                "quality": quality,
+                "quality_score": round(quality_score, 3),
+                "reasons": reasons,
+                "recommendation": recommendation,
+                "last_assessed": last_assessed or int(time.time()),
+            }
+
+        return {"peers": peers_data}
+
+    except Exception as e:
+        return {"error": f"Failed to get peer quality: {e}"}
+
+
+def get_fee_change_outcomes(ctx: HiveContext, scid: str = None,
+                             days: int = 30) -> Dict[str, Any]:
+    """
+    Get outcomes of past fee changes for learning.
+
+    Returns historical fee changes with before/after metrics to help
+    cl-revenue-ops learn from past decisions and adjust Thompson priors.
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel SCID. If None, returns all.
+        days: Number of days of history to return (default: 30, max: 90)
+
+    Returns:
+        Dict with fee change outcomes:
+        {
+            "changes": [
+                {
+                    "scid": "932263x1883x0",
+                    "timestamp": 1707500000,
+                    "old_fee_ppm": 200,
+                    "new_fee_ppm": 300,
+                    "source": "advisor",
+                    "outcome": {
+                        "forwards_before_24h": 5,
+                        "forwards_after_24h": 3,
+                        "revenue_before_24h": 500,
+                        "revenue_after_24h": 600,
+                        "verdict": "positive"
+                    }
+                }
+            ]
+        }
+    """
+    if not ctx.database:
+        return {"error": "Database not initialized"}
+
+    # Bound days parameter
+    days = min(max(1, days), 90)
+
+    try:
+        changes = []
+        cutoff_ts = int(time.time()) - (days * 86400)
+
+        # Query fee change history from database
+        # This data may come from multiple sources:
+        # 1. fee_coordination_mgr stigmergic markers
+        # 2. database recorded fee changes
+        # 3. routing_map pheromone history
+
+        if ctx.fee_coordination_mgr:
+            # Get markers which track fee changes
+            markers = ctx.fee_coordination_mgr.get_all_markers() \
+                if hasattr(ctx.fee_coordination_mgr, 'get_all_markers') else []
+
+            # Filter by scid if specified
+            if scid:
+                markers = [m for m in markers if m.get('channel_id') == scid]
+
+            for marker in markers:
+                if marker.get('timestamp', 0) < cutoff_ts:
+                    continue
+
+                # Get outcome data if available
+                outcome_data = marker.get('outcome', {})
+
+                change_entry = {
+                    "scid": marker.get('channel_id', ''),
+                    "timestamp": marker.get('timestamp', 0),
+                    "old_fee_ppm": marker.get('old_fee_ppm', 0),
+                    "new_fee_ppm": marker.get('fee_ppm', 0),
+                    "source": marker.get('source', 'unknown'),
+                    "outcome": {
+                        "forwards_before_24h": outcome_data.get('forwards_before', 0),
+                        "forwards_after_24h": outcome_data.get('forwards_after', 0),
+                        "revenue_before_24h": outcome_data.get('revenue_before', 0),
+                        "revenue_after_24h": outcome_data.get('revenue_after', 0),
+                        "verdict": outcome_data.get('verdict', 'unknown'),
+                    }
+                }
+                changes.append(change_entry)
+
+        # Sort by timestamp descending
+        changes.sort(key=lambda x: x['timestamp'], reverse=True)
+
+        return {"changes": changes[:200]}  # Limit to 200 entries
+
+    except Exception as e:
+        return {"error": f"Failed to get fee change outcomes: {e}"}
+
+
+def get_channel_flags(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
+    """
+    Get special flags for channels.
+
+    Returns flags identifying hive-internal channels that should be excluded
+    from optimization (always 0 fee) or have other special treatment.
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel SCID. If None, returns all channels.
+
+    Returns:
+        Dict with channel flags:
+        {
+            "channels": {
+                "932263x1883x0": {
+                    "is_hive_internal": false,
+                    "is_hive_member": false,
+                    "fixed_fee": null,
+                    "exclude_from_optimization": false
+                }
+            }
+        }
+    """
+    if not ctx.database:
+        return {"error": "Database not initialized"}
+
+    try:
+        channels_data = {}
+
+        # Get all hive members
+        members = ctx.database.get_all_members()
+        member_ids = set(m.get('peer_id') for m in members if m.get('peer_id'))
+
+        # Get all channels
+        if ctx.safe_plugin:
+            channels = ctx.safe_plugin.rpc.listpeerchannels()
+
+            for ch in channels.get('channels', []):
+                ch_scid = ch.get('short_channel_id')
+                if not ch_scid:
+                    continue
+
+                # Skip if specific scid requested and this isn't it
+                if scid and ch_scid != scid:
+                    continue
+
+                peer_id = ch.get('peer_id', '')
+                is_hive_member = peer_id in member_ids
+
+                # Check if this is a hive-internal channel (between hive members)
+                # Both ends must be hive members
+                is_hive_internal = is_hive_member  # Our end is hive, check peer
+
+                # Hive internal channels should have 0 fee
+                fixed_fee = 0 if is_hive_internal else None
+                exclude_from_optimization = is_hive_internal
+
+                channels_data[ch_scid] = {
+                    "is_hive_internal": is_hive_internal,
+                    "is_hive_member": is_hive_member,
+                    "fixed_fee": fixed_fee,
+                    "exclude_from_optimization": exclude_from_optimization,
+                    "peer_id": peer_id[:16] + "..." if peer_id else None,
+                }
+
+        return {"channels": channels_data}
+
+    except Exception as e:
+        return {"error": f"Failed to get channel flags: {e}"}
+
+
+def get_mcf_targets(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get MCF-computed optimal balance targets.
+
+    Returns the Multi-Commodity Flow computed optimal local balance
+    percentages for each channel. Used by cl-revenue-ops to guide
+    rebalancing toward globally optimal distribution.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with MCF targets:
+        {
+            "targets": {
+                "932263x1883x0": {
+                    "optimal_local_pct": 45,
+                    "current_local_pct": 30,
+                    "delta_sats": 150000,
+                    "priority": "high"
+                }
+            },
+            "computed_at": 1707600000
+        }
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction manager not initialized"}
+
+    try:
+        targets_data = {}
+        computed_at = 0
+
+        # Get current MCF solution if available
+        if hasattr(ctx.cost_reduction_mgr, 'get_current_mcf_solution'):
+            solution = ctx.cost_reduction_mgr.get_current_mcf_solution()
+            if solution:
+                computed_at = solution.get('timestamp', 0)
+
+                # Extract target balances from assignments
+                assignments = solution.get('assignments', [])
+                channel_deltas: Dict[str, int] = {}
+
+                for assignment in assignments:
+                    to_channel = assignment.get('to_channel')
+                    from_channel = assignment.get('from_channel')
+                    amount = assignment.get('amount_sats', 0)
+
+                    if to_channel:
+                        channel_deltas[to_channel] = channel_deltas.get(to_channel, 0) + amount
+                    if from_channel:
+                        channel_deltas[from_channel] = channel_deltas.get(from_channel, 0) - amount
+
+                # Get current channel balances
+                if ctx.safe_plugin:
+                    channels = ctx.safe_plugin.rpc.listpeerchannels()
+
+                    for ch in channels.get('channels', []):
+                        ch_scid = ch.get('short_channel_id')
+                        if not ch_scid:
+                            continue
+
+                        local_msat = ch.get('to_us_msat', 0)
+                        if isinstance(local_msat, str):
+                            local_msat = int(local_msat.replace('msat', ''))
+                        total_msat = ch.get('total_msat', 0)
+                        if isinstance(total_msat, str):
+                            total_msat = int(total_msat.replace('msat', ''))
+
+                        if total_msat <= 0:
+                            continue
+
+                        current_local_pct = (local_msat / total_msat) * 100
+                        delta_sats = channel_deltas.get(ch_scid, 0)
+
+                        # Calculate optimal based on delta
+                        optimal_local_sats = (local_msat // 1000) + delta_sats
+                        optimal_local_pct = (optimal_local_sats * 1000 / total_msat) * 100
+                        optimal_local_pct = max(0, min(100, optimal_local_pct))
+
+                        # Determine priority
+                        abs_delta = abs(delta_sats)
+                        if abs_delta > 500000:
+                            priority = "high"
+                        elif abs_delta > 100000:
+                            priority = "medium"
+                        else:
+                            priority = "low"
+
+                        targets_data[ch_scid] = {
+                            "optimal_local_pct": round(optimal_local_pct, 1),
+                            "current_local_pct": round(current_local_pct, 1),
+                            "delta_sats": delta_sats,
+                            "priority": priority,
+                        }
+
+        return {
+            "targets": targets_data,
+            "computed_at": computed_at,
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get MCF targets: {e}"}
+
+
+def get_nnlb_opportunities(ctx: HiveContext, min_amount: int = 50000) -> Dict[str, Any]:
+    """
+    Get Nearest-Neighbor Load Balancing opportunities.
+
+    Returns low-cost rebalance opportunities between fleet members where
+    the rebalance can be done at zero or minimal fee through hive-internal
+    channels.
+
+    Args:
+        ctx: HiveContext
+        min_amount: Minimum amount in sats to consider (default: 50000)
+
+    Returns:
+        Dict with NNLB opportunities:
+        {
+            "opportunities": [
+                {
+                    "source_scid": "932263x1883x0",
+                    "sink_scid": "931308x1256x0",
+                    "amount_sats": 200000,
+                    "estimated_cost_sats": 0,
+                    "path_hops": 1,
+                    "is_hive_internal": true
+                }
+            ]
+        }
+    """
+    if not ctx.anticipatory_manager:
+        # Fall back to liquidity coordinator
+        if not ctx.liquidity_coordinator:
+            return {"error": "Neither anticipatory manager nor liquidity coordinator initialized"}
+
+    try:
+        opportunities = []
+
+        # Get NNLB recommendations from anticipatory manager
+        if ctx.anticipatory_manager and hasattr(ctx.anticipatory_manager, 'get_nnlb_opportunities'):
+            nnlb_opps = ctx.anticipatory_manager.get_nnlb_opportunities(min_amount)
+            for opp in nnlb_opps:
+                opportunities.append({
+                    "source_scid": opp.get('source_channel'),
+                    "sink_scid": opp.get('sink_channel'),
+                    "amount_sats": opp.get('amount_sats', 0),
+                    "estimated_cost_sats": opp.get('estimated_cost', 0),
+                    "path_hops": opp.get('path_hops', 1),
+                    "is_hive_internal": opp.get('is_hive_internal', False),
+                })
+        elif ctx.liquidity_coordinator:
+            # Use liquidity coordinator's circular flow detection
+            if hasattr(ctx.liquidity_coordinator, 'get_circular_rebalance_opportunities'):
+                circ_opps = ctx.liquidity_coordinator.get_circular_rebalance_opportunities()
+                for opp in circ_opps:
+                    if opp.get('amount_sats', 0) >= min_amount:
+                        opportunities.append({
+                            "source_scid": opp.get('from_channel'),
+                            "sink_scid": opp.get('to_channel'),
+                            "amount_sats": opp.get('amount_sats', 0),
+                            "estimated_cost_sats": opp.get('cost_sats', 0),
+                            "path_hops": opp.get('hops', 1),
+                            "is_hive_internal": opp.get('is_hive_internal', True),
+                        })
+
+        # Sort by amount descending
+        opportunities.sort(key=lambda x: x['amount_sats'], reverse=True)
+
+        return {"opportunities": opportunities[:20]}  # Limit to 20
+
+    except Exception as e:
+        return {"error": f"Failed to get NNLB opportunities: {e}"}
+
+
+def get_channel_ages(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
+    """
+    Get channel age information.
+
+    Returns age and maturity classification for channels. Used by
+    cl-revenue-ops to adjust exploration vs exploitation in Thompson
+    sampling - new channels need more exploration, mature channels
+    should exploit known-good fees.
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel SCID. If None, returns all channels.
+
+    Returns:
+        Dict with channel ages:
+        {
+            "channels": {
+                "932263x1883x0": {
+                    "age_days": 45,
+                    "maturity": "mature",
+                    "first_forward_days_ago": 40,
+                    "total_forwards": 250
+                }
+            }
+        }
+    """
+    if not ctx.safe_plugin:
+        return {"error": "Plugin not initialized"}
+
+    try:
+        channels_data = {}
+        now = int(time.time())
+
+        # Get all channels
+        channels = ctx.safe_plugin.rpc.listpeerchannels()
+
+        for ch in channels.get('channels', []):
+            ch_scid = ch.get('short_channel_id')
+            if not ch_scid:
+                continue
+
+            # Skip if specific scid requested and this isn't it
+            if scid and ch_scid != scid:
+                continue
+
+            # Calculate age from funding confirmation
+            # SCID format: blockheight x txindex x output
+            # We can derive approximate age from blockheight
+            try:
+                parts = ch_scid.split('x')
+                if len(parts) >= 3:
+                    funding_block = int(parts[0])
+
+                    # Get current blockheight
+                    info = ctx.safe_plugin.rpc.getinfo()
+                    current_block = info.get('blockheight', funding_block)
+
+                    blocks_old = current_block - funding_block
+                    # Approximate 10 minutes per block
+                    age_days = (blocks_old * 10) / (60 * 24)
+                    age_days = max(0, age_days)
+                else:
+                    age_days = 0
+            except (ValueError, TypeError):
+                age_days = 0
+
+            # Classify maturity
+            if age_days < 14:
+                maturity = "new"
+            elif age_days < 60:
+                maturity = "developing"
+            else:
+                maturity = "mature"
+
+            # Get forward statistics if available from database
+            first_forward_days_ago = None
+            total_forwards = 0
+
+            if ctx.database:
+                # Check peer events for forward activity
+                peer_id = ch.get('peer_id', '')
+                if peer_id:
+                    events = ctx.database.get_peer_events(
+                        peer_id=peer_id,
+                        event_type='forward',
+                        limit=1000
+                    )
+                    if events:
+                        total_forwards = len(events)
+                        oldest_event = min(e.get('timestamp', now) for e in events)
+                        first_forward_days_ago = (now - oldest_event) / 86400
+
+            channels_data[ch_scid] = {
+                "age_days": round(age_days, 1),
+                "maturity": maturity,
+                "first_forward_days_ago": round(first_forward_days_ago, 1) if first_forward_days_ago else None,
+                "total_forwards": total_forwards,
+            }
+
+        return {"channels": channels_data}
+
+    except Exception as e:
+        return {"error": f"Failed to get channel ages: {e}"}

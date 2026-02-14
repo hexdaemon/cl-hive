@@ -1,11 +1,12 @@
 {
   "mcpServers": {
     "hive": {
-      "command": "python3",
-      "args": ["tools/mcp-hive-server.py"],
+      "command": "${HOME}/cl-hive/.venv/bin/python",
+      "args": ["${HOME}/cl-hive/tools/mcp-hive-server.py"],
       "env": {
-        "HIVE_NODES_CONFIG": "production/nodes.production.json",
-        "HIVE_STRATEGY_DIR": "production/strategy-prompts",
+        "HIVE_NODES_CONFIG": "${HOME}/cl-hive/production/nodes.production.json",
+        "HIVE_STRATEGY_DIR": "${HOME}/cl-hive/production/strategy-prompts",
+        "HIVE_ALLOW_INSECURE_TLS": "true",
         "PYTHONUNBUFFERED": "1"
       }
     }

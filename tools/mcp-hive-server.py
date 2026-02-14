@@ -78,13 +78,6 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-hive")
 
-# Goat Feeder configuration
-# Revenue is tracked via LNbits API - payments with "⚡CyberHerd Treats⚡" in memo
-GOAT_FEEDER_PATTERN = "⚡CyberHerd Treats⚡"
-LNBITS_URL = os.environ.get("LNBITS_URL", "http://127.0.0.1:3002")
-LNBITS_INVOICE_KEY = os.environ.get("LNBITS_INVOICE_KEY", "")
-LNBITS_ALLOW_INSECURE = os.environ.get("LNBITS_ALLOW_INSECURE", "false").lower() == "true"
-LNBITS_TIMEOUT_SECS = float(os.environ.get("LNBITS_TIMEOUT_SECS", "10"))
 
 # =============================================================================
 # Strategy Prompt Loading
@@ -119,6 +112,8 @@ def _check_method_allowed(method: str) -> bool:
             with open(HIVE_ALLOWED_METHODS_FILE) as f:
                 _allowed_methods = set(json.load(f))
         except Exception:
+            # Parse error: deny all and stop retrying on every call
+            _allowed_methods = set()
             return False
     return method in _allowed_methods
 
@@ -173,15 +168,6 @@ def _is_local_host(hostname: str) -> bool:
     return hostname in {"127.0.0.1", "localhost", "::1"}
 
 
-def _validate_lnbits_config() -> Optional[str]:
-    parsed = urlparse(LNBITS_URL)
-    if not parsed.scheme or not parsed.netloc:
-        return "LNBITS_URL is invalid or missing a scheme/host."
-    if parsed.scheme != "https" and not _is_local_host(parsed.hostname or ""):
-        if not LNBITS_ALLOW_INSECURE:
-            return "LNBITS_URL must use https for non-localhost targets."
-    return None
-
 
 def _validate_node_config(node_config: Dict, node_mode: str) -> Optional[str]:
     name = node_config.get("name")
@@ -209,7 +195,8 @@ def _validate_node_config(node_config: Dict, node_mode: str) -> Optional[str]:
 
 def _normalize_response(result: Any) -> Dict[str, Any]:
     if isinstance(result, dict) and "error" in result:
-        return {"ok": False, "error": result.get("error"), "details": result}
+        error_msg = result.get("error") or result.get("message") or "Unknown error"
+        return {"ok": False, "error": error_msg, "details": result}
     return {"ok": True, "data": result}
 
 
@@ -293,11 +280,19 @@ class NodeConnection:
                 body = e.response.json()
             except Exception:
                 body = {"error": e.response.text.strip()} if e.response.text else {}
-            logger.error(f"RPC error on {self.name}: {e}")
-            return {"error": str(e), "details": body}
+            # Extract the actual CLN error message from the response body
+            error_msg = (
+                body.get("message")  # CLN REST error format: {"code": ..., "message": "..."}
+                or body.get("error")  # fallback plain error
+                or str(e)
+                or f"HTTP {e.response.status_code} from {self.name}"
+            )
+            logger.error(f"RPC error on {self.name}: {error_msg}")
+            return {"error": error_msg, "details": body}
         except httpx.HTTPError as e:
-            logger.error(f"RPC error on {self.name}: {e}")
-            return {"error": str(e)}
+            error_msg = str(e) or f"{type(e).__name__} connecting to {self.name}"
+            logger.error(f"RPC error on {self.name}: {error_msg}")
+            return {"error": error_msg}
 
     async def _call_docker(self, method: str, params: Dict = None) -> Dict:
         """Call CLN via docker exec (for Polar testing)."""
@@ -307,6 +302,7 @@ class NodeConnection:
             "lightning-cli",
             f"--lightning-dir={self.lightning_dir}",
             f"--network={self.network}",
+            "--",  # Separate options from method/params
             method
         ]
 
@@ -332,7 +328,8 @@ class NodeConnection:
                 proc.communicate(), timeout=HIVE_DOCKER_TIMEOUT
             )
             if proc.returncode != 0:
-                return {"error": stderr.decode().strip()[:500]}
+                err_text = stderr.decode().strip()[:500]
+                return {"error": err_text or f"Command failed with exit code {proc.returncode}"}
             return json.loads(stdout.decode()) if stdout.strip() else {}
         except asyncio.TimeoutError:
             try:
@@ -343,7 +340,7 @@ class NodeConnection:
         except json.JSONDecodeError as e:
             return {"error": f"Invalid JSON response: {e}"}
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": str(e) or f"{type(e).__name__} in docker exec"}
 
 
 class HiveFleet:
@@ -443,7 +440,7 @@ class HiveFleet:
                 return (name, {"error": f"Timeout after {timeout}s"})
             except Exception as e:
                 logger.error(f"Error calling {method} on {name}: {e}")
-                return (name, {"error": str(e)})
+                return (name, {"error": str(e) or f"{type(e).__name__} calling {method}"})
 
         tasks = [call_with_timeout(name, node) for name, node in self.nodes.items()]
         results_list = await asyncio.gather(*tasks)
@@ -467,8 +464,8 @@ class HiveFleet:
             except asyncio.TimeoutError:
                 return (name, {"status": "timeout", "error": f"No response in {timeout}s"})
             except Exception as e:
-                return (name, {"status": "error", "error": str(e)})
-        
+                return (name, {"status": "error", "error": str(e) or type(e).__name__})
+
         tasks = [check_node(name, node) for name, node in self.nodes.items()]
         results_list = await asyncio.gather(*tasks)
         return dict(results_list)
@@ -802,6 +799,190 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
                 "required": ["node", "target_peer_id"]
             }
         ),
+        # --- Membership lifecycle ---
+        Tool(
+            name="hive_vouch",
+            description="Vouch for a neophyte to support their promotion to full member. Vouches count toward the quorum needed for promotion.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Public key of the neophyte to vouch for"}
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_leave",
+            description="Voluntarily leave the hive. Removes this node from the member list and notifies other members. The last full member cannot leave.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "reason": {"type": "string", "description": "Reason for leaving (default: voluntary)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_force_promote",
+            description="Force-promote a neophyte to member during bootstrap phase. Only works when the hive is too small to reach normal vouch quorum. Admin only.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Public key of the neophyte to promote"}
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_request_promotion",
+            description="Request promotion from neophyte to member. Broadcasts a promotion request to all hive members for voting.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_remove_member",
+            description="Remove a member from the hive (admin maintenance). Use to clean up stale/orphaned member entries. Cannot remove yourself - use hive_leave instead.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Public key of the member to remove"},
+                    "reason": {"type": "string", "description": "Reason for removal (default: maintenance)"}
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_genesis",
+            description="Initialize this node as the genesis (first) node of a new hive. Creates the first member record with full privileges.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "hive_id": {"type": "string", "description": "Custom hive identifier (auto-generated if not provided)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_invite",
+            description="Generate an invitation ticket for a new member to join the hive. Only full members can generate invites.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "valid_hours": {"type": "integer", "description": "Hours until ticket expires (default: 24)"},
+                    "tier": {"type": "string", "description": "Starting tier: 'neophyte' (default) or 'member' (bootstrap only)", "enum": ["neophyte", "member"]}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_join",
+            description="Join a hive using an invitation ticket. Initiates the handshake protocol with a known hive member.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "ticket": {"type": "string", "description": "Base64-encoded invitation ticket"},
+                    "peer_id": {"type": "string", "description": "Node ID of a known hive member (optional, extracted from ticket if not provided)"}
+                },
+                "required": ["node", "ticket"]
+            }
+        ),
+        # --- Ban governance ---
+        Tool(
+            name="hive_propose_ban",
+            description="Propose banning a member from the hive. Requires quorum vote (51%% of members) to execute. Proposal is valid for 7 days.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Public key of the member to ban"},
+                    "reason": {"type": "string", "description": "Reason for the ban proposal (max 500 chars)"}
+                },
+                "required": ["node", "peer_id", "reason"]
+            }
+        ),
+        Tool(
+            name="hive_vote_ban",
+            description="Vote on a pending ban proposal. Use hive_pending_bans to see active proposals first.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "proposal_id": {"type": "string", "description": "ID of the ban proposal"},
+                    "vote": {"type": "string", "description": "Vote: 'approve' or 'reject'", "enum": ["approve", "reject"]}
+                },
+                "required": ["node", "proposal_id", "vote"]
+            }
+        ),
+        Tool(
+            name="hive_pending_bans",
+            description="View pending ban proposals with vote counts, quorum status, and your vote. Shows all active ban proposals awaiting votes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        # --- Health/reputation monitoring ---
+        Tool(
+            name="hive_nnlb_status",
+            description="Get NNLB (No Node Left Behind) status. Shows health distribution across hive members and identifies struggling members who may need assistance.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_peer_reputations",
+            description="Get aggregated peer reputations from hive intelligence. Peer reputations are aggregated from reports by all hive members with outlier detection.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Optional specific peer to query (omit for all peers)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_reputation_stats",
+            description="Get overall reputation tracking statistics. Returns summary statistics about tracked peer reputations across the fleet.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_contribution",
+            description="View contribution statistics for a peer. Shows forwarding contribution ratio, uptime, and leech detection status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Optional peer to view (defaults to self)"}
+                },
+                "required": ["node"]
+            }
+        ),
         Tool(
             name="hive_node_info",
             description="Get detailed info about a specific Lightning node including channels, balance, and peers.",
@@ -832,7 +1013,7 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
         ),
         Tool(
             name="hive_set_fees",
-            description="Set channel fees for a specific channel on a node.",
+            description="Set channel fees for a specific channel on a node. IMPORTANT: Hive member channels must have 0 fees. This tool will block non-zero fees on hive channels unless force=true.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -851,6 +1032,10 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
                     "base_fee_msat": {
                         "type": "integer",
                         "description": "Base fee in millisatoshis (default: 0)"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Override hive zero-fee guard (default: false)"
                     }
                 },
                 "required": ["node", "channel_id", "fee_ppm"]
@@ -1595,6 +1780,55 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
+            name="revenue_fee_anchor",
+            description="""Manage advisor fee anchors — soft fee targets that blend into the optimizer with decaying weight.
+
+Unlike revenue_set_fee (which hard-overrides), anchors preserve Thompson Sampling / Hill Climbing state.
+Weight decays linearly to zero over the TTL. Applied AFTER hive coordination, BEFORE defense multiplier.
+
+Actions: set, list, get, clear, clear-all.
+Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Action: set, list, get, clear, clear-all",
+                        "enum": ["set", "list", "get", "clear", "clear-all"]
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID (SCID format). Required for set/get/clear."
+                    },
+                    "target_fee_ppm": {
+                        "type": "integer",
+                        "description": "Target fee in ppm. Required for set."
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Advisor confidence 0.0-1.0 (default 1.0)"
+                    },
+                    "base_weight": {
+                        "type": "number",
+                        "description": "Anchor blend weight 0.0-1.0 (default 0.7)"
+                    },
+                    "ttl_hours": {
+                        "type": "integer",
+                        "description": "Time-to-live in hours (default 24, max 168)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the advisor is setting this anchor"
+                    }
+                },
+                "required": ["node", "action"]
+            }
+        ),
+        Tool(
             name="revenue_rebalance",
             description="Trigger a manual rebalance between channels with profit/budget constraints.",
             inputSchema={
@@ -1679,6 +1913,208 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
+            name="config_adjust",
+            description="""Adjust cl-revenue-ops config with tracking for learning and analysis.
+
+Records the adjustment in advisor database, enabling outcome measurement and 
+effectiveness analysis over time. Use instead of revenue_config when you want
+to track the decision and learn from outcomes.
+
+**IMPORTANT: Check config_effectiveness() and config_adjustment_history() BEFORE adjusting.**
+- Don't repeat failed adjustments within 7 days
+- Don't adjust same param within 24-48h of last change
+- One change at a time for related params
+
+**Tier 1 - Fee Bounds & Budget:**
+- min_fee_ppm: Fee floor (↑ if drain attacks, ↓ if stagnating)
+- max_fee_ppm: Fee ceiling (↓ if losing volume, ↑ if high demand)
+- daily_budget_sats: Rebalance budget (↑ if ROI positive, ↓ if negative)
+- rebalance_max_amount: Max rebalance size
+- rebalance_min_profit_ppm: Min profit margin (↑ if unprofitable rebalances)
+
+**Tier 1 - Liquidity Thresholds:**
+- low_liquidity_threshold: When to consider low (↑ if too aggressive)
+- high_liquidity_threshold: When to consider high (↓ if saturating)
+- new_channel_grace_days: Grace period before optimization
+
+**Tier 2 - AIMD Algorithm (careful):**
+- aimd_additive_increase_ppm: Fee increase step (↑ aggressive, ↓ stable)
+- aimd_multiplicative_decrease: Fee decrease factor (↓ if fees stuck high)
+- aimd_failure_threshold: Failures before decrease (↑ if too volatile)
+- aimd_success_threshold: Successes before increase (↓ for faster growth)
+
+**Tier 2 - Algorithm Tuning (careful):**
+- thompson_observation_decay_hours: Shorter in volatile, longer in stable
+- hive_prior_weight: Trust in swarm intelligence (0-1)
+- scarcity_threshold: When to apply scarcity pricing
+
+**Tier 3 - Sling Rebalancer Targets (conservative):**
+- sling_target_source: Target balance for source channels (default 0.65, range 0.5-0.8)
+- sling_target_sink: Target balance for sink channels (default 0.4, range 0.2-0.5)
+- sling_target_balanced: Target for balanced channels (default 0.5, range 0.4-0.6)
+- sling_chunk_size_sats: Rebalance chunk size (scale with channel sizes)
+- rebalance_cooldown_hours: Hours between rebalances (↑ to reduce churn)
+
+**Tier 4 - Advanced Algorithm (expert, very conservative):**
+- vegas_decay_rate: Signal decay rate (default 0.85, range 0.7-0.95)
+- ema_smoothing_alpha: Flow smoothing (default 0.3, range 0.1-0.5)
+- kelly_fraction: Kelly bet sizing (default 0.6, range 0.3-0.8)
+- proportional_budget_pct: Revenue % for budget (default 0.3, range 0.1-0.5)
+
+**ISOLATION ENFORCED:** Related params cannot be adjusted within 24h of each other.
+Parameter groups: fee_bounds, budget, aimd, thompson, liquidity, sling_targets, sling_params, algorithm
+
+**Trigger reasons:** drain_detected, stagnation, profitability_low, profitability_high,
+budget_exhausted, market_conditions, competitive_pressure, rebalance_inefficiency,
+algorithm_tuning, liquidity_imbalance, rebalance_churn, target_optimization
+
+**Always include context_metrics** with revenue_24h, forward_count_24h, stagnant_count, etc.
+
+**Use config_recommend first** to get data-driven suggestions based on learned patterns.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "config_key": {
+                        "type": "string",
+                        "description": "Config key to adjust"
+                    },
+                    "new_value": {
+                        "type": ["string", "number", "boolean"],
+                        "description": "New value to set"
+                    },
+                    "trigger_reason": {
+                        "type": "string",
+                        "description": "Why making this change (e.g., drain_detected, stagnation)"
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "Detailed explanation of the decision"
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "0-1 confidence in the change"
+                    },
+                    "context_metrics": {
+                        "type": "object",
+                        "description": "Relevant metrics at time of change for outcome comparison"
+                    }
+                },
+                "required": ["node", "config_key", "new_value", "trigger_reason"]
+            }
+        ),
+        Tool(
+            name="config_adjustment_history",
+            description="""Get history of config adjustments for analysis and learning.
+
+Use this to review what changes were made, why, and their outcomes.
+Essential for understanding which adjustments worked and which didn't.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Filter by node (optional)"
+                    },
+                    "config_key": {
+                        "type": "string",
+                        "description": "Filter by specific config key (optional)"
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "How far back to look (default: 30)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max records (default: 50)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="config_effectiveness",
+            description="""Analyze effectiveness of config adjustments over time.
+
+Shows success rates, learned optimal ranges, and recommendations
+based on historical adjustment outcomes. Use to understand which
+config values work best for this fleet.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Filter by node (optional)"
+                    },
+                    "config_key": {
+                        "type": "string",
+                        "description": "Filter by specific config key (optional)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="config_measure_outcomes",
+            description="""Measure outcomes for pending config adjustments.
+
+Compares current metrics against metrics at time of adjustment
+to determine if changes were successful. Should be called periodically
+(e.g., 24-48h after adjustments) to evaluate effectiveness.
+
+This enables the learning loop: adjust -> measure -> learn -> improve.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hours_since": {
+                        "type": "integer",
+                        "description": "Only measure adjustments older than this (default: 24)"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, show what would be measured without recording"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="config_recommend",
+            description="""Recommend the next config adjustment based on learned patterns.
+
+Analyzes current fleet conditions, past adjustment outcomes, and learned
+optimal ranges to suggest the best next config change.
+
+**Uses learning from past adjustments:**
+- Success rates per parameter
+- Learned optimal min/max ranges
+- What conditions trigger which adjustments
+
+**Enforces isolation:**
+- Shows which params can be adjusted now
+- Hours until isolated params become available
+
+**Returns prioritized recommendations** with:
+- Suggested values based on learned ranges
+- Confidence scores adjusted by past success rate
+- Reasons tied to current conditions
+
+Call this BEFORE making adjustments to get data-driven suggestions.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to analyze"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="revenue_debug",
             description="Get diagnostic information for troubleshooting fee or rebalance issues.",
             inputSchema={
@@ -1706,24 +2142,6 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                     "node": {
                         "type": "string",
                         "description": "Node name"
-                    }
-                },
-                "required": ["node"]
-            }
-        ),
-        Tool(
-            name="revenue_outgoing",
-            description="Get goat feeder P&L: Lightning Goats revenue (incoming donations) vs CyberHerd Treats expenses (outgoing rewards). Shows goat feeder profitability separate from routing.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name"
-                    },
-                    "window_days": {
-                        "type": "integer",
-                        "description": "Time window in days (default: 30)"
                     }
                 },
                 "required": ["node"]
@@ -1766,40 +2184,115 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 "required": ["node"]
             }
         ),
+        # =====================================================================
+        # Diagnostic Tools - Data pipeline health checks and validation
+        # =====================================================================
         Tool(
-            name="goat_feeder_history",
-            description="Get historical goat feeder P&L from the advisor database. Shows snapshots over time for trend analysis.",
+            name="hive_node_diagnostic",
+            description="""Run a comprehensive diagnostic on a single node.
+
+**Returns in one call:**
+- Channel balances (total capacity, local/remote, balance ratios)
+- 24h forwarding stats (count, volume, revenue, avg fee)
+- Sling rebalancer status (if available)
+- Installed plugin list
+
+**When to use:** First tool to call when investigating node issues or verifying data pipeline health.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "node": {
                         "type": "string",
-                        "description": "Node name (optional, omit for all nodes)"
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "Days of history to retrieve (default: 30)"
+                        "description": "Node name"
                     }
                 },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_ops_health",
+            description="""Validate cl-revenue-ops data pipeline health.
+
+**Checks 4 RPC endpoints:**
+- revenue-dashboard: P&L data availability
+- revenue-profitability: Channel classification data
+- revenue-rebalance-debug: Rebalance subsystem state
+- revenue-status: Plugin operational status
+
+**Returns:** Per-check pass/fail/error/warn status + overall health (healthy/warning/unhealthy/degraded).
+
+**When to use:** After deploying changes or when advisor reports unexpected data.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="advisor_validate_data",
+            description="""Validate advisor snapshot data quality.
+
+**Checks:**
+- Zero-value detection: channels with 0 capacity or 0 local balance
+- Missing IDs: channels without short_channel_id or peer_id
+- Flow state consistency: balance ratios outside 0-1 range
+- Live comparison: snapshot balances vs current listpeerchannels data
+
+**When to use:** After recording a snapshot, to verify data integrity. Catches the zero-balance and missing-data bugs that were previously found.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="advisor_dedup_status",
+            description="""Check for duplicate and stale pending decisions.
+
+**Returns:**
+- Pending decision count grouped by (decision_type, node, channel)
+- Duplicate groups (same type+node+channel with multiple pending decisions)
+- Stale decisions (pending > 48 hours)
+- Outcome measurement coverage (decisions with measured outcomes vs total)
+
+**When to use:** Before running advisor cycle, to clean up stale recommendations.""",
+            inputSchema={
+                "type": "object",
+                "properties": {},
                 "required": []
             }
         ),
         Tool(
-            name="goat_feeder_trends",
-            description="Get goat feeder trend analysis comparing current vs previous period. Shows if goat feeder profitability is improving, stable, or declining.",
+            name="rebalance_diagnostic",
+            description="""Diagnose rebalancing subsystem health.
+
+**Checks:**
+- Sling plugin availability
+- Active sling jobs and their status
+- Rebalance rejection reasons from revenue-rebalance-debug
+- Capital controls state
+- Budget availability
+
+**When to use:** When rebalances are failing or not executing as expected.""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "node": {
                         "type": "string",
-                        "description": "Node name (optional, omit for all nodes)"
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "Analysis period in days (default: 7)"
+                        "description": "Node name"
                     }
                 },
-                "required": []
+                "required": ["node"]
             }
         ),
         # =====================================================================
@@ -1906,6 +2399,14 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                     "confidence": {
                         "type": "number",
                         "description": "Confidence score 0-1 (optional)"
+                    },
+                    "predicted_benefit": {
+                        "type": "integer",
+                        "description": "Predicted benefit in sats from opportunity scanner (optional)"
+                    },
+                    "snapshot_metrics": {
+                        "type": "string",
+                        "description": "JSON snapshot of decision context metrics (optional)"
                     }
                 },
                 "required": ["decision_type", "node", "recommendation"]
@@ -2250,6 +2751,178 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                     "node": {
                         "type": "string",
                         "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # =====================================================================
+        # Phase 3: Automation Tools - Autonomous Fleet Management
+        # =====================================================================
+        Tool(
+            name="auto_evaluate_proposal",
+            description="""Evaluate a pending proposal against automated criteria and optionally execute.
+
+**When to use:** Use this to get an automated evaluation of a pending action with reasoning.
+Can auto-execute approve/reject if dry_run=false and decision is not "escalate".
+
+**Evaluation Criteria:**
+- Channel opens: approve if ≥15 channels, quality≥0.4 (not "avoid"), within budget, positive return
+- Channel opens: reject if <10 channels, quality="avoid", over budget
+- Fee changes: approve if ≤25% change, within 50-1500ppm range
+- Rebalances: approve if EV-positive, ≤500k sats
+
+**Returns:**
+- decision: "approve" | "reject" | "escalate"
+- reasoning: Explanation of the decision
+- action_executed: Whether action was executed (only if dry_run=false and decision!=escalate)""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "action_id": {
+                        "type": "integer",
+                        "description": "ID of the pending action to evaluate"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, evaluate only without executing (default: true)"
+                    }
+                },
+                "required": ["node", "action_id"]
+            }
+        ),
+        Tool(
+            name="process_all_pending",
+            description="""Batch process all pending actions across the fleet.
+
+**When to use:** Run periodically (e.g., every 4 hours) to handle routine proposals automatically
+and surface only those requiring human review.
+
+**What it does:**
+1. Gets pending actions from all configured nodes
+2. Evaluates each against automated criteria
+3. If dry_run=false: executes approve/reject decisions
+4. Aggregates results into approved, rejected, escalated lists
+
+**Returns:**
+- summary: Quick overview (counts by category)
+- approved: Actions that were/would be approved
+- rejected: Actions that were/would be rejected
+- escalated: Actions requiring human review
+- by_node: Per-node breakdown""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, evaluate only without executing (default: true)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="stagnant_channels",
+            description="""List channels with ≥95% local balance (stagnant) with enriched context.
+
+**When to use:** Run as part of fleet health checks to identify channels that aren't routing.
+These channels have capital locked up without generating revenue.
+
+**Returns per channel:**
+- peer_alias, capacity, local_pct
+- channel_age_days (calculated from SCID)
+- days_since_last_forward
+- peer_quality (from advisor_get_peer_intel)
+- current_fee_ppm, current_policy
+- recommendation: "close" | "fee_reduction" | "static_policy" | "wait"
+- reasoning: Why this recommendation""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "min_local_pct": {
+                        "type": "number",
+                        "description": "Minimum local balance percentage to consider stagnant (default: 95)"
+                    },
+                    "min_age_days": {
+                        "type": "integer",
+                        "description": "Minimum channel age in days (default: 0)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="remediate_stagnant",
+            description="""Auto-remediate stagnant channels based on age and peer quality.
+
+**When to use:** Run periodically (e.g., daily) to automatically apply remediation strategies
+to stagnant channels that meet criteria.
+
+**Remediation Rules:**
+- <30 days old: skip (too young to judge)
+- 30-90 days + neutral/good peer: reduce fee to 50ppm to attract flow
+- >90 days + neutral peer: apply static policy, disable rebalance
+- any age + "avoid" peer: flag for close review (never auto-close)
+
+**Returns:**
+- actions_taken: List of remediation actions applied
+- channels_skipped: Channels that didn't match criteria
+- flagged_for_review: Channels with "avoid" peers needing human decision""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, report what would be done without executing (default: true)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="execute_safe_opportunities",
+            description="""Execute opportunities marked as auto_execute_safe.
+
+**When to use:** Run after advisor_scan_opportunities to automatically execute low-risk
+optimizations like small fee adjustments.
+
+**What it does:**
+1. Calls advisor_scan_opportunities to get current opportunities
+2. Filters for auto_execute_safe=true
+3. Executes each via appropriate tool (revenue_set_fee, etc.)
+4. Logs all decisions to advisor DB for audit trail
+
+**Safety:**
+- Only executes opportunities the scanner marked as safe
+- All decisions logged for review
+- dry_run mode available for preview
+
+**Returns:**
+- executed_count: Number of opportunities executed
+- skipped_count: Number skipped (not safe or dry_run)
+- executed: Details of executed opportunities
+- skipped: Details of skipped opportunities""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, report what would be done without executing (default: true)"
                     }
                 },
                 "required": ["node"]
@@ -3571,6 +4244,344 @@ Provides comprehensive view of MCF optimizer health including:
                 },
                 "required": ["node"]
             }
+        ),
+        # =====================================================================
+        # Phase 4: Membership & Settlement Tools (Hex Automation)
+        # =====================================================================
+        Tool(
+            name="membership_dashboard",
+            description="""Get unified membership lifecycle view.
+
+**Returns:**
+- neophytes: count, rankings (from hive_neophyte_rankings), promotion_eligible, fast_track_eligible
+- members: count, contribution_scores (from hive_contribution), health (from hive_nnlb_status)
+- pending_actions: pending_promotions count, pending_bans count
+- onboarding_needed: members without channel suggestions
+
+**When to use:** For quick membership health overview during heartbeat checks.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="check_neophytes",
+            description="""Check for promotion-ready neophytes and optionally propose promotions.
+
+Calls hive_neophyte_rankings and for each eligible or fast_track_eligible neophyte:
+- Checks if already in pending_promotions
+- If not pending and dry_run=false: calls hive_propose_promotion
+
+**Returns:**
+- proposed_count: Number of promotions proposed this run
+- already_pending_count: Number already in voting
+- details: Per-neophyte breakdown with eligibility and status
+
+**Default:** dry_run=true (preview only)""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, preview without proposing (default: true)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="settlement_readiness",
+            description="""Pre-settlement validation check.
+
+Validates that the hive is ready for settlement:
+- Checks all members have BOLT12 offers registered
+- Reviews participation history for potential gaming
+- Calculates expected distribution via settlement_calculate
+
+**Returns:**
+- ready: Boolean indicating if settlement can proceed
+- blockers: List of issues preventing settlement
+- missing_offers: Members without BOLT12 offers
+- low_participation: Members with <50% historical participation
+- expected_distribution: Preview of what each member would receive
+- recommendation: "settle_now" | "wait" | "fix_blockers"
+
+**When to use:** Before running settlement to ensure clean execution.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="run_settlement_cycle",
+            description="""Execute a full settlement cycle.
+
+**Steps:**
+1. Calls pool_snapshot to record current contributions
+2. Calls settlement_calculate for distribution preview
+3. If dry_run=false: calls settlement_execute to distribute funds
+
+**Returns:**
+- period: Settlement period (YYYY-WW format)
+- snapshot_recorded: Whether contribution snapshot was taken
+- total_distributed_sats: Total sats distributed (0 if dry_run)
+- per_member_breakdown: What each member received/would receive
+- dry_run: Whether this was a preview
+
+**Default:** dry_run=true (preview only)
+
+**When to use:** Weekly settlement execution (typically Sunday).""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to run settlement from"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, preview without executing (default: true)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # =====================================================================
+        # Phase 5: Monitoring & Health Tools (Hex Automation)
+        # =====================================================================
+        Tool(
+            name="fleet_health_summary",
+            description="""Quick fleet health overview for monitoring.
+
+**Returns:**
+- nodes: Per-node status (online, channel_count, total_capacity_sats)
+- channel_distribution: % profitable, % underwater, % stagnant (from revenue_profitability)
+- routing_24h: volume_sats, revenue_sats, forward_count
+- alerts: Active alert counts by severity (critical, warning, info)
+- mcf_health: MCF optimizer status and circuit breaker state
+- nnlb_struggling: Members identified as struggling by NNLB
+
+**When to use:** Heartbeat health checks (3x daily).""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, defaults to all nodes)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="routing_intelligence_health",
+            description="""Check routing intelligence data quality.
+
+**Returns:**
+- pheromone_coverage:
+  - channels_with_data: Count of channels with pheromone signals
+  - stale_count: Channels with data older than 7 days
+  - coverage_pct: Percentage of channels with fresh data
+- stigmergic_markers:
+  - active_count: Number of active markers
+  - corridors_tracked: Unique corridors being tracked
+- needs_backfill: Boolean - true if data is insufficient
+- recommendation: "healthy" | "needs_backfill" | "partially_stale"
+
+**When to use:** During deep checks to verify routing intelligence is collecting properly.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="advisor_channel_history",
+            description="""Query past advisor decisions for a specific channel.
+
+**Returns:**
+- decisions: List of past decisions with:
+  - decision_type: fee_change, rebalance, flag_channel, etc.
+  - recommendation: What was recommended
+  - reasoning: Why
+  - timestamp: When the decision was made
+  - outcome: If measured (improved/unchanged/worsened)
+- pattern_detection:
+  - repeated_recommendations: Same advice given >2 times
+  - conflicting_decisions: Back-and-forth changes detected
+  - decision_frequency: Average days between decisions
+
+**When to use:** Before making decisions on a channel, check what was tried before.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel SCID to query"
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Days of history to retrieve (default: 30)"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="connectivity_recommendations",
+            description="""Get actionable connectivity improvement recommendations.
+
+Takes alerts from hive_connectivity_alerts and enriches them with specific actions.
+
+**Returns per alert:**
+- alert_type: disconnected, isolated, low_connectivity
+- member: pubkey and alias of affected member
+- recommendation:
+  - who_should_act: Member pubkey/alias who should take action
+  - action: open_channel_to, improve_uptime, add_liquidity
+  - target: Target pubkey if applicable (for channel opens)
+  - expected_improvement: Description of expected benefit
+  - priority: 1-5 (5 = most urgent)
+
+**When to use:** After connectivity_alerts shows issues, get specific remediation steps.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # =====================================================================
+        # Automation Tools (Phase 2 - Hex Enhancement)
+        # =====================================================================
+        Tool(
+            name="bulk_policy",
+            description="""Apply policies to multiple channels matching criteria.
+
+Batch policy application for channel categories:
+- filter_type: "stagnant" | "zombie" | "underwater" | "depleted" | "custom"
+- strategy: "static" | "passive" | "dynamic"
+- fee_ppm: Target fee for static strategy
+- rebalance: "enabled" | "disabled" | "source_only" | "sink_only"
+
+Default is dry_run=true which previews without applying.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "filter_type": {
+                        "type": "string",
+                        "enum": ["stagnant", "zombie", "underwater", "depleted", "custom"],
+                        "description": "Channel filter type"
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["static", "passive", "dynamic"],
+                        "description": "Fee strategy to apply"
+                    },
+                    "fee_ppm": {
+                        "type": "integer",
+                        "description": "Fee PPM for static strategy"
+                    },
+                    "rebalance": {
+                        "type": "string",
+                        "enum": ["enabled", "disabled", "source_only", "sink_only"],
+                        "description": "Rebalance setting"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Preview without applying (default: true)"
+                    },
+                    "custom_filter": {
+                        "type": "object",
+                        "description": "Custom filter criteria for filter_type='custom'"
+                    }
+                },
+                "required": ["node", "filter_type"]
+            }
+        ),
+        Tool(
+            name="enrich_peer",
+            description="""Get external data for peer evaluation from mempool.space.
+
+Queries the public mempool.space Lightning API to get:
+- alias: Node alias
+- capacity_sats: Total node capacity
+- channel_count: Number of channels
+- first_seen: When node first appeared
+- updated_at: Last update time
+
+Gracefully falls back if API is unavailable.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Peer public key (hex)"
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "API timeout (default: 10)"
+                    }
+                },
+                "required": ["peer_id"]
+            }
+        ),
+        Tool(
+            name="enrich_proposal",
+            description="""Enhance a pending action with external peer data.
+
+Takes a pending action and enriches it with:
+- External peer data from mempool.space
+- Peer quality assessment
+- Enhanced recommendation based on combined data
+
+Use before approving/rejecting channel opens or policy changes.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "action_id": {
+                        "type": "integer",
+                        "description": "Pending action ID to enrich"
+                    }
+                },
+                "required": ["node", "action_id"]
+            }
         )
     ]
 
@@ -3579,16 +4590,11 @@ Provides comprehensive view of MCF optimizer health including:
 async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
     """Handle tool calls via registry dispatch."""
     try:
-        if name == "hive_health":
-            # Special case: inline handler with custom argument extraction
-            timeout = arguments.get("timeout", 5.0)
-            result = await fleet.health_check(timeout=timeout)
+        handler = TOOL_HANDLERS.get(name)
+        if handler is None:
+            result = {"error": f"Unknown tool: {name}"}
         else:
-            handler = TOOL_HANDLERS.get(name)
-            if handler is None:
-                result = {"error": f"Unknown tool: {name}"}
-            else:
-                result = await handler(arguments)
+            result = await handler(arguments)
 
         if HIVE_NORMALIZE_RESPONSES:
             result = _normalize_response(result)
@@ -3596,7 +4602,11 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
 
     except Exception as e:
         logger.exception(f"Error in tool {name}")
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        error_msg = str(e) or f"{type(e).__name__} in {name}"
+        error_result = {"error": error_msg}
+        if HIVE_NORMALIZE_RESPONSES:
+            error_result = {"ok": False, "error": error_msg}
+        return [TextContent(type="text", text=json.dumps(error_result))]
 
 
 # =============================================================================
@@ -3619,7 +4629,10 @@ async def handle_hive_status(args: Dict) -> Dict:
 
 def _extract_msat(value: Any) -> int:
     if isinstance(value, dict) and "msat" in value:
-        return int(value.get("msat", 0))
+        try:
+            return int(value.get("msat", 0))
+        except (ValueError, TypeError):
+            return 0
     if isinstance(value, str) and value.endswith("msat"):
         try:
             return int(value[:-4])
@@ -3631,16 +4644,21 @@ def _extract_msat(value: Any) -> int:
 
 
 def _channel_totals(channel: Dict) -> Dict[str, int]:
-    total_msat = _extract_msat(
-        channel.get("total_msat")
-        or channel.get("channel_total_msat")
-        or channel.get("amount_msat")
-    )
-    local_msat = _extract_msat(
-        channel.get("to_us_msat")
-        or channel.get("our_amount_msat")
-        or channel.get("our_msat")
-    )
+    # Use explicit None checks — `or` chaining treats 0 as falsy
+    total_raw = channel.get("total_msat")
+    if total_raw is None:
+        total_raw = channel.get("channel_total_msat")
+    if total_raw is None:
+        total_raw = channel.get("amount_msat")
+    total_msat = _extract_msat(total_raw)
+
+    local_raw = channel.get("to_us_msat")
+    if local_raw is None:
+        local_raw = channel.get("our_amount_msat")
+    if local_raw is None:
+        local_raw = channel.get("our_msat")
+    local_msat = _extract_msat(local_raw)
+
     return {"total_msat": total_msat, "local_msat": local_msat}
 
 
@@ -3720,12 +4738,37 @@ def _flow_profile(channel: Dict) -> Dict[str, Any]:
 
     return {
         "flow_profile": flow_profile,
-        "inbound_outbound_ratio": ratio if ratio != float("inf") else "infinite",
+        "inbound_outbound_ratio": ratio if ratio != float("inf") else 999.99,
         "inbound_payments": in_fulfilled,
         "outbound_payments": out_fulfilled,
         "inbound_volume_sats": _extract_msat(in_msat) // 1000,
         "outbound_volume_sats": _extract_msat(out_msat) // 1000
     }
+
+
+def _scid_to_age_days(scid: str, current_blockheight: int) -> Optional[int]:
+    """
+    Calculate channel age in days from short_channel_id.
+    
+    SCID format: BLOCKxTXINDEXxOUTPUT (e.g., 933128x1345x0)
+    
+    Args:
+        scid: Short channel ID
+        current_blockheight: Current blockchain height
+        
+    Returns:
+        Approximate age in days, or None if SCID is invalid
+    """
+    if not scid or 'x' not in str(scid):
+        return None
+    try:
+        funding_block = int(str(scid).split('x')[0])
+        if funding_block <= 0 or funding_block > current_blockheight:
+            return None
+        blocks_elapsed = current_blockheight - funding_block
+        return max(0, blocks_elapsed // 144)  # ~144 blocks per day
+    except (ValueError, IndexError):
+        return None
 
 
 async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
@@ -3734,13 +4777,13 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
     now = int(time.time())
     since_24h = now - 86400
 
-    info = await node.call("getinfo")
-    peers = await node.call("listpeers")
-    channels_result = await node.call("listpeerchannels")
-    pending = await node.call("hive-pending-actions")
-
-    # Routing stats (24h) from listforwards
-    forwards = await node.call("listforwards", {"status": "settled"})
+    info, peers, channels_result, pending, forwards = await asyncio.gather(
+        node.call("getinfo"),
+        node.call("listpeers"),
+        node.call("listpeerchannels"),
+        node.call("hive-pending-actions"),
+        node.call("listforwards", {"status": "settled"}),
+    )
     forward_count = 0
     total_volume_msat = 0
     total_revenue_msat = 0
@@ -3779,20 +4822,21 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
     try:
         profitability = await node.call("revenue-profitability")
         channels_by_class = profitability.get("channels_by_class", {})
-        for class_name in ("bleeder", "zombie"):
+        for class_name in ("underwater", "zombie", "stagnant_candidate"):
+            severity = "warning" if class_name == "underwater" else "info"
             for ch in channels_by_class.get(class_name, [])[:3]:
                 issues.append({
                     "type": class_name,
-                    "severity": "warning" if class_name == "bleeder" else "info",
+                    "severity": severity,
                     "channel_id": ch.get("channel_id"),
-                    "peer_id": ch.get("peer_id"),
                     "details": {
                         "net_profit_sats": ch.get("net_profit_sats"),
-                        "roi_percentage": ch.get("roi_percentage")
+                        "roi_percentage": ch.get("roi_percentage"),
+                        "flow_profile": ch.get("flow_profile"),
                     }
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Could not fetch profitability issues: {e}")
 
     for ch in low_balance_channels:
         issues.append({
@@ -3831,6 +4875,12 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
         "pending_actions": len(pending.get("actions", [])),
         "top_issues": top_issues
     }
+
+
+async def handle_health(args: Dict) -> Dict:
+    """Quick health check on all nodes."""
+    timeout = args.get("timeout", 5.0)
+    return await fleet.health_check(timeout=timeout)
 
 
 async def handle_fleet_snapshot(args: Dict) -> Dict:
@@ -4072,27 +5122,59 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
     remote_msat = max(0, total_msat - local_msat)
     local_pct = round((local_msat / total_msat) * 100, 2) if total_msat else 0.0
 
-    peers = await node.call("listpeers")
+    # Gather remaining RPC calls in parallel (all independent after finding target_channel)
+    peers, prof, debug, forwards = await asyncio.gather(
+        node.call("listpeers"),
+        node.call("revenue-profitability", {"channel_id": channel_id}),
+        node.call("revenue-fee-debug"),
+        node.call("listforwards", {"status": "settled"}),
+        return_exceptions=True,
+    )
+
+    # Process peers result
+    if isinstance(peers, Exception):
+        peers = {"peers": []}
     peer_info = next((p for p in peers.get("peers", []) if p.get("id") == peer_id), {})
     peer_alias = peer_info.get("alias") or peer_info.get("alias_or_local", "") or ""
     connected = bool(peer_info.get("connected", False))
 
+    # Fallback to listnodes if peer not in listpeers (disconnected peer)
+    if not peer_alias and peer_id:
+        try:
+            nodes_result = await node.call("listnodes", {"id": peer_id})
+            if nodes_result.get("nodes"):
+                peer_alias = nodes_result["nodes"][0].get("alias", "")
+        except Exception:
+            pass  # Best effort fallback
+
+    # Calculate channel age from SCID
+    channel_age_days = None
+    try:
+        info_result = await node.call("getinfo")
+        current_blockheight = info_result.get("blockheight", 0)
+        if current_blockheight and channel_id:
+            channel_age_days = _scid_to_age_days(channel_id, current_blockheight)
+    except Exception:
+        pass  # Best effort
+
     # Profitability
     profitability = {}
-    try:
-        prof = await node.call("revenue-profitability", {"channel_id": channel_id})
-        for ch in prof.get("channels", []):
-            if ch.get("channel_id") == channel_id:
-                profitability = {
-                    "lifetime_revenue_sats": ch.get("revenue_sats"),
-                    "lifetime_cost_sats": ch.get("cost_sats"),
-                    "net_profit_sats": ch.get("net_profit_sats"),
-                    "roi_percentage": ch.get("roi_percentage"),
-                    "classification": ch.get("classification")
-                }
-                break
-    except Exception:
-        profitability = {}
+    if not isinstance(prof, Exception):
+        prof_data = prof.get("profitability", {})
+        if prof_data:
+            profitability = {
+                "lifetime_revenue_sats": prof_data.get("total_contribution_sats", 0),
+                "lifetime_cost_sats": prof_data.get("total_costs_sats", 0),
+                "net_profit_sats": prof_data.get("net_profit_sats", 0),
+                "roi_percentage": prof_data.get("roi_percentage", 0),
+                "classification": prof_data.get("profitability_class", "unknown"),
+                "forward_count": prof_data.get("forward_count", 0),
+                "volume_routed_sats": prof_data.get("volume_routed_sats", 0),
+                "flow_profile": prof_data.get("flow_profile", "unknown"),
+                "days_active": prof_data.get("days_active", 0),
+            }
+    else:
+        logger.debug(f"Could not fetch profitability for {channel_id}: {prof}")
 
     # Flow analysis + velocity
     flow = _flow_profile(target_channel)
@@ -4120,19 +5202,18 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
     }
 
     # Fee history (best-effort)
+    local_updates = target_channel.get("updates", {}).get("local", {})
     fee_history = {
-        "current_fee_ppm": target_channel.get("fee_proportional_millionths"),
-        "current_base_fee_msat": target_channel.get("fee_base_msat"),
+        "current_fee_ppm": local_updates.get("fee_proportional_millionths", 0),
+        "current_base_fee_msat": local_updates.get("fee_base_msat", 0),
         "recent_changes": None
     }
-    try:
-        debug = await node.call("revenue-fee-debug")
+    if not isinstance(debug, Exception):
         fee_history["recent_changes"] = debug.get("recent_fee_changes")
-    except Exception:
-        pass
 
-    # Recent forwards through channel
-    forwards = await node.call("listforwards", {"status": "settled"})
+    # Process forwards result
+    if isinstance(forwards, Exception):
+        forwards = {"forwards": []}
     recent = []
     for fwd in sorted(
         forwards.get("forwards", []),
@@ -4171,7 +5252,8 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
             "remote_msat": remote_msat,
             "local_balance_pct": local_pct,
             "peer_alias": peer_alias,
-            "connected": connected
+            "connected": connected,
+            "channel_age_days": channel_age_days
         },
         "profitability": profitability,
         "flow_analysis": flow_analysis,
@@ -4268,21 +5350,28 @@ async def handle_recommended_actions(args: Dict) -> Dict:
 async def _node_peer_search(node: NodeConnection, query: str) -> Dict[str, Any]:
     query_lower = query.lower()
 
-    peers = await node.call("listpeers")
-    channels_result = await node.call("listpeerchannels")
+    peers, channels_result, nodes_result = await asyncio.gather(
+        node.call("listpeers"),
+        node.call("listpeerchannels"),
+        node.call("listnodes"),
+        return_exceptions=True,
+    )
+
+    # Handle potential exceptions from gather
+    if isinstance(peers, Exception):
+        peers = {"peers": []}
+    if isinstance(channels_result, Exception):
+        channels_result = {"channels": []}
     channels = channels_result.get("channels", [])
 
     # Build pubkey -> alias map from listnodes (best-effort)
     alias_map = {}
-    try:
-        nodes = await node.call("listnodes")
-        for n in nodes.get("nodes", []):
+    if not isinstance(nodes_result, Exception):
+        for n in nodes_result.get("nodes", []):
             pubkey = n.get("nodeid")
             alias = n.get("alias")
             if pubkey and alias:
                 alias_map[pubkey] = alias
-    except Exception:
-        pass
 
     channel_by_peer = {}
     for ch in channels:
@@ -4376,7 +5465,20 @@ async def handle_approve_action(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Note: reason is for logging only, not passed to plugin
+    logger.info(f"Approving action {action_id} on {node_name}: {reason}")
+
+    # Record approval reason in advisor DB if available
+    try:
+        db = ensure_advisor_db()
+        db.record_decision(
+            decision_type="approve_action",
+            node_name=node_name,
+            recommendation=f"Approved action {action_id}",
+            reasoning=reason
+        )
+    except Exception:
+        pass  # Advisor DB is optional
+
     return await node.call("hive-approve-action", {
         "action_id": action_id
     })
@@ -4392,10 +5494,10 @@ async def handle_reject_action(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Note: reason is for logging only, not passed to plugin
-    return await node.call("hive-reject-action", {
-        "action_id": action_id
-    })
+    params = {"action_id": action_id}
+    if reason:
+        params["reason"] = reason
+    return await node.call("hive-reject-action", params)
 
 
 async def handle_members(args: Dict) -> Dict:
@@ -4436,11 +5538,13 @@ async def handle_onboard_new_members(args: Dict) -> Dict:
     # Initialize advisor DB for onboarding tracking (uses configured ADVISOR_DB_PATH)
     db = ensure_advisor_db()
 
-    # Gather required data
+    # Gather required data in parallel
     try:
-        members_data = await node.call("hive-members")
-        node_info = await node.call("getinfo")
-        channels_data = await node.call("listpeerchannels")
+        members_data, node_info, channels_data = await asyncio.gather(
+            node.call("hive-members"),
+            node.call("getinfo"),
+            node.call("listpeerchannels"),
+        )
     except Exception as e:
         return {"error": f"Failed to gather node data: {e}"}
 
@@ -4526,21 +5630,16 @@ async def handle_onboard_new_members(args: Dict) -> Dict:
             if not dry_run:
                 # Create pending_action for this suggestion
                 try:
-                    await node.call("hive-queue-action", {
+                    await node.call("hive-test-pending-action", {
                         "action_type": "channel_open",
                         "target": member_pubkey,
-                        "context": {
-                            "onboarding": True,
-                            "new_member_alias": member_alias,
-                            "new_member_tier": tier,
-                            "suggested_amount_sats": 3000000,
-                            "reasoning": suggestion["reasoning"]
-                        }
+                        "capacity_sats": 3000000,
+                        "reason": f"onboard_{member_alias}"
                     })
                     suggestion["pending_action_created"] = True
                 except Exception as e:
                     suggestion["pending_action_created"] = False
-                    suggestion["error"] = str(e)
+                    suggestion["error"] = str(e) or type(e).__name__
 
             suggestions_created.append(suggestion)
 
@@ -4673,6 +5772,183 @@ async def handle_execute_promotion(args: Dict) -> Dict:
     return await node.call("hive-execute-promotion", {"target_peer_id": target_peer_id})
 
 
+# =============================================================================
+# Membership Lifecycle Handlers
+# =============================================================================
+
+async def handle_vouch(args: Dict) -> Dict:
+    """Vouch for a neophyte."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-vouch", {"peer_id": peer_id})
+
+
+async def handle_leave(args: Dict) -> Dict:
+    """Leave the hive voluntarily."""
+    node_name = args.get("node")
+    reason = args.get("reason", "voluntary")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-leave", {"reason": reason})
+
+
+async def handle_force_promote(args: Dict) -> Dict:
+    """Force-promote a neophyte during bootstrap."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-force-promote", {"peer_id": peer_id})
+
+
+async def handle_request_promotion(args: Dict) -> Dict:
+    """Request promotion from neophyte to member."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-request-promotion")
+
+
+async def handle_remove_member(args: Dict) -> Dict:
+    """Remove a member from the hive."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    reason = args.get("reason", "maintenance")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-remove-member", {"peer_id": peer_id, "reason": reason})
+
+
+async def handle_genesis(args: Dict) -> Dict:
+    """Initialize a new hive."""
+    node_name = args.get("node")
+    hive_id = args.get("hive_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {}
+    if hive_id:
+        params["hive_id"] = hive_id
+    return await node.call("hive-genesis", params)
+
+
+async def handle_invite(args: Dict) -> Dict:
+    """Generate an invitation ticket."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {}
+    if args.get("valid_hours") is not None:
+        params["valid_hours"] = args["valid_hours"]
+    if args.get("tier"):
+        params["tier"] = args["tier"]
+    return await node.call("hive-invite", params)
+
+
+async def handle_join(args: Dict) -> Dict:
+    """Join a hive using an invitation ticket."""
+    node_name = args.get("node")
+    ticket = args.get("ticket")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {"ticket": ticket}
+    if args.get("peer_id"):
+        params["peer_id"] = args["peer_id"]
+    return await node.call("hive-join", params)
+
+
+# =============================================================================
+# Ban Governance Handlers
+# =============================================================================
+
+async def handle_propose_ban(args: Dict) -> Dict:
+    """Propose banning a member."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    reason = args.get("reason", "no reason given")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-propose-ban", {"peer_id": peer_id, "reason": reason})
+
+
+async def handle_vote_ban(args: Dict) -> Dict:
+    """Vote on a pending ban proposal."""
+    node_name = args.get("node")
+    proposal_id = args.get("proposal_id")
+    vote = args.get("vote")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-vote-ban", {"proposal_id": proposal_id, "vote": vote})
+
+
+async def handle_pending_bans(args: Dict) -> Dict:
+    """View pending ban proposals."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-pending-bans")
+
+
+# =============================================================================
+# Health/Reputation Monitoring Handlers
+# =============================================================================
+
+async def handle_nnlb_status(args: Dict) -> Dict:
+    """Get NNLB (No Node Left Behind) status."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-nnlb-status")
+
+
+async def handle_peer_reputations(args: Dict) -> Dict:
+    """Get aggregated peer reputations."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {}
+    if peer_id:
+        params["peer_id"] = peer_id
+    return await node.call("hive-peer-reputations", params)
+
+
+async def handle_reputation_stats(args: Dict) -> Dict:
+    """Get overall reputation tracking statistics."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-reputation-stats")
+
+
+async def handle_contribution(args: Dict) -> Dict:
+    """View contribution stats for a peer."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {}
+    if peer_id:
+        params["peer_id"] = peer_id
+    return await node.call("hive-contribution", params)
+
+
 async def handle_node_info(args: Dict) -> Dict:
     """Get node info."""
     node_name = args.get("node")
@@ -4749,7 +6025,7 @@ async def handle_channels(args: Dict) -> Dict:
 
             # Add flow metrics to channel
             channel["flow_profile"] = flow_profile
-            channel["inbound_outbound_ratio"] = inbound_outbound_ratio if inbound_outbound_ratio != float('inf') else "infinite"
+            channel["inbound_outbound_ratio"] = inbound_outbound_ratio if inbound_outbound_ratio != float('inf') else 999.99
             channel["inbound_payments"] = in_fulfilled
             channel["outbound_payments"] = out_fulfilled
             channel["inbound_volume_sats"] = in_msat // 1000 if isinstance(in_msat, int) else 0
@@ -4763,21 +6039,47 @@ async def handle_channels(args: Dict) -> Dict:
                             channel["profitability_class"] = class_name
                             channel["net_profit_sats"] = ch.get("net_profit_sats", 0)
                             channel["roi_percentage"] = ch.get("roi_percentage", 0)
+                            channel["forward_count"] = ch.get("forward_count", 0)
+                            channel["fees_earned_sats"] = ch.get("fees_earned_sats", 0)
+                            channel["volume_routed_sats"] = ch.get("volume_routed_sats", 0)
                             break
 
     return channels_result
 
 
 async def handle_set_fees(args: Dict) -> Dict:
-    """Set channel fees."""
+    """Set channel fees. Routes through cl-revenue-ops to enforce hive zero-fee policy."""
     node_name = args.get("node")
     channel_id = args.get("channel_id")
     fee_ppm = args.get("fee_ppm")
     base_fee_msat = args.get("base_fee_msat", 0)
+    force = args.get("force", False)
 
     node = fleet.get_node(node_name)
     if not node:
         return {"error": f"Unknown node: {node_name}"}
+
+    # Guard: check if the target channel peer is a hive member (zero-fee policy)
+    if fee_ppm and int(fee_ppm) > 0 and not force:
+        try:
+            members_result = await node.call("hive-members")
+            member_ids = {m.get("peer_id") for m in members_result.get("members", [])}
+            # Resolve channel_id to peer_id
+            channels = await node.call("listpeerchannels")
+            for ch in channels.get("channels", []):
+                scid = ch.get("short_channel_id", "")
+                peer_id = ch.get("peer_id", "")
+                if scid == channel_id or peer_id == channel_id:
+                    if peer_id in member_ids:
+                        return {
+                            "error": "Cannot set non-zero fees on hive member channel",
+                            "channel_id": channel_id,
+                            "peer_id": peer_id,
+                            "hint": "Hive channels must have 0 fees. Use force=true to override."
+                        }
+                    break
+        except Exception:
+            pass  # Fail open on guard check — setchannel itself will still work
 
     return await node.call("setchannel", {
         "id": channel_id,
@@ -4802,16 +6104,21 @@ async def handle_topology_analysis(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Get planner log, topology info, and expansion recommendations
-    planner_log = await node.call("hive-planner-log", {"limit": 10})
-    topology = await node.call("hive-topology")
+    # Get planner log, topology info, and expansion recommendations in parallel
+    planner_log, topology, expansion_recs = await asyncio.gather(
+        node.call("hive-planner-log", {"limit": 10}),
+        node.call("hive-topology"),
+        node.call("hive-expansion-recommendations", {"limit": 10}),
+        return_exceptions=True,
+    )
 
-    # Get expansion recommendations with cooperation module intelligence
-    try:
-        expansion_recs = await node.call("hive-expansion-recommendations", {"limit": 10})
-    except Exception as e:
-        # Graceful fallback if RPC not available
-        expansion_recs = {"error": str(e), "recommendations": []}
+    # Handle potential exceptions
+    if isinstance(planner_log, Exception):
+        planner_log = {"error": str(planner_log)}
+    if isinstance(topology, Exception):
+        topology = {"error": str(topology)}
+    if isinstance(expansion_recs, Exception):
+        expansion_recs = {"error": str(expansion_recs), "recommendations": []}
 
     return {
         "planner_log": planner_log,
@@ -5797,7 +7104,11 @@ async def handle_revenue_profitability(args: Dict) -> Dict:
 
     # Try to add market context from competitor intelligence
     try:
-        channels = profitability.get("channels", [])
+        channels_by_class = profitability.get("channels_by_class", {})
+        channels = []
+        for class_channels in channels_by_class.values():
+            if isinstance(class_channels, list):
+                channels.extend(class_channels)
 
         # Build a map of peer_id -> intel for quick lookup
         intel_map = {}
@@ -5847,7 +7158,7 @@ async def handle_revenue_profitability(args: Dict) -> Dict:
 
 
 async def handle_revenue_dashboard(args: Dict) -> Dict:
-    """Get financial health dashboard with routing and goat feeder revenue."""
+    """Get financial health dashboard with routing revenue."""
     node_name = args.get("node")
     window_days = args.get("window_days", 30)
 
@@ -5861,85 +7172,34 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
     if "error" in dashboard:
         return dashboard
 
-    import time
-    since_timestamp = int(time.time()) - (window_days * 86400)
-
-    # Fetch goat feeder revenue from LNbits (only for hive-nexus-01)
-    if node_name == "hive-nexus-01":
-        goat_feeder = await get_goat_feeder_revenue(since_timestamp)
-    else:
-        goat_feeder = {"total_sats": 0, "payment_count": 0}
-
     # Extract routing P&L data from cl-revenue-ops dashboard structure
-    # Data is in "period" and "financial_health", not "pnl_summary"
+    # Use defensive null handling - values may be None even with defaults
     period = dashboard.get("period", {})
     financial_health = dashboard.get("financial_health", {})
-    routing_revenue = period.get("gross_revenue_sats", 0)
-    routing_opex = period.get("opex_sats", 0)
-    routing_net = financial_health.get("net_profit_sats", 0)
+    routing_revenue = period.get("gross_revenue_sats") or 0
+    routing_opex = period.get("opex_sats") or 0
+    routing_net = financial_health.get("net_profit_sats") or 0
 
-    # Initialize pnl structure for building enhanced response
-    pnl = {}
+    operating_margin_pct = financial_health.get("operating_margin_pct") or 0.0
 
-    # Goat feeder revenue (no expenses tracked)
-    goat_revenue = goat_feeder.get("total_sats", 0)
-    goat_count = goat_feeder.get("payment_count", 0)
-
-    # Combined totals
-    total_revenue = routing_revenue + goat_revenue
-    total_net = routing_net + goat_revenue  # Goat revenue adds directly to profit
-
-    # Calculate combined operating margin
-    if total_revenue > 0:
-        combined_margin_pct = round((total_net / total_revenue) * 100, 2)
-    else:
-        combined_margin_pct = financial_health.get("operating_margin_pct", 0.0)
-
-    # Build enhanced P&L structure
-    # Note: opex_breakdown not exposed in dashboard API, set to 0
-    pnl["routing"] = {
-        "revenue_sats": routing_revenue,
-        "opex_sats": routing_opex,
-        "net_profit_sats": routing_net,
-        "opex_breakdown": {
-            "rebalance_cost_sats": 0,
-            "closure_cost_sats": 0,
-            "splice_cost_sats": 0
+    pnl = {
+        "routing": {
+            "revenue_sats": routing_revenue,
+            "opex_sats": routing_opex,
+            "net_profit_sats": routing_net,
+            "operating_margin_pct": operating_margin_pct,
+            "opex_breakdown": {
+                "rebalance_cost_sats": period.get("rebalance_cost_sats", 0),
+                "closure_cost_sats": period.get("closure_cost_sats", 0),
+                "splice_cost_sats": period.get("splice_cost_sats", 0),
+            }
         }
     }
 
-    pnl["goat_feeder"] = {
-        "revenue_sats": goat_revenue,
-        "payment_count": goat_count,
-        "source": "LNbits"
-    }
-
-    # Record goat feeder snapshot to advisor database for historical tracking
-    try:
-        db = ensure_advisor_db()
-        db.record_goat_feeder_snapshot(
-            node_name=node_name,
-            window_days=window_days,
-            revenue_sats=goat_revenue,
-            revenue_count=goat_count,
-            expense_sats=0,
-            expense_count=0,
-            expense_routing_fee_sats=0
-        )
-    except Exception as e:
-        logger.warning(f"Failed to record goat feeder snapshot: {e}")
-
-    pnl["combined"] = {
-        "total_revenue_sats": total_revenue,
-        "total_opex_sats": routing_opex,
-        "net_profit_sats": total_net,
-        "operating_margin_pct": combined_margin_pct
-    }
-
     # Update top-level fields for backwards compatibility
-    pnl["gross_revenue_sats"] = total_revenue
-    pnl["net_profit_sats"] = total_net
-    pnl["operating_margin_pct"] = combined_margin_pct
+    pnl["gross_revenue_sats"] = routing_revenue
+    pnl["net_profit_sats"] = routing_net
+    pnl["operating_margin_pct"] = operating_margin_pct
 
     dashboard["pnl_summary"] = pnl
 
@@ -6010,6 +7270,10 @@ async def handle_revenue_policy(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
+    # Validate required action parameter
+    if not action:
+        return {"error": "action is required (list, get, set, delete)"}
+
     # Build the action string for revenue-policy command
     if action == "list":
         return await node.call("revenue-policy", {"action": "list"})
@@ -6055,6 +7319,46 @@ async def handle_revenue_set_fee(args: Dict) -> Dict:
         params["force"] = True
 
     return await node.call("revenue-set-fee", params)
+
+
+async def handle_revenue_fee_anchor(args: Dict) -> Dict:
+    """Manage advisor fee anchors (soft fee targets with decaying weight)."""
+    node_name = args.get("node")
+    action = args.get("action")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if not action:
+        return {"error": "action is required (set, list, get, clear, clear-all)"}
+
+    params = {"action": action}
+
+    if action == "set":
+        channel_id = args.get("channel_id")
+        target_fee_ppm = args.get("target_fee_ppm")
+        if not channel_id:
+            return {"error": "channel_id is required for set"}
+        if target_fee_ppm is None:
+            return {"error": "target_fee_ppm is required for set"}
+        params["channel_id"] = channel_id
+        params["target_fee_ppm"] = target_fee_ppm
+        if args.get("confidence") is not None:
+            params["confidence"] = args["confidence"]
+        if args.get("base_weight") is not None:
+            params["base_weight"] = args["base_weight"]
+        if args.get("ttl_hours") is not None:
+            params["ttl_hours"] = args["ttl_hours"]
+        if args.get("reason"):
+            params["reason"] = args["reason"]
+    elif action in ("get", "clear"):
+        channel_id = args.get("channel_id")
+        if not channel_id:
+            return {"error": f"channel_id is required for {action}"}
+        params["channel_id"] = channel_id
+
+    return await node.call("revenue-fee-anchor", params)
 
 
 async def handle_revenue_rebalance(args: Dict) -> Dict:
@@ -6111,6 +7415,10 @@ async def handle_revenue_config(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
+    # Validate required action parameter
+    if not action:
+        return {"error": "action is required (get, set, reset, list-mutable)"}
+
     params = {"action": action}
     if key:
         params["key"] = key
@@ -6118,6 +7426,528 @@ async def handle_revenue_config(args: Dict) -> Dict:
         params["value"] = value
 
     return await node.call("revenue-config", params)
+
+
+async def handle_config_adjust(args: Dict) -> Dict:
+    """
+    Adjust cl-revenue-ops config with tracking for analysis and learning.
+    
+    Records the adjustment in advisor database with context metrics,
+    enabling outcome measurement and effectiveness analysis over time.
+    
+    Recommended config keys for advisor tuning:
+    - min_fee_ppm: Fee floor (raise if drain detected, lower if stagnating)
+    - max_fee_ppm: Fee ceiling (adjust based on competitive positioning)
+    - daily_budget_sats: Rebalance budget (scale with profitability)
+    - rebalance_max_amount: Max rebalance size
+    - thompson_observation_decay_hours: Shorter in volatile conditions
+    - hive_prior_weight: Trust in hive intelligence (0-1)
+    - scarcity_threshold: When to apply scarcity pricing
+    
+    Args:
+        node: Node name to adjust
+        config_key: Config key to change
+        new_value: New value to set
+        trigger_reason: Why making this change (e.g., 'drain_detected', 'stagnation', 
+                       'profitability_low', 'budget_exhausted', 'market_conditions')
+        reasoning: Detailed explanation of the decision
+        confidence: 0-1 confidence in the change
+        context_metrics: Optional dict of relevant metrics at time of change
+        
+    Returns:
+        Result including adjustment_id for later outcome tracking
+    """
+    node_name = args.get("node")
+    config_key = args.get("config_key")
+    new_value = args.get("new_value")
+    trigger_reason = args.get("trigger_reason")
+    reasoning = args.get("reasoning")
+    confidence = args.get("confidence")
+    context_metrics = args.get("context_metrics", {})
+    
+    if not all([node_name, config_key, new_value is not None, trigger_reason]):
+        return {"error": "Required: node, config_key, new_value, trigger_reason"}
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    # ISOLATION CHECK: Ensure no other config was adjusted recently
+    db = ensure_advisor_db()
+    recent_adjustments = db.get_config_adjustment_history(
+        node_name=node_name,
+        days=2,  # Look back 48 hours
+        limit=10
+    )
+    
+    # Define related parameter groups that shouldn't be changed together
+    PARAM_GROUPS = {
+        "fee_bounds": ["min_fee_ppm", "max_fee_ppm"],
+        "budget": ["daily_budget_sats", "rebalance_max_amount", "rebalance_min_amount", "proportional_budget_pct"],
+        "aimd": ["aimd_additive_increase_ppm", "aimd_multiplicative_decrease", "aimd_failure_threshold", "aimd_success_threshold"],
+        "thompson": ["thompson_observation_decay_hours", "thompson_prior_std_fee", "thompson_max_observations"],
+        "liquidity": ["low_liquidity_threshold", "high_liquidity_threshold", "scarcity_threshold"],
+        "sling_targets": ["sling_target_source", "sling_target_sink", "sling_target_balanced"],
+        "sling_params": ["sling_chunk_size_sats", "sling_max_hops", "sling_parallel_jobs"],
+        "algorithm": ["vegas_decay_rate", "ema_smoothing_alpha", "kelly_fraction", "hive_prior_weight"],
+    }
+    
+    # Find which group this param belongs to
+    param_group = None
+    for group_name, params in PARAM_GROUPS.items():
+        if config_key in params:
+            param_group = group_name
+            break
+    
+    # Check for recent changes to related params
+    import time
+    now = int(time.time())
+    isolation_hours = 24  # Minimum hours between related param changes
+    
+    for adj in recent_adjustments:
+        adj_key = adj.get("config_key")
+        adj_time = adj.get("timestamp", 0)
+        hours_ago = (now - adj_time) / 3600
+        
+        # Skip if it's the same param (we allow adjusting same param)
+        if adj_key == config_key:
+            continue
+        
+        # Check if in same group
+        if param_group:
+            for group_params in PARAM_GROUPS.values():
+                if adj_key in group_params and config_key in group_params:
+                    if hours_ago < isolation_hours:
+                        return {
+                            "error": f"ISOLATION VIOLATION: Related param '{adj_key}' was adjusted {hours_ago:.1f}h ago. "
+                                     f"Wait {isolation_hours - hours_ago:.1f}h more before adjusting '{config_key}'. "
+                                     f"Both are in group: {[k for k,v in PARAM_GROUPS.items() if config_key in v][0]}"
+                        }
+    
+    # Get current value first
+    current_config = await node.call("revenue-config", {"action": "get", "key": config_key})
+    if "error" in current_config:
+        return current_config
+    
+    old_value = current_config.get("config", {}).get(config_key)
+    
+    # Apply the change
+    result = await node.call("revenue-config", {
+        "action": "set",
+        "key": config_key,
+        "value": str(new_value)  # revenue-config expects string values
+    })
+    
+    if "error" in result:
+        return result
+    
+    # Record in advisor database
+    db = ensure_advisor_db()
+    adjustment_id = db.record_config_adjustment(
+        node_name=node_name,
+        config_key=config_key,
+        old_value=old_value,
+        new_value=new_value,
+        trigger_reason=trigger_reason,
+        reasoning=reasoning,
+        confidence=confidence,
+        context_metrics=context_metrics
+    )
+    
+    return {
+        "success": True,
+        "adjustment_id": adjustment_id,
+        "node": node_name,
+        "config_key": config_key,
+        "old_value": old_value,
+        "new_value": new_value,
+        "trigger_reason": trigger_reason,
+        "message": f"Config {config_key} changed from {old_value} to {new_value}. "
+                   f"Track outcome with adjustment_id={adjustment_id}"
+    }
+
+
+async def handle_config_adjustment_history(args: Dict) -> Dict:
+    """
+    Get history of config adjustments for analysis.
+    
+    Use this to review what changes were made, why, and their outcomes.
+    
+    Args:
+        node: Filter by node (optional)
+        config_key: Filter by specific config key (optional)
+        days: How far back to look (default: 30)
+        limit: Max records (default: 50)
+        
+    Returns:
+        List of adjustment records with outcomes
+    """
+    node_name = args.get("node")
+    config_key = args.get("config_key")
+    days = args.get("days", 30)
+    limit = args.get("limit", 50)
+    
+    db = ensure_advisor_db()
+    history = db.get_config_adjustment_history(
+        node_name=node_name,
+        config_key=config_key,
+        days=days,
+        limit=limit
+    )
+    
+    # Parse JSON fields for readability
+    for record in history:
+        for field in ['old_value', 'new_value', 'context_metrics', 'outcome_metrics']:
+            if record.get(field):
+                try:
+                    record[field] = json.loads(record[field])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+    
+    return {
+        "count": len(history),
+        "adjustments": history
+    }
+
+
+async def handle_config_effectiveness(args: Dict) -> Dict:
+    """
+    Analyze effectiveness of config adjustments.
+    
+    Shows success rates, learned optimal ranges, and recommendations
+    based on historical adjustment outcomes.
+    
+    Args:
+        node: Filter by node (optional)
+        config_key: Filter by specific config key (optional)
+        
+    Returns:
+        Effectiveness analysis with learned ranges and success rates
+    """
+    node_name = args.get("node")
+    config_key = args.get("config_key")
+    
+    db = ensure_advisor_db()
+    effectiveness = db.get_config_effectiveness(
+        node_name=node_name,
+        config_key=config_key
+    )
+    
+    # Parse context_ranges JSON
+    for r in effectiveness.get("learned_ranges", []):
+        if r.get("context_ranges"):
+            try:
+                r["context_ranges"] = json.loads(r["context_ranges"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+    
+    return effectiveness
+
+
+async def handle_config_measure_outcomes(args: Dict) -> Dict:
+    """
+    Measure outcomes for pending config adjustments.
+    
+    Compares current metrics against metrics at time of adjustment
+    to determine if the change was successful.
+    
+    Should be called periodically (e.g., 24-48h after adjustments)
+    to evaluate effectiveness.
+    
+    Args:
+        hours_since: Only measure adjustments older than this (default: 24)
+        dry_run: If true, show what would be measured without recording
+        
+    Returns:
+        List of measured outcomes
+    """
+    hours_since = args.get("hours_since", 24)
+    dry_run = args.get("dry_run", False)
+    
+    db = ensure_advisor_db()
+    pending = db.get_pending_outcome_measurements(hours_since=hours_since)
+    
+    if not pending:
+        return {"message": "No pending outcome measurements", "measured": []}
+    
+    results = []
+    
+    for adj in pending:
+        node_name = adj["node_name"]
+        config_key = adj["config_key"]
+        
+        node = fleet.get_node(node_name)
+        if not node:
+            results.append({
+                "adjustment_id": adj["id"],
+                "error": f"Node {node_name} not found"
+            })
+            continue
+        
+        # Get current metrics based on config type
+        try:
+            if config_key in ["min_fee_ppm", "max_fee_ppm"]:
+                # Measure fee effectiveness via revenue
+                dashboard = await node.call("revenue-dashboard", {"window_days": 1})
+                current_metrics = {
+                    "revenue_sats": dashboard.get("period", {}).get("gross_revenue_sats", 0),
+                    "forward_count": dashboard.get("period", {}).get("forward_count", 0),
+                    "volume_sats": dashboard.get("period", {}).get("volume_sats", 0)
+                }
+            elif config_key in ["daily_budget_sats", "rebalance_max_amount"]:
+                # Measure rebalance effectiveness
+                dashboard = await node.call("revenue-dashboard", {"window_days": 1})
+                current_metrics = {
+                    "rebalance_cost_sats": dashboard.get("period", {}).get("rebalance_cost_sats", 0),
+                    "net_profit_sats": dashboard.get("financial_health", {}).get("net_profit_sats", 0)
+                }
+            else:
+                # Generic metrics
+                dashboard = await node.call("revenue-dashboard", {"window_days": 1})
+                current_metrics = {
+                    "net_profit_sats": dashboard.get("financial_health", {}).get("net_profit_sats", 0),
+                    "operating_margin_pct": dashboard.get("financial_health", {}).get("operating_margin_pct", 0)
+                }
+        except Exception as e:
+            results.append({
+                "adjustment_id": adj["id"],
+                "error": str(e)
+            })
+            continue
+        
+        # Compare with context metrics at time of change
+        context_metrics = {}
+        if adj.get("context_metrics"):
+            try:
+                context_metrics = json.loads(adj["context_metrics"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
+        # Determine success based on improvement
+        success = False
+        notes = []
+        
+        if config_key in ["min_fee_ppm", "max_fee_ppm"]:
+            # Success if revenue or volume improved
+            old_rev = context_metrics.get("revenue_sats", 0)
+            new_rev = current_metrics.get("revenue_sats", 0)
+            if new_rev >= old_rev:
+                success = True
+                notes.append(f"Revenue maintained/improved: {old_rev} -> {new_rev}")
+            else:
+                notes.append(f"Revenue decreased: {old_rev} -> {new_rev}")
+                
+        elif config_key in ["daily_budget_sats", "rebalance_max_amount"]:
+            # Success if net profit improved or costs reduced
+            old_profit = context_metrics.get("net_profit_sats", 0)
+            new_profit = current_metrics.get("net_profit_sats", 0)
+            if new_profit >= old_profit:
+                success = True
+                notes.append(f"Profit maintained/improved: {old_profit} -> {new_profit}")
+            else:
+                notes.append(f"Profit decreased: {old_profit} -> {new_profit}")
+        else:
+            # Default: check margin improvement
+            old_margin = context_metrics.get("operating_margin_pct", 0)
+            new_margin = current_metrics.get("operating_margin_pct", 0)
+            if new_margin >= old_margin:
+                success = True
+                notes.append(f"Margin maintained/improved: {old_margin} -> {new_margin}")
+            else:
+                notes.append(f"Margin decreased: {old_margin} -> {new_margin}")
+        
+        outcome = {
+            "adjustment_id": adj["id"],
+            "node": node_name,
+            "config_key": config_key,
+            "old_value": adj["old_value"],
+            "new_value": adj["new_value"],
+            "trigger_reason": adj["trigger_reason"],
+            "success": success,
+            "notes": "; ".join(notes),
+            "context_metrics": context_metrics,
+            "current_metrics": current_metrics
+        }
+        
+        if not dry_run:
+            db.record_config_outcome(
+                adjustment_id=adj["id"],
+                outcome_metrics=current_metrics,
+                success=success,
+                notes="; ".join(notes)
+            )
+        
+        results.append(outcome)
+    
+    return {
+        "dry_run": dry_run,
+        "measured_count": len(results),
+        "successful": sum(1 for r in results if r.get("success")),
+        "failed": sum(1 for r in results if r.get("success") is False),
+        "errors": sum(1 for r in results if "error" in r),
+        "results": results
+    }
+
+
+async def handle_config_recommend(args: Dict) -> Dict:
+    """
+    Recommend the next config adjustment based on learned patterns and current conditions.
+    
+    Analyzes:
+    1. Current fleet conditions (stagnation, drains, profitability)
+    2. Past adjustment outcomes (what worked, what didn't)
+    3. Learned optimal ranges per parameter
+    4. Isolation constraints (what can be adjusted now)
+    
+    Returns prioritized recommendations with confidence scores.
+    """
+    node_name = args.get("node")
+    
+    if not node_name:
+        return {"error": "node required"}
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    db = ensure_advisor_db()
+    import time
+    now = int(time.time())
+    
+    # 1. Get current conditions
+    try:
+        dashboard = await node.call("revenue-dashboard", {"window_days": 1})
+        config = await node.call("revenue-config", {"action": "get"})
+    except Exception as e:
+        return {"error": f"Failed to get current state: {e}"}
+    
+    current_config = config.get("config", {})
+    period = dashboard.get("period", {})
+    financial = dashboard.get("financial_health", {})
+    
+    current_conditions = {
+        "revenue_24h": period.get("gross_revenue_sats", 0),
+        "volume_24h": period.get("volume_sats", 0),
+        "forward_count_24h": period.get("forward_count", 0),
+        "rebalance_cost_24h": period.get("rebalance_cost_sats", 0),
+        "net_profit_24h": financial.get("net_profit_sats", 0),
+        "operating_margin_pct": financial.get("operating_margin_pct", 0),
+    }
+    
+    # 2. Get learned effectiveness
+    effectiveness = db.get_config_effectiveness(node_name=node_name)
+    learned_ranges = {r["config_key"]: r for r in effectiveness.get("learned_ranges", [])}
+    
+    # 3. Get recent adjustments (for isolation check)
+    recent = db.get_config_adjustment_history(node_name=node_name, days=2, limit=20)
+    recently_adjusted = {}
+    for adj in recent:
+        key = adj.get("config_key")
+        adj_time = adj.get("timestamp", 0)
+        hours_ago = (now - adj_time) / 3600
+        if key not in recently_adjusted or hours_ago < recently_adjusted[key]:
+            recently_adjusted[key] = hours_ago
+    
+    # 4. Analyze conditions and generate recommendations
+    recommendations = []
+    
+    # Define what to check and when
+    CONDITION_CHECKS = [
+        # (condition_name, check_fn, param, direction, reason)
+        ("low_revenue", lambda c: c["revenue_24h"] < 100, "min_fee_ppm", "decrease", 
+         "Revenue very low - lower fee floor to attract more routing"),
+        ("low_revenue", lambda c: c["revenue_24h"] < 100, "max_fee_ppm", "decrease",
+         "Revenue very low - lower fee ceiling to be more competitive"),
+        ("high_rebalance_cost", lambda c: c["rebalance_cost_24h"] > c["net_profit_24h"] * 2,
+         "daily_budget_sats", "decrease", "Rebalance costs exceed profit - reduce budget"),
+        ("high_rebalance_cost", lambda c: c["rebalance_cost_24h"] > c["net_profit_24h"] * 2,
+         "rebalance_min_profit_ppm", "increase", "Rebalance costs high - require higher profit margin"),
+        ("negative_margin", lambda c: c["operating_margin_pct"] < 0,
+         "daily_budget_sats", "decrease", "Negative margin - reduce rebalance spending"),
+        ("good_profitability", lambda c: c["operating_margin_pct"] > 50 and c["net_profit_24h"] > 500,
+         "daily_budget_sats", "increase", "Good profitability - can afford more rebalancing"),
+        ("low_volume", lambda c: c["volume_24h"] < 100000,
+         "low_liquidity_threshold", "increase", "Low volume - less aggressive rebalancing"),
+        ("high_volume", lambda c: c["volume_24h"] > 1000000,
+         "sling_chunk_size_sats", "increase", "High volume - larger rebalance chunks efficient"),
+    ]
+    
+    for condition_name, check_fn, param, direction, reason in CONDITION_CHECKS:
+        if not check_fn(current_conditions):
+            continue
+        
+        # Check if param can be adjusted (isolation)
+        hours_since = recently_adjusted.get(param, 999)
+        can_adjust = hours_since >= 24
+        
+        # Get current value
+        current_val = current_config.get(param)
+        if current_val is None:
+            continue
+        
+        # Calculate suggested value
+        try:
+            current_val = float(current_val)
+        except (ValueError, TypeError):
+            continue
+        
+        if direction == "increase":
+            suggested = current_val * 1.25  # 25% increase
+        else:
+            suggested = current_val * 0.8   # 20% decrease
+        
+        # Check learned ranges
+        learned = learned_ranges.get(param, {})
+        success_rate = 0
+        if learned.get("adjustments_count", 0) > 0:
+            success_rate = (learned.get("successful_adjustments", 0) / 
+                          learned.get("adjustments_count", 1))
+        
+        # Adjust confidence based on past success
+        base_confidence = 0.5
+        if success_rate > 0.7:
+            base_confidence = 0.8
+        elif success_rate < 0.3 and learned.get("adjustments_count", 0) >= 3:
+            base_confidence = 0.2  # This param doesn't seem to work well
+        
+        # Apply learned optimal range constraints
+        if learned.get("optimal_min") and suggested < learned["optimal_min"]:
+            suggested = learned["optimal_min"]
+        if learned.get("optimal_max") and suggested > learned["optimal_max"]:
+            suggested = learned["optimal_max"]
+        
+        recommendations.append({
+            "param": param,
+            "current_value": current_val,
+            "suggested_value": round(suggested, 2) if isinstance(suggested, float) else suggested,
+            "direction": direction,
+            "reason": reason,
+            "condition": condition_name,
+            "confidence": round(base_confidence, 2),
+            "can_adjust_now": can_adjust,
+            "hours_until_can_adjust": max(0, 24 - hours_since) if not can_adjust else 0,
+            "past_success_rate": round(success_rate, 2),
+            "past_adjustments": learned.get("adjustments_count", 0),
+            "learned_optimal_range": {
+                "min": learned.get("optimal_min"),
+                "max": learned.get("optimal_max")
+            } if learned else None
+        })
+    
+    # Sort by confidence and whether we can adjust now
+    recommendations.sort(key=lambda r: (r["can_adjust_now"], r["confidence"]), reverse=True)
+    
+    return {
+        "node": node_name,
+        "current_conditions": current_conditions,
+        "recommendations": recommendations[:10],  # Top 10
+        "recently_adjusted": {k: f"{v:.1f}h ago" for k, v in recently_adjusted.items()},
+        "learning_summary": {
+            "total_adjustments": effectiveness.get("total_adjustments", 0),
+            "overall_success_rate": round(effectiveness.get("overall_success_rate", 0), 2),
+            "params_with_learned_ranges": len(learned_ranges)
+        }
+    }
 
 
 async def handle_revenue_debug(args: Dict) -> Dict:
@@ -6147,113 +7977,6 @@ async def handle_revenue_history(args: Dict) -> Dict:
 
     return await node.call("revenue-history")
 
-
-async def get_goat_feeder_revenue(since_timestamp: int) -> Dict[str, Any]:
-    """
-    Fetch goat feeder revenue from LNbits.
-
-    Queries the LNbits wallet for payments with "⚡CyberHerd Treats⚡" in the memo.
-    These are incoming payments to the sat wallet from the goat feeder.
-
-    Args:
-        since_timestamp: Only count payments after this timestamp
-
-    Returns:
-        Dict with total_sats and payment_count
-    """
-    import urllib.request
-    import json
-
-    validation_error = _validate_lnbits_config()
-    if validation_error:
-        return {"total_sats": 0, "payment_count": 0, "error": validation_error}
-    if not LNBITS_INVOICE_KEY:
-        return {"total_sats": 0, "payment_count": 0, "error": "LNBITS_INVOICE_KEY not configured."}
-
-    try:
-        # Query LNbits payments API using urllib (no external dependencies)
-        req = urllib.request.Request(
-            f"{LNBITS_URL}/api/v1/payments",
-            headers={"X-Api-Key": LNBITS_INVOICE_KEY}
-        )
-        with urllib.request.urlopen(req, timeout=LNBITS_TIMEOUT_SECS) as response:
-            if response.status != 200:
-                return {"total_sats": 0, "payment_count": 0, "error": f"API error: {response.status}"}
-            raw = json.loads(response.read())
-
-        if isinstance(raw, dict) and "data" in raw:
-            payments = raw.get("data", [])
-        else:
-            payments = raw if isinstance(raw, list) else []
-
-        total_sats = 0
-        payment_count = 0
-
-        for payment in payments:
-            # Only count incoming payments (positive amount)
-            amount = payment.get("amount", 0)
-            if amount <= 0:
-                continue
-
-            # Check if memo matches goat feeder pattern
-            memo = payment.get("memo", "") or ""
-            if GOAT_FEEDER_PATTERN not in memo:
-                continue
-
-            # Parse timestamp (LNbits uses ISO date string in 'time' field)
-            payment_time_str = payment.get("time", "")
-            try:
-                from datetime import datetime
-                # Handle ISO format with or without timezone
-                if "." in payment_time_str:
-                    payment_time = datetime.fromisoformat(payment_time_str.replace("Z", "+00:00"))
-                else:
-                    payment_time = datetime.fromisoformat(payment_time_str)
-                payment_timestamp = int(payment_time.timestamp())
-            except (ValueError, TypeError):
-                payment_timestamp = 0
-
-            if payment_timestamp < since_timestamp:
-                continue
-
-            # LNbits amounts are in millisats
-            total_sats += amount // 1000
-            payment_count += 1
-
-        return {
-            "total_sats": total_sats,
-            "payment_count": payment_count
-        }
-
-    except Exception as e:
-        logger.warning(f"Error fetching goat feeder revenue from LNbits: {e}")
-        return {
-            "total_sats": 0,
-            "payment_count": 0,
-            "error": str(e)
-        }
-
-
-async def handle_revenue_outgoing(args: Dict) -> Dict:
-    """Get goat feeder revenue from LNbits."""
-    window_days = args.get("window_days", 30)
-
-    import time
-    since_timestamp = int(time.time()) - (window_days * 86400)
-
-    # Get goat feeder revenue from LNbits
-    revenue = await get_goat_feeder_revenue(since_timestamp)
-
-    return {
-        "window_days": window_days,
-        "goat_feeder": {
-            "revenue_sats": revenue.get("total_sats", 0),
-            "payment_count": revenue.get("payment_count", 0),
-            "pattern": GOAT_FEEDER_PATTERN,
-            "source": f"LNbits ({LNBITS_URL})"
-        },
-        "error": revenue.get("error")
-    }
 
 
 async def handle_revenue_competitor_analysis(args: Dict) -> Dict:
@@ -6406,56 +8129,407 @@ def _analyze_market_position(our_fee: int, their_avg_fee: int, intel: Dict) -> D
     }
 
 
-async def handle_goat_feeder_history(args: Dict) -> Dict:
-    """Get historical goat feeder P&L from the advisor database."""
+
+# =============================================================================
+# Diagnostic Tool Handlers
+# =============================================================================
+
+
+async def handle_hive_node_diagnostic(args: Dict) -> Dict:
+    """Comprehensive single-node diagnostic."""
     node_name = args.get("node")
-    days = args.get("days", 30)
 
-    db = ensure_advisor_db()
-    history = db.get_goat_feeder_history(node_name=node_name, days=days)
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
 
-    if not history:
-        return {
-            "snapshots": [],
-            "count": 0,
-            "note": "No goat feeder history found. Run revenue_dashboard to start recording snapshots."
+    import time
+    now = int(time.time())
+    since_24h = now - 86400
+
+    result: Dict[str, Any] = {"node": node_name}
+
+    # Channel balances
+    try:
+        channels_result = await node.call("listpeerchannels")
+        channels = channels_result.get("channels", [])
+        total_capacity_msat = 0
+        total_local_msat = 0
+        channel_count = 0
+        zero_balance_channels = []
+        for ch in channels:
+            state = ch.get("state", "")
+            if "CHANNELD_NORMAL" not in state:
+                continue
+            channel_count += 1
+            totals = _channel_totals(ch)
+            total_capacity_msat += totals["total_msat"]
+            total_local_msat += totals["local_msat"]
+            if totals["total_msat"] == 0:
+                zero_balance_channels.append(ch.get("short_channel_id", "unknown"))
+        result["channels"] = {
+            "count": channel_count,
+            "total_capacity_sats": total_capacity_msat // 1000,
+            "total_local_sats": total_local_msat // 1000,
+            "total_remote_sats": (total_capacity_msat - total_local_msat) // 1000,
+            "avg_balance_ratio": round(total_local_msat / total_capacity_msat, 3) if total_capacity_msat else 0,
+            "zero_balance_channels": zero_balance_channels,
         }
+    except Exception as e:
+        result["channels"] = {"error": str(e)}
+
+    # 24h forwarding stats
+    try:
+        forwards = await node.call("listforwards", {"status": "settled"})
+        stats = _forward_stats(forwards.get("forwards", []), since_24h, now)
+        result["forwards_24h"] = stats
+    except Exception as e:
+        result["forwards_24h"] = {"error": str(e)}
+
+    # Sling status
+    try:
+        sling = await node.call("sling-status")
+        result["sling_status"] = sling
+    except Exception as e:
+        result["sling_status"] = {"error": str(e), "note": "sling plugin may not be installed"}
+
+    # Plugin list
+    try:
+        plugins = await node.call("plugin", {"subcommand": "list"})
+        plugin_names = []
+        for p in plugins.get("plugins", []):
+            name = p.get("name", "")
+            # Extract just the filename from the path
+            plugin_names.append(name.split("/")[-1] if "/" in name else name)
+        result["plugins"] = plugin_names
+    except Exception as e:
+        result["plugins"] = {"error": str(e)}
+
+    return result
+
+
+async def handle_revenue_ops_health(args: Dict) -> Dict:
+    """Validate cl-revenue-ops data pipeline health."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    checks: Dict[str, Dict[str, Any]] = {}
+
+    # Check 1: revenue-dashboard
+    try:
+        dashboard = await node.call("revenue-dashboard", {"window_days": 7})
+        if "error" in dashboard:
+            checks["dashboard"] = {"status": "error", "detail": dashboard["error"]}
+        else:
+            has_revenue = dashboard.get("total_revenue_sats", 0) is not None
+            has_channels = dashboard.get("active_channels", 0) is not None
+            if has_revenue and has_channels:
+                checks["dashboard"] = {"status": "pass", "active_channels": dashboard.get("active_channels"), "total_revenue_sats": dashboard.get("total_revenue_sats")}
+            else:
+                checks["dashboard"] = {"status": "warn", "detail": "Dashboard returned but missing expected fields"}
+    except Exception as e:
+        checks["dashboard"] = {"status": "error", "detail": str(e)}
+
+    # Check 2: revenue-profitability
+    try:
+        prof = await node.call("revenue-profitability")
+        if "error" in prof:
+            checks["profitability"] = {"status": "error", "detail": prof["error"]}
+        else:
+            channel_count = len(prof.get("channels", prof.get("channels_by_class", {}).get("all", [])))
+            checks["profitability"] = {"status": "pass", "channels_analyzed": channel_count}
+    except Exception as e:
+        checks["profitability"] = {"status": "error", "detail": str(e)}
+
+    # Check 3: revenue-rebalance-debug
+    try:
+        rebal = await node.call("revenue-rebalance-debug")
+        if "error" in rebal:
+            checks["rebalance_debug"] = {"status": "error", "detail": rebal["error"]}
+        else:
+            checks["rebalance_debug"] = {"status": "pass", "keys": list(rebal.keys())[:10]}
+    except Exception as e:
+        checks["rebalance_debug"] = {"status": "error", "detail": str(e)}
+
+    # Check 4: revenue-status
+    try:
+        status = await node.call("revenue-status")
+        if "error" in status:
+            checks["status"] = {"status": "error", "detail": status["error"]}
+        else:
+            checks["status"] = {"status": "pass", "detail": status}
+    except Exception as e:
+        checks["status"] = {"status": "error", "detail": str(e)}
+
+    # Overall health
+    statuses = [c["status"] for c in checks.values()]
+    if all(s == "pass" for s in statuses):
+        overall = "healthy"
+    elif all(s == "error" for s in statuses):
+        overall = "unhealthy"
+    elif "error" in statuses:
+        overall = "degraded"
+    else:
+        overall = "warning"
 
     return {
-        "snapshots": [
-            {
-                "timestamp": s.timestamp.isoformat(),
-                "node_name": s.node_name,
-                "window_days": s.window_days,
-                "revenue_sats": s.revenue_sats,
-                "revenue_count": s.revenue_count,
-                "expense_sats": s.expense_sats,
-                "expense_count": s.expense_count,
-                "net_profit_sats": s.net_profit_sats,
-                "profitable": s.profitable
-            }
-            for s in history
-        ],
-        "count": len(history),
-        "summary": db.get_goat_feeder_summary(node_name=node_name)
+        "node": node_name,
+        "overall_health": overall,
+        "checks": checks,
     }
 
 
-async def handle_goat_feeder_trends(args: Dict) -> Dict:
-    """Get goat feeder trend analysis."""
+async def handle_advisor_validate_data(args: Dict) -> Dict:
+    """Validate advisor snapshot data quality."""
     node_name = args.get("node")
-    days = args.get("days", 7)
 
-    db = ensure_advisor_db()
-    trends = db.get_goat_feeder_trends(node_name=node_name, days=days)
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
 
-    if not trends:
-        return {
-            "error": "Insufficient data for trend analysis",
-            "note": "Run revenue_dashboard multiple times over several days to collect enough data for trends."
-        }
+    import time
+    issues = []
+    stats: Dict[str, Any] = {}
 
-    return trends
+    # Get recent snapshot data from advisor DB
+    try:
+        db = ensure_advisor_db()
+        snapshots = db.get_recent_snapshots(limit=1)
+        if not snapshots:
+            return {"node": node_name, "issues": [{"severity": "warn", "detail": "No snapshots found in advisor DB"}], "stats": {}}
+        stats["latest_snapshot_age_secs"] = int(time.time()) - snapshots[0].get("timestamp", 0)
+        stats["latest_snapshot_type"] = snapshots[0].get("snapshot_type", "unknown")
+    except Exception as e:
+        issues.append({"severity": "error", "detail": f"Cannot read advisor DB: {e}"})
+
+    # Get channel_history records for this node
+    channel_records = []
+    try:
+        db = ensure_advisor_db()
+        with db._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT channel_id, peer_id, capacity_sats, local_sats, remote_sats, balance_ratio
+                FROM channel_history
+                WHERE node_name = ?
+                AND timestamp > ?
+                ORDER BY timestamp DESC
+                LIMIT 200
+            """, (node_name, int(time.time()) - 3600)).fetchall()
+            channel_records = [dict(r) for r in rows]
+    except Exception as e:
+        issues.append({"severity": "error", "detail": f"Cannot query channel_history: {e}"})
+
+    stats["channel_records_last_hour"] = len(channel_records)
+
+    # Check for zero-value issues
+    zero_capacity = [r for r in channel_records if r.get("capacity_sats", 0) == 0]
+    zero_local = [r for r in channel_records if r.get("local_sats", 0) == 0 and r.get("remote_sats", 0) == 0]
+    if zero_capacity:
+        issues.append({
+            "severity": "critical",
+            "detail": f"{len(zero_capacity)} channel records with zero capacity",
+            "channels": [r.get("channel_id", "?") for r in zero_capacity[:5]],
+        })
+    if zero_local:
+        issues.append({
+            "severity": "warn",
+            "detail": f"{len(zero_local)} channel records with both local and remote = 0",
+            "channels": [r.get("channel_id", "?") for r in zero_local[:5]],
+        })
+
+    # Check for missing IDs
+    missing_channel_id = [r for r in channel_records if not r.get("channel_id")]
+    missing_peer_id = [r for r in channel_records if not r.get("peer_id")]
+    if missing_channel_id:
+        issues.append({"severity": "critical", "detail": f"{len(missing_channel_id)} records missing channel_id"})
+    if missing_peer_id:
+        issues.append({"severity": "warn", "detail": f"{len(missing_peer_id)} records missing peer_id"})
+
+    # Check balance ratio consistency
+    bad_ratio = [r for r in channel_records if r.get("balance_ratio") is not None and (r["balance_ratio"] < 0 or r["balance_ratio"] > 1)]
+    if bad_ratio:
+        issues.append({
+            "severity": "warn",
+            "detail": f"{len(bad_ratio)} records with balance_ratio outside 0-1 range",
+            "examples": [{"channel_id": r.get("channel_id"), "ratio": r.get("balance_ratio")} for r in bad_ratio[:3]],
+        })
+
+    # Compare snapshot vs live data
+    try:
+        channels_result = await node.call("listpeerchannels")
+        live_channels = {}
+        for ch in channels_result.get("channels", []):
+            scid = ch.get("short_channel_id")
+            if scid and "CHANNELD_NORMAL" in ch.get("state", ""):
+                totals = _channel_totals(ch)
+                live_channels[scid] = {
+                    "capacity_sats": totals["total_msat"] // 1000,
+                    "local_sats": totals["local_msat"] // 1000,
+                }
+
+        # Deduplicate channel_records to most recent per channel_id
+        seen_channels: Dict[str, Dict] = {}
+        for r in channel_records:
+            cid = r.get("channel_id")
+            if cid and cid not in seen_channels:
+                seen_channels[cid] = r
+
+        mismatches = []
+        for cid, snapshot in seen_channels.items():
+            live = live_channels.get(cid)
+            if not live:
+                continue
+            snap_cap = snapshot.get("capacity_sats", 0)
+            live_cap = live.get("capacity_sats", 0)
+            if live_cap > 0 and snap_cap == 0:
+                mismatches.append({"channel_id": cid, "issue": "snapshot has 0 capacity, live has data", "live_capacity_sats": live_cap})
+
+        stats["live_channels"] = len(live_channels)
+        stats["snapshot_channels_matched"] = len(seen_channels)
+        if mismatches:
+            issues.append({
+                "severity": "critical",
+                "detail": f"{len(mismatches)} channels with snapshot=0 but live data exists",
+                "mismatches": mismatches[:5],
+            })
+    except Exception as e:
+        issues.append({"severity": "warn", "detail": f"Could not compare with live data: {e}"})
+
+    return {
+        "node": node_name,
+        "issue_count": len(issues),
+        "critical_count": len([i for i in issues if i.get("severity") == "critical"]),
+        "issues": issues,
+        "stats": stats,
+    }
+
+
+async def handle_advisor_dedup_status(args: Dict) -> Dict:
+    """Check for duplicate and stale pending decisions."""
+    import time
+    now = int(time.time())
+    stale_threshold = now - (48 * 3600)
+
+    try:
+        db = ensure_advisor_db()
+    except Exception as e:
+        return {"error": f"Cannot initialize advisor DB: {e}"}
+
+    pending = db.get_pending_decisions()
+
+    # Group by (decision_type, node_name, channel_id)
+    groups: Dict[str, list] = {}
+    stale_count = 0
+    for d in pending:
+        key = f"{d.get('decision_type', '?')}|{d.get('node_name', '?')}|{d.get('channel_id', '?')}"
+        groups.setdefault(key, []).append(d)
+        if d.get("timestamp", now) < stale_threshold:
+            stale_count += 1
+
+    duplicates = []
+    for key, decisions in groups.items():
+        if len(decisions) > 1:
+            parts = key.split("|")
+            duplicates.append({
+                "decision_type": parts[0],
+                "node_name": parts[1],
+                "channel_id": parts[2],
+                "count": len(decisions),
+                "oldest_timestamp": min(d.get("timestamp", 0) for d in decisions),
+                "newest_timestamp": max(d.get("timestamp", 0) for d in decisions),
+            })
+
+    # Outcome coverage stats
+    try:
+        db_stats = db.get_stats()
+        total_decisions = db_stats.get("ai_decisions", 0)
+        total_outcomes = db.count_outcomes()
+    except Exception:
+        total_decisions = 0
+        total_outcomes = 0
+
+    return {
+        "pending_total": len(pending),
+        "unique_groups": len(groups),
+        "duplicate_groups": duplicates,
+        "stale_count_48h": stale_count,
+        "outcome_coverage": {
+            "total_decisions": total_decisions,
+            "total_outcomes": total_outcomes,
+            "coverage_pct": round(total_outcomes / total_decisions * 100, 1) if total_decisions else 0,
+        },
+    }
+
+
+async def handle_rebalance_diagnostic(args: Dict) -> Dict:
+    """Diagnose rebalancing subsystem health."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result: Dict[str, Any] = {"node": node_name}
+    diagnosis = []
+
+    # Check sling plugin availability
+    sling_available = False
+    try:
+        plugins = await node.call("plugin", {"subcommand": "list"})
+        for p in plugins.get("plugins", []):
+            name = p.get("name", "")
+            if "sling" in name.lower():
+                sling_available = True
+                break
+        result["sling_installed"] = sling_available
+        if not sling_available:
+            diagnosis.append("Sling plugin is NOT installed — rebalancing unavailable")
+    except Exception as e:
+        result["sling_installed"] = None
+        diagnosis.append(f"Cannot check plugin list: {e}")
+
+    # Get revenue-rebalance-debug for structured diagnostics
+    try:
+        rebal = await node.call("revenue-rebalance-debug")
+        if "error" in rebal:
+            result["rebalance_debug"] = {"error": rebal["error"]}
+            diagnosis.append(f"revenue-rebalance-debug error: {rebal['error']}")
+        else:
+            result["rebalance_debug"] = rebal
+
+            # Extract key diagnostic info
+            rejections = rebal.get("rejection_reasons", rebal.get("rejections", {}))
+            if rejections:
+                result["rejection_reasons"] = rejections
+                for reason, count in rejections.items() if isinstance(rejections, dict) else []:
+                    if count > 0:
+                        diagnosis.append(f"Rejection: {reason} ({count} channels)")
+
+            capital_controls = rebal.get("capital_controls", {})
+            if capital_controls:
+                result["capital_controls"] = capital_controls
+
+            budget = rebal.get("budget", rebal.get("budget_state", {}))
+            if budget:
+                result["budget_state"] = budget
+    except Exception as e:
+        result["rebalance_debug"] = {"error": str(e)}
+        diagnosis.append(f"Cannot call revenue-rebalance-debug: {e}")
+
+    # Try sling-status for active jobs
+    if sling_available:
+        try:
+            sling = await node.call("sling-status")
+            result["sling_status"] = sling
+        except Exception as e:
+            result["sling_status"] = {"error": str(e)}
+            diagnosis.append(f"sling-status call failed: {e}")
+
+    result["diagnosis"] = diagnosis if diagnosis else ["All rebalance subsystems operational"]
+    return result
 
 
 # =============================================================================
@@ -6493,7 +8567,8 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
             dashboard = await node.call("revenue-dashboard", {"window_days": 30})
             profitability = await node.call("revenue-profitability")
             history = await node.call("revenue-history")
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Revenue data unavailable for {node_name}: {e}")
             dashboard = {}
             profitability = {}
             history = {}
@@ -6532,11 +8607,27 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
 
         # Process channel details for history
         channels_data = await node.call("listpeerchannels")
-        prof_data = profitability.get("channels", [])
+        channels_by_class = profitability.get("channels_by_class", {})
+        if not channels_by_class and "error" in profitability:
+            logger.warning(f"Profitability returned error for {node_name}: {profitability.get('error')}")
+        prof_data = []
+        for class_name, class_channels in channels_by_class.items():
+            if isinstance(class_channels, list):
+                for ch in class_channels:
+                    ch["profitability_class"] = class_name
+                    prof_data.append(ch)
         prof_by_id = {c.get("channel_id"): c for c in prof_data}
+        if prof_data:
+            logger.info(f"Profitability data: {len(prof_data)} channels classified for {node_name}")
+        else:
+            logger.warning(f"No profitability classification data available for {node_name}")
 
         for ch in channels_data.get("channels", []):
+            if ch.get("state") != "CHANNELD_NORMAL":
+                continue
             scid = ch.get("short_channel_id", "")
+            if not scid:
+                continue
             prof_ch = prof_by_id.get(scid, {})
 
             local_msat = ch.get("to_us_msat", 0)
@@ -6565,9 +8656,10 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
                 "remote_sats": remote_sats,
                 "balance_ratio": round(balance_ratio, 4),
                 "flow_state": prof_ch.get("profitability_class", "unknown"),
-                "flow_ratio": prof_ch.get("roi_annual_pct", 0),
+                "flow_ratio": prof_ch.get("roi_percentage", 0),
                 "confidence": 1.0,
-                "forward_count": 0,
+                "forward_count": prof_ch.get("forward_count", 0),
+                "fees_earned_sats": prof_ch.get("fees_earned_sats", 0),
                 "fee_ppm": fee_ppm,
                 "fee_base_msat": fee_base,
                 "needs_inbound": balance_ratio > 0.8,
@@ -6709,6 +8801,8 @@ async def handle_advisor_record_decision(args: Dict) -> Dict:
     channel_id = args.get("channel_id")
     peer_id = args.get("peer_id")
     confidence = args.get("confidence")
+    predicted_benefit = args.get("predicted_benefit")
+    snapshot_metrics = args.get("snapshot_metrics")
 
     db = ensure_advisor_db()
 
@@ -6719,7 +8813,9 @@ async def handle_advisor_record_decision(args: Dict) -> Dict:
         reasoning=reasoning,
         channel_id=channel_id,
         peer_id=peer_id,
-        confidence=confidence
+        confidence=confidence,
+        predicted_benefit=predicted_benefit,
+        snapshot_metrics=snapshot_metrics
     )
 
     return {
@@ -6740,7 +8836,8 @@ async def handle_advisor_get_recent_decisions(args: Dict) -> Dict:
     with db._get_conn() as conn:
         rows = conn.execute("""
             SELECT id, timestamp, decision_type, node_name, channel_id, peer_id,
-                   recommendation, reasoning, confidence, status
+                   recommendation, reasoning, confidence, status,
+                   outcome_measured_at, outcome_success, outcome_metrics
             FROM ai_decisions
             ORDER BY timestamp DESC
             LIMIT ?
@@ -6748,7 +8845,7 @@ async def handle_advisor_get_recent_decisions(args: Dict) -> Dict:
 
     decisions = []
     for row in rows:
-        decisions.append({
+        decision = {
             "id": row["id"],
             "timestamp": datetime.fromtimestamp(row["timestamp"]).isoformat(),
             "decision_type": row["decision_type"],
@@ -6758,8 +8855,16 @@ async def handle_advisor_get_recent_decisions(args: Dict) -> Dict:
             "recommendation": row["recommendation"],
             "reasoning": row["reasoning"],
             "confidence": row["confidence"],
-            "status": row["status"]
-        })
+            "status": row["status"],
+            "outcome_success": row["outcome_success"],
+            "outcome_measured_at": datetime.fromtimestamp(row["outcome_measured_at"]).isoformat() if row["outcome_measured_at"] else None,
+        }
+        if row["outcome_metrics"]:
+            try:
+                decision["outcome_metrics"] = json.loads(row["outcome_metrics"])
+            except (json.JSONDecodeError, TypeError):
+                decision["outcome_metrics"] = row["outcome_metrics"]
+        decisions.append(decision)
 
     return {
         "count": len(decisions),
@@ -6936,9 +9041,11 @@ async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
                 if channels_result.get("error"):
                     graph_data["rpc_errors"] = graph_data.get("rpc_errors", [])
                     graph_data["rpc_errors"].append(f"listchannels: {channels_result['error']}")
-                channels = channels_result.get("channels", [])
-
-                graph_data["channel_count"] = len(channels)
+                    channels = []
+                    # Don't set channel_count when RPC failed - leave it undefined
+                else:
+                    channels = channels_result.get("channels", [])
+                    graph_data["channel_count"] = len(channels)
 
                 if channels:
                     capacities = []
@@ -7077,16 +9184,13 @@ def _get_proactive_advisor():
                 }
 
                 async def call(self, tool_name, params):
-                    # Route to internal handlers
-                    handler_name = self.TOOL_TO_HANDLER.get(tool_name)
-                    if not handler_name:
-                        # Try handle_{tool_name} first
-                        handler_name = f"handle_{tool_name}"
-                        if handler_name not in globals():
-                            # Try stripping hive_ prefix: hive_foo -> handle_foo
-                            if tool_name.startswith("hive_"):
-                                handler_name = f"handle_{tool_name[5:]}"
-                    handler = globals().get(handler_name)
+                    # Route to internal handlers via TOOL_HANDLERS registry
+                    handler = TOOL_HANDLERS.get(tool_name)
+                    if not handler:
+                        # Fallback: try explicit mapping for non-standard names
+                        handler_name = self.TOOL_TO_HANDLER.get(tool_name)
+                        if handler_name:
+                            handler = globals().get(handler_name)
                     if handler:
                         return await handler(params)
                     return {"error": f"Unknown tool: {tool_name}"}
@@ -7323,6 +9427,815 @@ async def handle_advisor_scan_opportunities(args: Dict) -> Dict:
     except Exception as e:
         logger.exception("Error scanning opportunities")
         return {"error": f"Failed to scan opportunities: {str(e)}"}
+
+
+# =============================================================================
+# Phase 3: Automation Tool Handlers
+# =============================================================================
+
+async def handle_auto_evaluate_proposal(args: Dict) -> Dict:
+    """Evaluate a pending proposal against automated criteria and optionally execute."""
+    node_name = args.get("node")
+    action_id = args.get("action_id")
+    dry_run = args.get("dry_run", True)
+
+    if not node_name or action_id is None:
+        return {"error": "node and action_id are required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Get the specific pending action
+    pending_result = await node.call("hive-pending-actions")
+    if "error" in pending_result:
+        return pending_result
+
+    actions = pending_result.get("actions", [])
+    action = None
+    for a in actions:
+        if a.get("action_id") == action_id or a.get("id") == action_id:
+            action = a
+            break
+
+    if not action:
+        return {"error": f"Action {action_id} not found in pending actions"}
+
+    action_type = action.get("action_type") or action.get("type", "unknown")
+    payload = action.get("payload", {})
+    # Target can be at top level or inside payload
+    target = (action.get("target") or action.get("peer_id") or action.get("target_pubkey") or
+              payload.get("target") or payload.get("peer_id") or payload.get("target_pubkey", ""))
+
+    decision = "escalate"
+    reasoning = []
+    action_executed = False
+
+    # Evaluate based on action type
+    if action_type in ("channel_open", "open_channel"):
+        # Validate we have a target pubkey
+        if not target or len(target) < 66:
+            decision = "escalate"
+            reasoning.append(f"Invalid or missing target pubkey in action")
+            return {
+                "action_id": action_id,
+                "action_type": action_type,
+                "decision": decision,
+                "reasoning": reasoning,
+                "action_executed": False
+            }
+
+        # Get peer intel for channel open evaluation
+        peer_intel = await handle_advisor_get_peer_intel({"peer_id": target})
+        graph_data = peer_intel.get("network_graph", {})
+        local_data = peer_intel.get("local_experience", {}) or {}
+        criteria = peer_intel.get("channel_open_criteria", {})
+
+        # Check if we actually have graph data (None/empty means lookup failed)
+        channel_count = graph_data.get("channel_count") if graph_data else None
+        recommendation = peer_intel.get("recommendation", "unknown")
+        capacity_sats = action.get("capacity_sats") or action.get("amount_sats", 0)
+
+        # Budget check (placeholder - could be configurable)
+        budget_limit = 10_000_000  # 10M sats default
+        within_budget = capacity_sats <= budget_limit
+
+        # Evaluate criteria
+        if recommendation == "avoid" or local_data.get("force_closes", 0) > 0:
+            decision = "reject"
+            reasoning.append(f"Peer has 'avoid' recommendation or force close history")
+        elif channel_count is None:
+            # Graph lookup failed - escalate instead of auto-rejecting
+            decision = "escalate"
+            reasoning.append("Could not retrieve peer's channel count from network graph")
+        elif channel_count < 10:
+            decision = "reject"
+            reasoning.append(f"Peer has only {channel_count} channels (<10 minimum)")
+        elif not within_budget:
+            decision = "reject"
+            reasoning.append(f"Capacity {capacity_sats:,} sats exceeds budget of {budget_limit:,} sats")
+        elif channel_count >= 15 and recommendation not in ("avoid", "caution"):
+            # Good peer with enough connectivity
+            if within_budget:
+                decision = "approve"
+                reasoning.append(f"Peer has {channel_count} channels (≥15)")
+                reasoning.append(f"Peer recommendation: {recommendation}")
+                reasoning.append(f"Capacity {capacity_sats:,} sats within budget")
+            else:
+                decision = "escalate"
+                reasoning.append(f"Good peer but capacity {capacity_sats:,} sats needs review")
+        else:
+            decision = "escalate"
+            reasoning.append(f"Peer has {channel_count} channels (10-15 range, needs review)")
+
+    elif action_type in ("fee_change", "set_fee"):
+        current_fee = action.get("current_fee_ppm", 0)
+        new_fee = action.get("new_fee_ppm") or action.get("fee_ppm", 0)
+
+        # Calculate percentage change
+        if current_fee > 0:
+            change_pct = abs(new_fee - current_fee) / current_fee * 100
+        else:
+            change_pct = 100 if new_fee > 0 else 0
+
+        # Evaluate criteria
+        if 50 <= new_fee <= 1500 and change_pct <= 25:
+            decision = "approve"
+            reasoning.append(f"Fee change from {current_fee} to {new_fee} ppm ({change_pct:.1f}% change)")
+            reasoning.append("Within acceptable range (50-1500 ppm, ≤25% change)")
+        elif new_fee < 50 or new_fee > 1500:
+            decision = "escalate"
+            reasoning.append(f"New fee {new_fee} ppm outside standard range (50-1500 ppm)")
+        else:
+            decision = "escalate"
+            reasoning.append(f"Fee change of {change_pct:.1f}% exceeds 25% threshold")
+
+    elif action_type in ("rebalance", "circular_rebalance"):
+        amount_sats = action.get("amount_sats", 0)
+        ev_positive = action.get("ev_positive", action.get("expected_value", 0) > 0)
+
+        # Evaluate criteria
+        if amount_sats <= 500_000 and ev_positive:
+            decision = "approve"
+            reasoning.append(f"Rebalance amount {amount_sats:,} sats (≤500k)")
+            reasoning.append("EV-positive expected")
+        elif amount_sats > 500_000:
+            decision = "escalate"
+            reasoning.append(f"Rebalance amount {amount_sats:,} sats exceeds 500k limit")
+        else:
+            decision = "escalate"
+            reasoning.append("Rebalance EV not clearly positive, needs review")
+
+    else:
+        decision = "escalate"
+        reasoning.append(f"Unknown action type '{action_type}', requires human review")
+
+    # Execute if not dry_run and decision is not escalate
+    if not dry_run and decision != "escalate":
+        db = ensure_advisor_db()
+        if decision == "approve":
+            result = await handle_approve_action({
+                "node": node_name,
+                "action_id": action_id,
+                "reason": f"Auto-approved: {'; '.join(reasoning)}"
+            })
+            action_executed = "error" not in result
+            if action_executed:
+                db.record_decision(
+                    decision_type="auto_approve",
+                    node_name=node_name,
+                    recommendation=f"Approved {action_type}",
+                    reasoning="; ".join(reasoning),
+                    peer_id=target
+                )
+        elif decision == "reject":
+            result = await handle_reject_action({
+                "node": node_name,
+                "action_id": action_id,
+                "reason": f"Auto-rejected: {'; '.join(reasoning)}"
+            })
+            action_executed = "error" not in result
+            if action_executed:
+                db.record_decision(
+                    decision_type="auto_reject",
+                    node_name=node_name,
+                    recommendation=f"Rejected {action_type}",
+                    reasoning="; ".join(reasoning),
+                    peer_id=target
+                )
+
+    return {
+        "node": node_name,
+        "action_id": action_id,
+        "action_type": action_type,
+        "decision": decision,
+        "reasoning": reasoning,
+        "dry_run": dry_run,
+        "action_executed": action_executed,
+        "ai_note": f"Decision: {decision.upper()}. {'; '.join(reasoning)}"
+    }
+
+
+async def handle_process_all_pending(args: Dict) -> Dict:
+    """Batch process all pending actions across the fleet."""
+    dry_run = args.get("dry_run", True)
+
+    # Get pending actions from all nodes
+    all_pending = await fleet.call_all("hive-pending-actions")
+
+    approved = []
+    rejected = []
+    escalated = []
+    errors = []
+    by_node = {}
+
+    for node_name, pending_result in all_pending.items():
+        by_node[node_name] = {
+            "approved": [],
+            "rejected": [],
+            "escalated": [],
+            "errors": []
+        }
+
+        if "error" in pending_result:
+            errors.append({"node": node_name, "error": pending_result["error"]})
+            by_node[node_name]["errors"].append(pending_result["error"])
+            continue
+
+        actions = pending_result.get("actions", [])
+
+        for action in actions:
+            action_id = action.get("action_id") or action.get("id")
+            if action_id is None:
+                continue
+
+            # Evaluate each action
+            eval_result = await handle_auto_evaluate_proposal({
+                "node": node_name,
+                "action_id": action_id,
+                "dry_run": dry_run
+            })
+
+            if "error" in eval_result:
+                errors.append({
+                    "node": node_name,
+                    "action_id": action_id,
+                    "error": eval_result["error"]
+                })
+                by_node[node_name]["errors"].append(eval_result["error"])
+                continue
+
+            decision = eval_result.get("decision", "escalate")
+            entry = {
+                "node": node_name,
+                "action_id": action_id,
+                "action_type": eval_result.get("action_type"),
+                "decision": decision,
+                "reasoning": eval_result.get("reasoning", []),
+                "executed": eval_result.get("action_executed", False)
+            }
+
+            if decision == "approve":
+                approved.append(entry)
+                by_node[node_name]["approved"].append(entry)
+            elif decision == "reject":
+                rejected.append(entry)
+                by_node[node_name]["rejected"].append(entry)
+            else:
+                escalated.append(entry)
+                by_node[node_name]["escalated"].append(entry)
+
+    return {
+        "dry_run": dry_run,
+        "summary": {
+            "total_processed": len(approved) + len(rejected) + len(escalated),
+            "approved_count": len(approved),
+            "rejected_count": len(rejected),
+            "escalated_count": len(escalated),
+            "error_count": len(errors)
+        },
+        "approved": approved,
+        "rejected": rejected,
+        "escalated": escalated,
+        "errors": errors if errors else None,
+        "by_node": by_node,
+        "ai_note": (
+            f"Processed {len(approved) + len(rejected) + len(escalated)} actions. "
+            f"Approved: {len(approved)}, Rejected: {len(rejected)}, "
+            f"Escalated (need human review): {len(escalated)}"
+            + (" [DRY RUN - no actions executed]" if dry_run else "")
+        )
+    }
+
+
+async def handle_stagnant_channels(args: Dict) -> Dict:
+    """List channels with high local balance (stagnant) with enriched context."""
+    node_name = args.get("node")
+    min_local_pct = args.get("min_local_pct", 95)
+    min_age_days = args.get("min_age_days", 0)
+
+    if not node_name:
+        return {"error": "node is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Gather data
+    try:
+        info_result, channels_result, forwards_result = await asyncio.gather(
+            node.call("getinfo"),
+            node.call("listpeerchannels"),
+            node.call("listforwards", {"status": "settled"}),
+            return_exceptions=True
+        )
+    except Exception as e:
+        return {"error": f"Failed to gather data: {e}"}
+
+    if isinstance(info_result, Exception):
+        return {"error": f"Failed to get node info: {info_result}"}
+
+    current_blockheight = info_result.get("blockheight", 0)
+
+    if isinstance(channels_result, Exception):
+        channels_result = {"channels": []}
+    if isinstance(forwards_result, Exception):
+        forwards_result = {"forwards": []}
+
+    channels = channels_result.get("channels", [])
+    forwards = forwards_result.get("forwards", [])
+
+    # Build forward history by channel
+    import time as time_module
+    now = time_module.time()
+    forward_by_channel = {}
+    for fwd in forwards:
+        in_ch = fwd.get("in_channel")
+        out_ch = fwd.get("out_channel")
+        resolved_time = fwd.get("resolved_time", 0)
+        if in_ch:
+            if in_ch not in forward_by_channel or resolved_time > forward_by_channel[in_ch]:
+                forward_by_channel[in_ch] = resolved_time
+        if out_ch:
+            if out_ch not in forward_by_channel or resolved_time > forward_by_channel[out_ch]:
+                forward_by_channel[out_ch] = resolved_time
+
+    # Get nodes list for alias lookup
+    nodes_result = await node.call("listnodes")
+    alias_map = {}
+    if not isinstance(nodes_result, Exception) and "nodes" in nodes_result:
+        for n in nodes_result.get("nodes", []):
+            nid = n.get("nodeid")
+            alias = n.get("alias")
+            if nid and alias:
+                alias_map[nid] = alias
+
+    stagnant_channels = []
+
+    for ch in channels:
+        if ch.get("state") != "CHANNELD_NORMAL":
+            continue
+
+        scid = ch.get("short_channel_id", "")
+        peer_id = ch.get("peer_id", "")
+
+        # Calculate balances
+        totals = _channel_totals(ch)
+        total_msat = totals["total_msat"]
+        local_msat = totals["local_msat"]
+
+        if total_msat == 0:
+            continue
+
+        local_pct = (local_msat / total_msat) * 100
+
+        # Skip if not stagnant enough
+        if local_pct < min_local_pct:
+            continue
+
+        # Calculate channel age
+        channel_age_days = _scid_to_age_days(scid, current_blockheight)
+
+        # Skip if too young
+        if channel_age_days is not None and channel_age_days < min_age_days:
+            continue
+
+        # Get last forward time
+        last_forward_ts = forward_by_channel.get(scid, 0)
+        days_since_forward = None
+        if last_forward_ts > 0:
+            days_since_forward = (now - last_forward_ts) / 86400
+
+        # Get peer intel
+        peer_intel = await handle_advisor_get_peer_intel({"peer_id": peer_id})
+        peer_quality = peer_intel.get("recommendation", "unknown")
+        local_exp = peer_intel.get("local_experience", {}) or {}
+        graph_data = peer_intel.get("network_graph", {}) or {}
+
+        # Get current fee
+        updates = ch.get("updates", {})
+        local_updates = updates.get("local", {})
+        current_fee_ppm = local_updates.get("fee_proportional_millionths", 0)
+
+        # Determine recommendation
+        recommendation = "wait"
+        reasoning = ""
+
+        if channel_age_days is not None and channel_age_days < 30:
+            recommendation = "wait"
+            reasoning = f"Channel only {channel_age_days} days old, too young to judge"
+        elif peer_quality == "avoid":
+            recommendation = "close"
+            reasoning = "Peer has 'avoid' rating - consider closing"
+        elif channel_age_days is not None and channel_age_days > 90:
+            if peer_quality in ("neutral", "unknown"):
+                recommendation = "static_policy"
+                reasoning = f"Stagnant for {channel_age_days} days with neutral peer - apply static low-fee policy"
+            else:
+                recommendation = "fee_reduction"
+                reasoning = f"Stagnant for {channel_age_days} days - try fee reduction to attract flow"
+        elif channel_age_days is not None and 30 <= channel_age_days <= 90:
+            if peer_quality not in ("avoid", "caution"):
+                recommendation = "fee_reduction"
+                reasoning = f"Stagnant for {channel_age_days} days - try fee reduction to 50ppm"
+            else:
+                recommendation = "wait"
+                reasoning = f"Peer has '{peer_quality}' rating, monitor before action"
+        else:
+            recommendation = "wait"
+            reasoning = "Insufficient data for recommendation"
+
+        stagnant_channels.append({
+            "channel_id": scid,
+            "peer_id": peer_id,
+            "peer_alias": alias_map.get(peer_id, local_exp.get("alias", "")),
+            "capacity_sats": total_msat // 1000,
+            "local_pct": round(local_pct, 1),
+            "channel_age_days": channel_age_days,
+            "days_since_last_forward": round(days_since_forward, 1) if days_since_forward else None,
+            "peer_quality": peer_quality,
+            "peer_channel_count": graph_data.get("channel_count", 0),
+            "current_fee_ppm": current_fee_ppm,
+            "recommendation": recommendation,
+            "reasoning": reasoning
+        })
+
+    # Sort by local_pct descending, then by age
+    stagnant_channels.sort(key=lambda x: (-x["local_pct"], -(x["channel_age_days"] or 0)))
+
+    return {
+        "node": node_name,
+        "min_local_pct": min_local_pct,
+        "min_age_days": min_age_days,
+        "stagnant_count": len(stagnant_channels),
+        "channels": stagnant_channels,
+        "ai_note": (
+            f"Found {len(stagnant_channels)} stagnant channels (≥{min_local_pct}% local balance). "
+            f"Recommendations: "
+            f"{sum(1 for c in stagnant_channels if c['recommendation'] == 'close')} close, "
+            f"{sum(1 for c in stagnant_channels if c['recommendation'] == 'fee_reduction')} fee_reduction, "
+            f"{sum(1 for c in stagnant_channels if c['recommendation'] == 'static_policy')} static_policy, "
+            f"{sum(1 for c in stagnant_channels if c['recommendation'] == 'wait')} wait"
+        )
+    }
+
+
+async def handle_remediate_stagnant(args: Dict) -> Dict:
+    """Auto-remediate stagnant channels based on age and peer quality."""
+    node_name = args.get("node")
+    dry_run = args.get("dry_run", True)
+
+    if not node_name:
+        return {"error": "node is required"}
+
+    # Get stagnant channels
+    stagnant_result = await handle_stagnant_channels({
+        "node": node_name,
+        "min_local_pct": 95,
+        "min_age_days": 0
+    })
+
+    if "error" in stagnant_result:
+        return stagnant_result
+
+    channels = stagnant_result.get("channels", [])
+    db = ensure_advisor_db()
+
+    actions_taken = []
+    channels_skipped = []
+    flagged_for_review = []
+
+    for ch in channels:
+        scid = ch.get("channel_id")
+        peer_id = ch.get("peer_id")
+        peer_alias = ch.get("peer_alias", "")
+        age_days = ch.get("channel_age_days")
+        peer_quality = ch.get("peer_quality", "unknown")
+        recommendation = ch.get("recommendation")
+        current_fee = ch.get("current_fee_ppm", 0)
+
+        action = None
+        action_detail = {}
+
+        # Apply remediation rules
+        if age_days is not None and age_days < 30:
+            # Too young - skip
+            channels_skipped.append({
+                "channel_id": scid,
+                "peer_alias": peer_alias,
+                "reason": f"Too young ({age_days} days < 30 day threshold)"
+            })
+            continue
+
+        if peer_quality == "avoid":
+            # Flag for close review, never auto-close
+            flagged_for_review.append({
+                "channel_id": scid,
+                "peer_id": peer_id,
+                "peer_alias": peer_alias,
+                "peer_quality": peer_quality,
+                "age_days": age_days,
+                "reason": "Peer has 'avoid' rating - manual close review needed"
+            })
+            continue
+
+        if age_days is not None and 30 <= age_days <= 90:
+            if peer_quality in ("neutral", "good", "excellent", "unknown"):
+                # Reduce fee to 50ppm to attract flow
+                if current_fee > 50:
+                    action = "fee_reduction"
+                    action_detail = {
+                        "channel_id": scid,
+                        "peer_alias": peer_alias,
+                        "old_fee_ppm": current_fee,
+                        "new_fee_ppm": 50,
+                        "reason": f"Stagnant {age_days} days, reducing fee to attract flow"
+                    }
+                else:
+                    channels_skipped.append({
+                        "channel_id": scid,
+                        "peer_alias": peer_alias,
+                        "reason": f"Fee already low ({current_fee} ppm)"
+                    })
+                    continue
+
+        elif age_days is not None and age_days > 90:
+            if peer_quality in ("neutral", "unknown"):
+                # Apply static policy, disable rebalance
+                action = "static_policy"
+                action_detail = {
+                    "channel_id": scid,
+                    "peer_id": peer_id,
+                    "peer_alias": peer_alias,
+                    "strategy": "static",
+                    "fee_ppm": 50,
+                    "rebalance": "disabled",
+                    "reason": f"Stagnant {age_days} days with neutral peer - applying static policy"
+                }
+            elif peer_quality in ("good", "excellent"):
+                # Good peer but stagnant - try fee reduction first
+                if current_fee > 50:
+                    action = "fee_reduction"
+                    action_detail = {
+                        "channel_id": scid,
+                        "peer_alias": peer_alias,
+                        "old_fee_ppm": current_fee,
+                        "new_fee_ppm": 50,
+                        "reason": f"Stagnant {age_days} days, trying fee reduction before static policy"
+                    }
+                else:
+                    action = "static_policy"
+                    action_detail = {
+                        "channel_id": scid,
+                        "peer_id": peer_id,
+                        "peer_alias": peer_alias,
+                        "strategy": "static",
+                        "fee_ppm": 50,
+                        "rebalance": "disabled",
+                        "reason": f"Stagnant {age_days} days, fee already low - applying static policy"
+                    }
+
+        # Execute action if not dry_run
+        if action and not dry_run:
+            try:
+                if action == "fee_reduction":
+                    result = await handle_revenue_set_fee({
+                        "node": node_name,
+                        "channel_id": scid,
+                        "fee_ppm": 50
+                    })
+                    action_detail["executed"] = "error" not in result
+                    if "error" in result:
+                        action_detail["error"] = result["error"]
+                    else:
+                        db.record_decision(
+                            decision_type="auto_remediate_stagnant",
+                            node_name=node_name,
+                            channel_id=scid,
+                            recommendation=f"Fee reduction: {current_fee} -> 50 ppm",
+                            reasoning=action_detail["reason"]
+                        )
+
+                elif action == "static_policy":
+                    result = await handle_revenue_policy({
+                        "node": node_name,
+                        "action": "set",
+                        "peer_id": peer_id,
+                        "strategy": "static",
+                        "fee_ppm": 50,
+                        "rebalance": "disabled"
+                    })
+                    action_detail["executed"] = "error" not in result
+                    if "error" in result:
+                        action_detail["error"] = result["error"]
+                    else:
+                        db.record_decision(
+                            decision_type="auto_remediate_stagnant",
+                            node_name=node_name,
+                            channel_id=scid,
+                            peer_id=peer_id,
+                            recommendation=f"Applied static policy: 50ppm, rebalance disabled",
+                            reasoning=action_detail["reason"]
+                        )
+            except Exception as e:
+                action_detail["executed"] = False
+                action_detail["error"] = str(e)
+        elif action:
+            action_detail["executed"] = False
+            action_detail["dry_run"] = True
+
+        if action:
+            action_detail["action"] = action
+            actions_taken.append(action_detail)
+
+    return {
+        "node": node_name,
+        "dry_run": dry_run,
+        "summary": {
+            "total_stagnant": len(channels),
+            "actions_taken": len(actions_taken),
+            "channels_skipped": len(channels_skipped),
+            "flagged_for_review": len(flagged_for_review)
+        },
+        "actions_taken": actions_taken,
+        "channels_skipped": channels_skipped,
+        "flagged_for_review": flagged_for_review,
+        "ai_note": (
+            f"Processed {len(channels)} stagnant channels. "
+            f"Actions: {len(actions_taken)}, Skipped: {len(channels_skipped)}, "
+            f"Flagged for review: {len(flagged_for_review)}"
+            + (" [DRY RUN - no changes made]" if dry_run else "")
+        )
+    }
+
+
+async def handle_execute_safe_opportunities(args: Dict) -> Dict:
+    """Execute opportunities marked as auto_execute_safe."""
+    node_name = args.get("node")
+    dry_run = args.get("dry_run", True)
+
+    if not node_name:
+        return {"error": "node is required"}
+
+    # Scan for opportunities
+    scan_result = await handle_advisor_scan_opportunities({"node": node_name})
+
+    if "error" in scan_result:
+        return scan_result
+
+    opportunities = scan_result.get("opportunities", [])
+    auto_safe_count = scan_result.get("auto_execute_safe", 0)
+
+    db = ensure_advisor_db()
+    executed = []
+    skipped = []
+
+    for opp in opportunities:
+        # Check if marked as auto-safe
+        is_safe = opp.get("auto_execute_safe", False)
+        opp_type = opp.get("type") or opp.get("opportunity_type", "unknown")
+        channel_id = opp.get("channel_id")
+        peer_id = opp.get("peer_id")
+
+        if not is_safe:
+            skipped.append({
+                "type": opp_type,
+                "channel_id": channel_id,
+                "reason": "Not marked as auto_execute_safe"
+            })
+            continue
+
+        # Execute based on opportunity type
+        action_result = None
+        action_detail = {
+            "type": opp_type,
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "details": opp
+        }
+
+        # Determine action category from action_type or opportunity_type
+        action_type = opp.get("action_type", "")
+
+        if not dry_run:
+            try:
+                # Fee change opportunities (match by action_type or specific opportunity_type)
+                if action_type == "fee_change" or opp_type in (
+                    "fee_adjustment", "fee_change", "hill_climb_fee",
+                    "stagnant_channel", "peak_hour_fee", "low_hour_fee",
+                    "critical_saturation", "competitor_undercut",
+                    "pheromone_fee_adjust", "stigmergic_coordination",
+                    "fleet_consensus_fee", "bleeder_fix", "imbalanced_channel"
+                ):
+                    rec_fee = opp.get("recommended_fee")
+                    new_fee = rec_fee if rec_fee is not None else opp.get("new_fee_ppm")
+
+                    # Calculate fee from current state if not explicitly set
+                    if not new_fee and channel_id:
+                        current_state = opp.get("current_state", {})
+                        fee_ppm_val = current_state.get("fee_ppm")
+                        current_fee = fee_ppm_val if fee_ppm_val is not None else current_state.get("fee_per_millionth", 0)
+
+                        if opp_type == "stagnant_channel":
+                            # Stagnant: reduce to 50 ppm floor (match remediation logic)
+                            new_fee = max(50, int(current_fee * 0.7)) if current_fee > 50 else 50
+                        elif opp_type == "critical_saturation":
+                            # Saturated: reduce by 20% to encourage outflow
+                            new_fee = max(25, int(current_fee * 0.8)) if current_fee else None
+                        elif opp_type == "peak_hour_fee":
+                            # Peak: increase by 15%
+                            new_fee = min(5000, int(current_fee * 1.15)) if current_fee else None
+                        elif opp_type in ("low_hour_fee", "competitor_undercut"):
+                            # Low hour / undercut: reduce by 10%
+                            new_fee = max(25, int(current_fee * 0.9)) if current_fee else None
+                        elif current_fee:
+                            # Generic fee change: reduce by 15%
+                            new_fee = max(25, int(current_fee * 0.85))
+
+                    if new_fee and channel_id:
+                        # Enforce hard bounds (safety constraints)
+                        new_fee = max(25, min(5000, int(new_fee)))
+                        action_result = await handle_revenue_set_fee({
+                            "node": node_name,
+                            "channel_id": channel_id,
+                            "fee_ppm": new_fee
+                        })
+                        action_detail["action"] = "revenue_set_fee"
+                        action_detail["new_fee_ppm"] = new_fee
+                    else:
+                        action_detail["action"] = "skipped_no_fee"
+                        action_result = {"skipped": True, "reason": f"No target fee for {opp_type}"}
+
+                elif opp_type in ("time_based_fee",):
+                    # Time-based fees are usually handled by the plugin automatically
+                    action_detail["action"] = "time_fee_handled_by_plugin"
+                    action_result = {"message": "Time-based fees handled automatically by plugin"}
+
+                elif action_type == "rebalance" or opp_type in ("rebalance", "circular_rebalance", "preemptive_rebalance"):
+                    amount = opp.get("amount_sats", 0)
+                    if amount <= 500_000:  # Only execute small rebalances
+                        source = opp.get("source_channel")
+                        dest = opp.get("dest_channel")
+                        if source and dest:
+                            action_result = await handle_execute_hive_circular_rebalance({
+                                "node": node_name,
+                                "source_channel": source,
+                                "dest_channel": dest,
+                                "amount_sats": amount,
+                                "dry_run": False
+                            })
+                            action_detail["action"] = "circular_rebalance"
+                    else:
+                        action_detail["action"] = "skipped_large_rebalance"
+                        action_result = {"skipped": True, "reason": f"Amount {amount} > 500k limit"}
+
+                else:
+                    action_detail["action"] = "no_handler"
+                    action_result = {"skipped": True, "reason": f"No handler for type {opp_type}"}
+
+                if action_result:
+                    action_detail["result"] = action_result
+                    action_detail["executed"] = "error" not in action_result and not action_result.get("skipped")
+
+                    # Log to advisor DB
+                    if action_detail.get("executed"):
+                        db.record_decision(
+                            decision_type="auto_execute_safe",
+                            node_name=node_name,
+                            channel_id=channel_id,
+                            peer_id=peer_id,
+                            recommendation=f"Executed {opp_type}",
+                            reasoning=f"Auto-safe opportunity: {opp.get('description', opp_type)}",
+                            predicted_benefit=opp.get("benefit_sats")
+                        )
+
+            except Exception as e:
+                action_detail["executed"] = False
+                action_detail["error"] = str(e)
+
+        else:
+            action_detail["executed"] = False
+            action_detail["dry_run"] = True
+
+        executed.append(action_detail)
+
+    executed_count = sum(1 for e in executed if e.get("executed", False))
+
+    return {
+        "node": node_name,
+        "dry_run": dry_run,
+        "total_opportunities": len(opportunities),
+        "auto_safe_available": auto_safe_count,
+        "executed_count": executed_count,
+        "skipped_count": len(skipped),
+        "executed": executed,
+        "skipped": skipped if skipped else None,
+        "ai_note": (
+            f"Processed {len(opportunities)} opportunities. "
+            f"Executed: {executed_count}, Skipped: {len(skipped)}"
+            + (" [DRY RUN - no changes made]" if dry_run else "")
+        )
+    }
 
 
 # =============================================================================
@@ -8952,11 +11865,1355 @@ async def handle_mcf_health(args: Dict) -> Dict:
 
 
 # =============================================================================
+# Phase 4: Membership & Settlement Handlers (Hex Automation)
+# =============================================================================
+
+async def handle_membership_dashboard(args: Dict) -> Dict:
+    """Get unified membership lifecycle view."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Gather data from multiple sources in parallel
+    try:
+        members_data, neophyte_rankings, nnlb_data, pending_promos, pending_bans = await asyncio.gather(
+            node.call("hive-members"),
+            node.call("hive-neophyte-rankings", {}),
+            node.call("hive-nnlb-status", {}),
+            node.call("hive-pending-promotions", {}),
+            node.call("hive-pending-bans", {}),
+            return_exceptions=True,
+        )
+    except Exception as e:
+        return {"error": f"Failed to gather membership data: {e}"}
+
+    # Process members
+    members_list = []
+    if not isinstance(members_data, Exception):
+        members_list = members_data.get("members", [])
+
+    member_count = len([m for m in members_list if m.get("tier") == "member"])
+    neophyte_count = len([m for m in members_list if m.get("tier") == "neophyte"])
+
+    # Process neophyte rankings
+    neophytes_info = {"count": neophyte_count, "rankings": [], "promotion_eligible": 0, "fast_track_eligible": 0}
+    if not isinstance(neophyte_rankings, Exception):
+        rankings = neophyte_rankings.get("rankings", [])
+        neophytes_info["rankings"] = rankings[:5]  # Top 5
+        neophytes_info["promotion_eligible"] = neophyte_rankings.get("eligible_for_promotion", 0)
+        neophytes_info["fast_track_eligible"] = neophyte_rankings.get("fast_track_eligible", 0)
+
+    # Process NNLB status for member health
+    members_health = {"count": member_count, "health_distribution": {}, "struggling_members": []}
+    if not isinstance(nnlb_data, Exception):
+        members_health["health_distribution"] = nnlb_data.get("health_distribution", {})
+        members_health["struggling_members"] = nnlb_data.get("struggling_members", [])[:3]  # Top 3
+
+    # Process pending actions
+    pending_actions = {"pending_promotions": 0, "pending_bans": 0}
+    if not isinstance(pending_promos, Exception):
+        pending_actions["pending_promotions"] = len(pending_promos.get("proposals", []))
+    if not isinstance(pending_bans, Exception):
+        pending_actions["pending_bans"] = len(pending_bans.get("proposals", []))
+
+    # Check for onboarding needs (members without recent channel suggestions)
+    db = ensure_advisor_db()
+    onboarding_needed = []
+    for member in members_list:
+        pubkey = member.get("pubkey") or member.get("peer_id")
+        if pubkey and not db.is_member_onboarded(pubkey):
+            onboarding_needed.append({
+                "pubkey": pubkey[:16] + "...",
+                "alias": member.get("alias", ""),
+                "tier": member.get("tier", "unknown")
+            })
+
+    # Build AI note
+    notes = []
+    if neophytes_info["promotion_eligible"] > 0:
+        notes.append(f"{neophytes_info['promotion_eligible']} neophyte(s) ready for promotion!")
+    if members_health["struggling_members"]:
+        notes.append(f"{len(members_health['struggling_members'])} member(s) struggling (NNLB).")
+    if pending_actions["pending_promotions"] > 0:
+        notes.append(f"{pending_actions['pending_promotions']} promotion vote(s) pending.")
+    if onboarding_needed:
+        notes.append(f"{len(onboarding_needed)} member(s) need onboarding.")
+
+    return {
+        "node": node_name,
+        "neophytes": neophytes_info,
+        "members": members_health,
+        "pending_actions": pending_actions,
+        "onboarding_needed": onboarding_needed[:5],
+        "onboarding_needed_count": len(onboarding_needed),
+        "ai_note": " ".join(notes) if notes else "Membership health is good. No urgent actions needed."
+    }
+
+
+async def handle_check_neophytes(args: Dict) -> Dict:
+    """Check for promotion-ready neophytes and optionally propose promotions."""
+    node_name = args.get("node")
+    dry_run = args.get("dry_run", True)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Get neophyte rankings and pending promotions in parallel
+    try:
+        rankings_data, pending_data = await asyncio.gather(
+            node.call("hive-neophyte-rankings", {}),
+            node.call("hive-pending-promotions", {}),
+        )
+    except Exception as e:
+        return {"error": f"Failed to get neophyte data: {e}"}
+
+    if "error" in rankings_data:
+        return rankings_data
+
+    rankings = rankings_data.get("rankings", [])
+    pending_proposals = pending_data.get("proposals", []) if "error" not in pending_data else []
+
+    # Build set of already-pending pubkeys
+    pending_pubkeys = set()
+    for prop in pending_proposals:
+        target = prop.get("target_peer_id") or prop.get("target")
+        if target:
+            pending_pubkeys.add(target)
+
+    # Process each neophyte
+    proposed_count = 0
+    already_pending_count = 0
+    details = []
+
+    for neo in rankings:
+        peer_id = neo.get("peer_id")
+        peer_id_short = neo.get("peer_id_short", peer_id[:16] + "..." if peer_id else "?")
+        is_eligible = neo.get("eligible", False)
+        is_fast_track = neo.get("fast_track_eligible", False)
+        readiness = neo.get("readiness_score", 0)
+
+        detail = {
+            "peer_id_short": peer_id_short,
+            "readiness_score": readiness,
+            "eligible": is_eligible,
+            "fast_track_eligible": is_fast_track,
+            "status": "not_eligible"
+        }
+
+        if not (is_eligible or is_fast_track):
+            detail["blocking_reasons"] = neo.get("blocking_reasons", [])
+            details.append(detail)
+            continue
+
+        # Check if already pending
+        if peer_id in pending_pubkeys:
+            detail["status"] = "already_pending"
+            already_pending_count += 1
+            details.append(detail)
+            continue
+
+        # Eligible and not pending - propose if not dry run
+        if dry_run:
+            detail["status"] = "would_propose"
+            proposed_count += 1
+        else:
+            try:
+                # Get our pubkey as proposer
+                info = await node.call("getinfo")
+                proposer_id = info.get("id")
+
+                result = await node.call("hive-propose-promotion", {
+                    "target_peer_id": peer_id,
+                    "proposer_peer_id": proposer_id
+                })
+
+                if "error" in result:
+                    detail["status"] = "proposal_failed"
+                    detail["error"] = result.get("error")
+                else:
+                    detail["status"] = "proposed"
+                    proposed_count += 1
+            except Exception as e:
+                detail["status"] = "proposal_failed"
+                detail["error"] = str(e) or type(e).__name__
+
+        details.append(detail)
+
+    ai_note = f"Checked {len(rankings)} neophyte(s). "
+    if proposed_count > 0:
+        ai_note += f"{'Would propose' if dry_run else 'Proposed'} {proposed_count} for promotion. "
+    if already_pending_count > 0:
+        ai_note += f"{already_pending_count} already pending. "
+    if dry_run and proposed_count > 0:
+        ai_note += "Run with dry_run=false to execute."
+
+    return {
+        "node": node_name,
+        "dry_run": dry_run,
+        "neophyte_count": len(rankings),
+        "proposed_count": proposed_count,
+        "already_pending_count": already_pending_count,
+        "details": details,
+        "ai_note": ai_note
+    }
+
+
+async def handle_settlement_readiness(args: Dict) -> Dict:
+    """Pre-settlement validation check."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    blockers = []
+    missing_offers = []
+    low_participation = []
+
+    # Gather required data in parallel
+    try:
+        members_data, offers_data, participation_data, calc_data = await asyncio.gather(
+            node.call("hive-members"),
+            node.call("hive-settlement-list-offers", {}),
+            node.call("hive-distributed-settlement-participation", {"periods": 10}),
+            node.call("hive-settlement-calculate", {}),
+            return_exceptions=True,
+        )
+    except Exception as e:
+        return {"error": f"Failed to gather settlement data: {e}"}
+
+    # Check members have BOLT12 offers
+    members_list = []
+    if not isinstance(members_data, Exception):
+        members_list = members_data.get("members", [])
+
+    offers_set = set()
+    if not isinstance(offers_data, Exception):
+        for offer in offers_data.get("offers", []):
+            peer_id = offer.get("peer_id") or offer.get("member_id")
+            if peer_id:
+                offers_set.add(peer_id)
+
+    for member in members_list:
+        pubkey = member.get("pubkey") or member.get("peer_id")
+        if pubkey and pubkey not in offers_set:
+            missing_offers.append({
+                "pubkey": pubkey[:16] + "...",
+                "alias": member.get("alias", "")
+            })
+
+    if missing_offers:
+        blockers.append(f"{len(missing_offers)} member(s) missing BOLT12 offers")
+
+    # Check participation history
+    if not isinstance(participation_data, Exception):
+        for member in participation_data.get("members", []):
+            vote_rate = member.get("vote_rate", 100)
+            exec_rate = member.get("execution_rate", 100)
+            if vote_rate < 50 or exec_rate < 50:
+                low_participation.append({
+                    "pubkey": (member.get("peer_id", "")[:16] + "...") if member.get("peer_id") else "?",
+                    "vote_rate": vote_rate,
+                    "execution_rate": exec_rate
+                })
+
+    if low_participation:
+        blockers.append(f"{len(low_participation)} member(s) with <50% participation")
+
+    # Get expected distribution
+    expected_distribution = []
+    total_to_distribute = 0
+    if not isinstance(calc_data, Exception) and "error" not in calc_data:
+        total_to_distribute = calc_data.get("total_to_distribute_sats", 0)
+        for dist in calc_data.get("distributions", []):
+            expected_distribution.append({
+                "member": dist.get("alias") or (dist.get("peer_id", "")[:16] + "..."),
+                "amount_sats": dist.get("amount_sats", 0),
+                "contribution_pct": dist.get("contribution_pct", 0)
+            })
+
+    if total_to_distribute == 0:
+        blockers.append("No funds to distribute (pool empty)")
+
+    # Determine readiness
+    ready = len(blockers) == 0
+    if ready:
+        recommendation = "settle_now"
+    elif len(blockers) == 1 and "participation" in blockers[0]:
+        recommendation = "wait"  # Low participation is a soft blocker
+    else:
+        recommendation = "fix_blockers"
+
+    ai_note = ""
+    if ready:
+        ai_note = f"Ready to settle! {total_to_distribute:,} sats to distribute among {len(expected_distribution)} members."
+    else:
+        ai_note = f"Settlement blocked: {'; '.join(blockers)}. "
+        if recommendation == "wait":
+            ai_note += "Consider proceeding anyway if participation issues are acceptable."
+
+    return {
+        "node": node_name,
+        "ready": ready,
+        "blockers": blockers,
+        "missing_offers": missing_offers,
+        "low_participation": low_participation,
+        "expected_distribution": expected_distribution[:10],  # Top 10
+        "total_to_distribute_sats": total_to_distribute,
+        "recommendation": recommendation,
+        "ai_note": ai_note
+    }
+
+
+async def handle_run_settlement_cycle(args: Dict) -> Dict:
+    """Execute a full settlement cycle."""
+    import time
+    from datetime import datetime
+
+    node_name = args.get("node")
+    dry_run = args.get("dry_run", True)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Determine current period
+    now = datetime.utcnow()
+    period = f"{now.year}-W{now.isocalendar()[1]:02d}"
+
+    # Step 1: Record contribution snapshot
+    snapshot_result = None
+    try:
+        snapshot_result = await node.call("hive-pool-snapshot", {})
+    except Exception as e:
+        logger.warning(f"Pool snapshot failed: {e}")
+
+    snapshot_recorded = snapshot_result is not None and "error" not in snapshot_result
+
+    # Step 2: Calculate distribution
+    try:
+        calc_result = await node.call("hive-settlement-calculate", {})
+    except Exception as e:
+        return {"error": f"Settlement calculation failed: {e}"}
+
+    if "error" in calc_result:
+        return calc_result
+
+    total_to_distribute = calc_result.get("total_to_distribute_sats", 0)
+    distributions = calc_result.get("distributions", [])
+
+    per_member_breakdown = []
+    for dist in distributions:
+        per_member_breakdown.append({
+            "member": dist.get("alias") or (dist.get("peer_id", "")[:16] + "..."),
+            "peer_id_short": (dist.get("peer_id", "")[:16] + "...") if dist.get("peer_id") else "?",
+            "amount_sats": dist.get("amount_sats", 0),
+            "contribution_pct": dist.get("contribution_pct", 0)
+        })
+
+    # Step 3: Execute if not dry run
+    total_distributed = 0
+    execution_result = None
+    if not dry_run and total_to_distribute > 0:
+        try:
+            execution_result = await node.call("hive-settlement-execute", {"dry_run": False})
+            if "error" not in execution_result:
+                total_distributed = execution_result.get("total_distributed_sats", total_to_distribute)
+        except Exception as e:
+            return {"error": f"Settlement execution failed: {e}"}
+
+    ai_note = f"Settlement cycle for {period}. "
+    if dry_run:
+        ai_note += f"DRY RUN: Would distribute {total_to_distribute:,} sats among {len(per_member_breakdown)} members. "
+        ai_note += "Run with dry_run=false to execute."
+    else:
+        if total_distributed > 0:
+            ai_note += f"Distributed {total_distributed:,} sats to {len(per_member_breakdown)} members."
+        else:
+            ai_note += "No funds were distributed (pool may be empty)."
+
+    return {
+        "node": node_name,
+        "period": period,
+        "dry_run": dry_run,
+        "snapshot_recorded": snapshot_recorded,
+        "total_calculated_sats": total_to_distribute,
+        "total_distributed_sats": total_distributed if not dry_run else 0,
+        "per_member_breakdown": per_member_breakdown,
+        "execution_result": execution_result if not dry_run else None,
+        "ai_note": ai_note
+    }
+
+
+# =============================================================================
+# Phase 5: Monitoring & Health Handlers (Hex Automation)
+# =============================================================================
+
+async def handle_fleet_health_summary(args: Dict) -> Dict:
+    """Quick fleet health overview for monitoring."""
+    node_name = args.get("node")
+
+    # If specific node, just query that one
+    if node_name:
+        nodes_to_check = [fleet.get_node(node_name)]
+        if not nodes_to_check[0]:
+            return {"error": f"Unknown node: {node_name}"}
+    else:
+        nodes_to_check = list(fleet.nodes.values())
+
+    nodes_status = {}
+    channel_stats = {"profitable": 0, "underwater": 0, "stagnant": 0, "total": 0}
+    routing_24h = {"volume_sats": 0, "revenue_sats": 0, "forward_count": 0}
+    alerts_by_severity = {"critical": 0, "warning": 0, "info": 0}
+    mcf_status = {}
+    nnlb_struggling = []
+    seen_struggling_peers = set()  # For deduplication across nodes
+
+    for node in nodes_to_check:
+        # Gather data for this node in parallel
+        try:
+            info, channels, dashboard, prof, mcf, nnlb, conn_alerts = await asyncio.gather(
+                node.call("getinfo"),
+                node.call("listpeerchannels"),
+                node.call("revenue-dashboard", {"window_days": 1}),
+                node.call("revenue-profitability", {}),
+                node.call("hive-mcf-status", {}),
+                node.call("hive-nnlb-status", {}),
+                node.call("hive-connectivity-alerts", {}),
+                return_exceptions=True,
+            )
+        except Exception as e:
+            nodes_status[node.name] = {"status": "error", "error": str(e)}
+            continue
+
+        # Node status
+        node_status = {"status": "online"}
+        if isinstance(info, Exception) or "error" in info:
+            node_status["status"] = "offline"
+            node_status["error"] = str(info) if isinstance(info, Exception) else info.get("error")
+        else:
+            node_status["alias"] = info.get("alias", "")
+            node_status["blockheight"] = info.get("blockheight", 0)
+
+        # Channel count and capacity
+        if not isinstance(channels, Exception):
+            ch_list = channels.get("channels", [])
+            node_status["channel_count"] = len(ch_list)
+            total_cap = sum(_channel_totals(ch)["total_msat"] for ch in ch_list) // 1000
+            node_status["total_capacity_sats"] = total_cap
+
+        nodes_status[node.name] = node_status
+
+        # Profitability distribution - use summary from revenue-profitability
+        if not isinstance(prof, Exception) and "error" not in prof:
+            summary = prof.get("summary", {})
+            if summary:
+                # Use pre-computed summary stats
+                channel_stats["total"] += summary.get("total_channels", 0)
+                channel_stats["profitable"] += summary.get("profitable_count", 0)
+                channel_stats["underwater"] += summary.get("underwater_count", 0)
+                channel_stats["stagnant"] += summary.get("stagnant_candidate_count", 0) + summary.get("zombie_count", 0)
+            else:
+                # Fallback to iterating channels if summary not available
+                for ch in prof.get("channels", []):
+                    channel_stats["total"] += 1
+                    classification = ch.get("profitability_class", "unknown")
+                    if classification in ("profitable", "strong"):
+                        channel_stats["profitable"] += 1
+                    elif classification in ("bleeder", "underwater"):
+                        channel_stats["underwater"] += 1
+                    elif classification == "zombie":
+                        channel_stats["stagnant"] += 1
+
+        # 24h routing stats
+        if not isinstance(dashboard, Exception) and "error" not in dashboard:
+            period = dashboard.get("period", {})
+            routing_24h["volume_sats"] += period.get("volume_sats", 0)
+            routing_24h["revenue_sats"] += period.get("gross_revenue_sats", 0) or 0
+            routing_24h["forward_count"] += period.get("forward_count", 0)
+
+        # MCF status (use first node's status)
+        if not mcf_status and not isinstance(mcf, Exception) and "error" not in mcf:
+            mcf_status = {
+                "enabled": mcf.get("enabled", False),
+                "circuit_breaker_state": mcf.get("circuit_breaker_state", "unknown"),
+                "is_healthy": mcf.get("is_healthy", True)
+            }
+
+        # NNLB struggling members (dedupe by peer_id, derive issue from health)
+        if not isinstance(nnlb, Exception) and "error" not in nnlb:
+            for member in nnlb.get("struggling_members", []):
+                peer_id = member.get("peer_id", "")
+                health = member.get("health", 0)
+                # Derive issue from health score
+                if health < 20:
+                    issue = "critical"
+                elif health < 40:
+                    issue = "low_health"
+                else:
+                    issue = "below_threshold"
+                # Dedupe: only add if not already seen (first node wins)
+                if peer_id and peer_id not in seen_struggling_peers:
+                    seen_struggling_peers.add(peer_id)
+                    nnlb_struggling.append({
+                        "peer_id": peer_id[:16] + "...",  # Truncated for readability
+                        "health": health,
+                        "issue": issue,
+                        "reporting_node": node.name
+                    })
+
+        # Connectivity alerts
+        if not isinstance(conn_alerts, Exception) and "error" not in conn_alerts:
+            alerts_by_severity["critical"] += conn_alerts.get("critical_count", 0)
+            alerts_by_severity["warning"] += conn_alerts.get("warning_count", 0)
+            alerts_by_severity["info"] += conn_alerts.get("info_count", 0)
+
+    # Calculate percentages
+    total_channels = channel_stats["total"]
+    channel_distribution = {
+        "profitable_pct": round(channel_stats["profitable"] * 100 / total_channels, 1) if total_channels else 0,
+        "underwater_pct": round(channel_stats["underwater"] * 100 / total_channels, 1) if total_channels else 0,
+        "stagnant_pct": round(channel_stats["stagnant"] * 100 / total_channels, 1) if total_channels else 0,
+        "total_channels": total_channels
+    }
+
+    # Build AI note
+    notes = []
+    online_count = sum(1 for n in nodes_status.values() if n.get("status") == "online")
+    notes.append(f"{online_count}/{len(nodes_status)} nodes online.")
+
+    if routing_24h["forward_count"] > 0:
+        notes.append(f"24h: {routing_24h['forward_count']} forwards, {routing_24h['revenue_sats']:,} sats revenue.")
+
+    if alerts_by_severity["critical"] > 0:
+        notes.append(f"CRITICAL: {alerts_by_severity['critical']} alert(s)!")
+    elif alerts_by_severity["warning"] > 0:
+        notes.append(f"{alerts_by_severity['warning']} warning(s).")
+
+    if mcf_status.get("circuit_breaker_state") == "open":
+        notes.append("MCF circuit breaker OPEN!")
+
+    if nnlb_struggling:
+        notes.append(f"{len(nnlb_struggling)} member(s) struggling.")
+
+    return {
+        "nodes": nodes_status,
+        "channel_distribution": channel_distribution,
+        "routing_24h": routing_24h,
+        "alerts": alerts_by_severity,
+        "mcf_health": mcf_status,
+        "nnlb_struggling": nnlb_struggling[:5],
+        "ai_note": " ".join(notes)
+    }
+
+
+async def handle_routing_intelligence_health(args: Dict) -> Dict:
+    """Check routing intelligence data quality."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    import time
+
+    # Get routing intelligence status and channel list
+    try:
+        intel_status, channels_data = await asyncio.gather(
+            node.call("hive-routing-intelligence-status", {}),
+            node.call("listpeerchannels"),
+        )
+    except Exception as e:
+        return {"error": f"Failed to get routing intelligence: {e}"}
+
+    if "error" in intel_status:
+        return intel_status
+
+    # Calculate pheromone coverage
+    # Handle both nested (pheromones.channels) and flat (pheromone_levels) formats
+    pheromone_channels = intel_status.get("pheromone_levels", [])
+    if not pheromone_channels:
+        pheromones = intel_status.get("pheromones", {})
+        if isinstance(pheromones, dict):
+            pheromone_channels = pheromones.get("channels", [])
+        elif isinstance(pheromones, list):
+            pheromone_channels = pheromones
+    channels_with_data = intel_status.get("pheromone_channels", len(pheromone_channels))
+
+    total_channels = len(channels_data.get("channels", [])) if "error" not in channels_data else 0
+
+    # Check for stale data (>7 days old)
+    stale_threshold = time.time() - (7 * 24 * 3600)
+    stale_count = 0
+    for ch in pheromone_channels:
+        last_update = ch.get("last_update", 0) if isinstance(ch, dict) else 0
+        if last_update > 0 and last_update < stale_threshold:
+            stale_count += 1
+
+    coverage_pct = round(channels_with_data * 100 / total_channels, 1) if total_channels else 0
+
+    # Get stigmergic marker stats - handle both dict and list formats
+    markers_data = intel_status.get("stigmergic_markers", [])
+    if isinstance(markers_data, list):
+        active_markers = intel_status.get("active_markers", len(markers_data))
+        # Count unique corridors from markers
+        corridors = set()
+        for m in markers_data:
+            if isinstance(m, dict):
+                corridor = m.get("corridor") or m.get("corridor_id")
+                if corridor:
+                    corridors.add(corridor)
+        corridors_tracked = len(corridors)
+    else:
+        active_markers = markers_data.get("active_count", 0)
+        corridors_tracked = markers_data.get("corridors_tracked", 0)
+
+    # Determine health assessment
+    needs_backfill = channels_with_data == 0 or coverage_pct < 30
+    if needs_backfill:
+        recommendation = "needs_backfill"
+    elif stale_count > channels_with_data * 0.3:
+        recommendation = "partially_stale"
+    else:
+        recommendation = "healthy"
+
+    ai_note = f"Routing intelligence coverage: {coverage_pct}% ({channels_with_data}/{total_channels} channels). "
+    if stale_count > 0:
+        ai_note += f"{stale_count} channel(s) have stale data (>7 days). "
+    if needs_backfill:
+        ai_note += "Run hive_backfill_routing_intelligence to populate data."
+    elif recommendation == "partially_stale":
+        ai_note += "Some data is stale. Consider partial backfill."
+    else:
+        ai_note += "Data quality is healthy."
+
+    return {
+        "node": node_name,
+        "pheromone_coverage": {
+            "channels_with_data": channels_with_data,
+            "total_channels": total_channels,
+            "stale_count": stale_count,
+            "coverage_pct": coverage_pct
+        },
+        "stigmergic_markers": {
+            "active_count": active_markers,
+            "corridors_tracked": corridors_tracked
+        },
+        "needs_backfill": needs_backfill,
+        "recommendation": recommendation,
+        "ai_note": ai_note
+    }
+
+
+async def handle_advisor_channel_history_tool(args: Dict) -> Dict:
+    """Query past advisor decisions for a specific channel."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    days = args.get("days", 30)
+
+    if not node_name or not channel_id:
+        return {"error": "node and channel_id are required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Query advisor database for decisions on this channel
+    db = ensure_advisor_db()
+
+    import time
+    cutoff_ts = time.time() - (days * 24 * 3600)
+
+    decisions = db.get_decisions_for_channel(node_name, channel_id, since_ts=cutoff_ts)
+
+    # Analyze patterns
+    decision_types = {}
+    recommendations = {}
+    outcomes = {"improved": 0, "unchanged": 0, "worsened": 0, "unknown": 0}
+    timestamps = []
+
+    for dec in decisions:
+        # Count by type
+        dtype = dec.get("decision_type", "unknown")
+        decision_types[dtype] = decision_types.get(dtype, 0) + 1
+
+        # Count recommendations
+        rec = dec.get("recommendation", "")
+        if rec:
+            recommendations[rec] = recommendations.get(rec, 0) + 1
+
+        # Count outcomes
+        outcome = dec.get("outcome", "unknown")
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+
+        timestamps.append(dec.get("timestamp", 0))
+
+    # Detect repeated recommendations (same advice >2 times)
+    repeated = [r for r, count in recommendations.items() if count > 2]
+
+    # Detect conflicting decisions (back-and-forth)
+    conflicting = []
+    if "fee_increase" in decision_types and "fee_decrease" in decision_types:
+        conflicting.append("fee_increase vs fee_decrease")
+
+    # Calculate decision frequency
+    decision_frequency_days = None
+    if len(timestamps) >= 2:
+        timestamps.sort()
+        avg_gap = (timestamps[-1] - timestamps[0]) / (len(timestamps) - 1)
+        decision_frequency_days = round(avg_gap / 86400, 1)
+
+    ai_note = f"Found {len(decisions)} decision(s) for channel {channel_id} in last {days} days. "
+    if repeated:
+        ai_note += f"Repeated recommendations: {', '.join(repeated)}. "
+    if conflicting:
+        ai_note += f"Conflicting decisions detected: {', '.join(conflicting)}. "
+    if outcomes["improved"] > outcomes["worsened"]:
+        ai_note += "Past decisions have generally helped."
+    elif outcomes["worsened"] > outcomes["improved"]:
+        ai_note += "Past decisions haven't been effective - try different approach."
+
+    return {
+        "node": node_name,
+        "channel_id": channel_id,
+        "days_queried": days,
+        "decision_count": len(decisions),
+        "decisions": decisions[:20],  # Limit to 20 most recent
+        "pattern_detection": {
+            "repeated_recommendations": repeated,
+            "conflicting_decisions": conflicting,
+            "decision_frequency_days": decision_frequency_days,
+            "outcomes_summary": outcomes
+        },
+        "decision_type_counts": decision_types,
+        "ai_note": ai_note
+    }
+
+
+async def handle_connectivity_recommendations(args: Dict) -> Dict:
+    """Get actionable connectivity improvement recommendations."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Get connectivity alerts and member info
+    try:
+        alerts_data, members_data, fleet_health = await asyncio.gather(
+            node.call("hive-connectivity-alerts", {}),
+            node.call("hive-members"),
+            node.call("hive-fleet-health", {}),
+        )
+    except Exception as e:
+        return {"error": f"Failed to get connectivity data: {e}"}
+
+    if "error" in alerts_data:
+        return alerts_data
+
+    alerts = alerts_data.get("alerts", [])
+    members_list = members_data.get("members", []) if "error" not in members_data else []
+
+    # Build pubkey -> alias map
+    alias_map = {}
+    for m in members_list:
+        pubkey = m.get("pubkey") or m.get("peer_id")
+        if pubkey:
+            alias_map[pubkey] = m.get("alias", pubkey[:16] + "...")
+
+    # Get well-connected members as potential targets
+    well_connected = []
+    for m in members_list:
+        connections = m.get("hive_channel_count", 0)
+        if connections >= 3:
+            well_connected.append({
+                "pubkey": m.get("pubkey") or m.get("peer_id"),
+                "alias": m.get("alias", ""),
+                "connections": connections
+            })
+
+    recommendations = []
+    for alert in alerts:
+        alert_type = alert.get("type", "unknown")
+        severity = alert.get("severity", "info")
+        affected_member = alert.get("member_id") or alert.get("peer_id")
+        affected_alias = alias_map.get(affected_member, affected_member[:16] + "..." if affected_member else "?")
+
+        rec = {
+            "alert_type": alert_type,
+            "severity": severity,
+            "member": {
+                "pubkey": affected_member[:16] + "..." if affected_member else "?",
+                "alias": affected_alias
+            },
+            "recommendation": {}
+        }
+
+        # Generate specific recommendations based on alert type
+        if alert_type in ("disconnected", "no_hive_channels"):
+            # Member has no hive channels - they need to open to someone
+            target = well_connected[0] if well_connected else None
+            rec["recommendation"] = {
+                "who_should_act": affected_alias,
+                "action": "open_channel_to",
+                "target": target["alias"] if target else "any well-connected member",
+                "target_pubkey": target["pubkey"][:16] + "..." if target else None,
+                "expected_improvement": "Establishes fleet connectivity, enables zero-fee rebalancing",
+                "priority": 5
+            }
+        elif alert_type in ("isolated", "low_connectivity"):
+            # Member has few connections - others should open to them
+            rec["recommendation"] = {
+                "who_should_act": "well-connected members",
+                "action": "open_channel_to",
+                "target": affected_alias,
+                "target_pubkey": affected_member[:16] + "..." if affected_member else None,
+                "expected_improvement": "Improves mesh connectivity, reduces path length",
+                "priority": 3
+            }
+        elif alert_type == "offline":
+            rec["recommendation"] = {
+                "who_should_act": affected_alias,
+                "action": "improve_uptime",
+                "target": None,
+                "expected_improvement": "Node must be online to participate in routing and governance",
+                "priority": 4
+            }
+        elif alert_type == "low_liquidity":
+            rec["recommendation"] = {
+                "who_should_act": affected_alias,
+                "action": "add_liquidity",
+                "target": None,
+                "expected_improvement": "More capital enables more routing revenue",
+                "priority": 2
+            }
+        else:
+            rec["recommendation"] = {
+                "who_should_act": affected_alias,
+                "action": "investigate",
+                "target": None,
+                "expected_improvement": "Unknown - manual review needed",
+                "priority": 1
+            }
+
+        recommendations.append(rec)
+
+    # Sort by priority
+    recommendations.sort(key=lambda x: x["recommendation"].get("priority", 0), reverse=True)
+
+    # Build AI note
+    critical_count = sum(1 for r in recommendations if r["severity"] == "critical")
+    warning_count = sum(1 for r in recommendations if r["severity"] == "warning")
+
+    ai_note = f"Generated {len(recommendations)} recommendation(s). "
+    if critical_count > 0:
+        ai_note += f"{critical_count} CRITICAL requiring immediate action. "
+    if warning_count > 0:
+        ai_note += f"{warning_count} warnings. "
+    if not recommendations:
+        ai_note = "No connectivity issues found. Fleet is well-connected."
+
+    return {
+        "node": node_name,
+        "recommendation_count": len(recommendations),
+        "recommendations": recommendations[:10],  # Top 10
+        "well_connected_targets": well_connected[:3],
+        "ai_note": ai_note
+    }
+
+
+# =============================================================================
+# Automation Tools (Phase 2 - Hex Enhancement)
+# =============================================================================
+
+async def handle_stagnant_channels(args: Dict) -> Dict:
+    """List channels with ≥95% local balance with enriched context."""
+    import time
+    
+    node_name = args.get("node")
+    min_local_pct = args.get("min_local_pct", 95)
+    min_age_days = args.get("min_age_days", 14)
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    # Get current blockheight for age calculation
+    info = await node.call("getinfo")
+    if "error" in info:
+        return info
+    current_blockheight = info.get("blockheight", 0)
+    
+    # Get all channels
+    channels_result = await node.call("listpeerchannels")
+    if "error" in channels_result:
+        return channels_result
+    
+    # Get forwards for last forward calculation
+    forwards = await node.call("listforwards", {"status": "settled"})
+    forwards_list = forwards.get("forwards", []) if not forwards.get("error") else []
+    
+    # Build map of channel -> last forward timestamp
+    channel_last_forward: Dict[str, int] = {}
+    for fwd in forwards_list:
+        for ch_key in ["in_channel", "out_channel"]:
+            ch_id = fwd.get(ch_key)
+            if ch_id:
+                ts = _coerce_ts(fwd.get("resolved_time") or fwd.get("resolved_at") or 0)
+                if ch_id not in channel_last_forward or ts > channel_last_forward[ch_id]:
+                    channel_last_forward[ch_id] = ts
+    
+    # Get peer intel if available
+    peer_intel_map: Dict[str, Dict] = {}
+    try:
+        db = ensure_advisor_db()
+        # Will be populated per-peer as needed
+    except Exception:
+        db = None
+    
+    now = int(time.time())
+    stagnant_channels = []
+    
+    for ch in channels_result.get("channels", []):
+        totals = _channel_totals(ch)
+        total_msat = totals["total_msat"]
+        local_msat = totals["local_msat"]
+        
+        if total_msat == 0:
+            continue
+            
+        local_pct = round((local_msat / total_msat) * 100, 2)
+        
+        if local_pct < min_local_pct:
+            continue
+        
+        channel_id = ch.get("short_channel_id", "")
+        peer_id = ch.get("peer_id", "")
+        
+        # Calculate channel age
+        channel_age_days = _scid_to_age_days(channel_id, current_blockheight) if channel_id else None
+        
+        if channel_age_days is not None and channel_age_days < min_age_days:
+            continue
+        
+        # Get peer alias
+        peer_alias = ""
+        try:
+            nodes_result = await node.call("listnodes", {"id": peer_id})
+            if nodes_result.get("nodes"):
+                peer_alias = nodes_result["nodes"][0].get("alias", "")
+        except Exception:
+            pass
+        
+        # Get current fee
+        local_updates = ch.get("updates", {}).get("local", {})
+        current_fee_ppm = local_updates.get("fee_proportional_millionths", 0)
+        
+        # Calculate days since last forward
+        last_forward_ts = channel_last_forward.get(channel_id, 0)
+        days_since_forward = None
+        if last_forward_ts > 0:
+            days_since_forward = (now - last_forward_ts) // 86400
+        
+        # Get peer quality from advisor if available
+        peer_quality = None
+        peer_recommendation = None
+        if db and peer_id:
+            try:
+                intel = db.get_peer_intel(peer_id)
+                if intel:
+                    peer_quality = intel.get("quality_score")
+                    peer_recommendation = intel.get("recommendation")
+            except Exception:
+                pass
+        
+        # Generate recommendation
+        recommendation = "wait"
+        reasoning = ""
+        
+        if peer_recommendation == "avoid":
+            recommendation = "close"
+            reasoning = "Peer marked as 'avoid' - consider closing channel"
+        elif channel_age_days is not None and channel_age_days > 90:
+            if days_since_forward is not None and days_since_forward > 30:
+                recommendation = "close"
+                reasoning = f"Channel >90 days old with no forwards in {days_since_forward} days"
+            elif current_fee_ppm > 100:
+                recommendation = "fee_reduction"
+                reasoning = f"Channel >90 days old, try reducing fee from {current_fee_ppm} ppm"
+            else:
+                recommendation = "static_policy"
+                reasoning = "Channel >90 days old with low fee already - apply static policy"
+        elif channel_age_days is not None and channel_age_days > 30:
+            if current_fee_ppm > 200:
+                recommendation = "fee_reduction"
+                reasoning = f"Consider reducing fee from {current_fee_ppm} ppm to attract flow"
+            else:
+                recommendation = "wait"
+                reasoning = "Channel 30-90 days old - give more time to attract flow"
+        else:
+            recommendation = "wait"
+            reasoning = "Channel too young for intervention"
+        
+        stagnant_channels.append({
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "peer_alias": peer_alias,
+            "capacity_sats": total_msat // 1000,
+            "local_pct": local_pct,
+            "channel_age_days": channel_age_days,
+            "days_since_last_forward": days_since_forward,
+            "peer_quality": peer_quality,
+            "current_fee_ppm": current_fee_ppm,
+            "recommendation": recommendation,
+            "reasoning": reasoning
+        })
+    
+    # Sort by recommendation priority: close > fee_reduction > static_policy > wait
+    priority = {"close": 0, "fee_reduction": 1, "static_policy": 2, "wait": 3}
+    stagnant_channels.sort(key=lambda x: (priority.get(x["recommendation"], 99), -(x.get("channel_age_days") or 0)))
+    
+    return {
+        "node": node_name,
+        "stagnant_count": len(stagnant_channels),
+        "channels": stagnant_channels,
+        "ai_note": f"Found {len(stagnant_channels)} stagnant channels (≥{min_local_pct}% local, ≥{min_age_days} days old)"
+    }
+
+
+async def handle_bulk_policy(args: Dict) -> Dict:
+    """Apply policies to multiple channels matching criteria."""
+    node_name = args.get("node")
+    filter_type = args.get("filter_type")
+    strategy = args.get("strategy")
+    fee_ppm = args.get("fee_ppm")
+    rebalance = args.get("rebalance")
+    dry_run = args.get("dry_run", True)
+    custom_filter = args.get("custom_filter", {})
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    if not filter_type:
+        return {"error": "filter_type is required"}
+    
+    # Get channels based on filter type
+    matched_channels = []
+    
+    if filter_type == "stagnant":
+        # Use stagnant_channels logic
+        stagnant_result = await handle_stagnant_channels({
+            "node": node_name,
+            "min_local_pct": custom_filter.get("min_local_pct", 95),
+            "min_age_days": custom_filter.get("min_age_days", 14)
+        })
+        if "error" in stagnant_result:
+            return stagnant_result
+        matched_channels = stagnant_result.get("channels", [])
+        
+    elif filter_type == "zombie":
+        # Get profitability and find zombies
+        prof = await node.call("revenue-profitability", {})
+        if "error" in prof:
+            return prof
+        channels_by_class = prof.get("channels_by_class", {})
+        for ch in channels_by_class.get("zombie", []):
+            matched_channels.append({
+                "channel_id": ch.get("short_channel_id"),
+                "peer_id": ch.get("peer_id"),
+                "peer_alias": ch.get("peer_alias", ""),
+                "classification": "zombie"
+            })
+            
+    elif filter_type == "underwater":
+        prof = await node.call("revenue-profitability", {})
+        if "error" in prof:
+            return prof
+        channels_by_class = prof.get("channels_by_class", {})
+        for ch in channels_by_class.get("bleeder", []):
+            matched_channels.append({
+                "channel_id": ch.get("short_channel_id"),
+                "peer_id": ch.get("peer_id"),
+                "peer_alias": ch.get("peer_alias", ""),
+                "classification": "bleeder"
+            })
+            
+    elif filter_type == "depleted":
+        # Channels with <5% local balance
+        channels_result = await node.call("listpeerchannels")
+        if "error" in channels_result:
+            return channels_result
+        for ch in channels_result.get("channels", []):
+            totals = _channel_totals(ch)
+            if totals["total_msat"] == 0:
+                continue
+            local_pct = (totals["local_msat"] / totals["total_msat"]) * 100
+            if local_pct < 5:
+                matched_channels.append({
+                    "channel_id": ch.get("short_channel_id"),
+                    "peer_id": ch.get("peer_id"),
+                    "local_pct": round(local_pct, 2),
+                    "classification": "depleted"
+                })
+                
+    elif filter_type == "custom":
+        # Custom filter based on provided criteria
+        channels_result = await node.call("listpeerchannels")
+        if "error" in channels_result:
+            return channels_result
+        for ch in channels_result.get("channels", []):
+            # Apply custom filters
+            match = True
+            totals = _channel_totals(ch)
+            local_pct = (totals["local_msat"] / totals["total_msat"] * 100) if totals["total_msat"] else 0
+            
+            if "min_local_pct" in custom_filter and local_pct < custom_filter["min_local_pct"]:
+                match = False
+            if "max_local_pct" in custom_filter and local_pct > custom_filter["max_local_pct"]:
+                match = False
+            if "min_capacity_sats" in custom_filter and (totals["total_msat"] // 1000) < custom_filter["min_capacity_sats"]:
+                match = False
+                
+            if match:
+                matched_channels.append({
+                    "channel_id": ch.get("short_channel_id"),
+                    "peer_id": ch.get("peer_id"),
+                    "local_pct": round(local_pct, 2)
+                })
+    else:
+        return {"error": f"Unknown filter_type: {filter_type}"}
+    
+    # Apply policies
+    applied = []
+    errors = []
+    
+    for ch in matched_channels:
+        peer_id = ch.get("peer_id")
+        if not peer_id:
+            continue
+            
+        if dry_run:
+            applied.append({
+                "peer_id": peer_id,
+                "channel_id": ch.get("channel_id"),
+                "would_apply": {
+                    "strategy": strategy,
+                    "fee_ppm": fee_ppm,
+                    "rebalance": rebalance
+                }
+            })
+        else:
+            # Actually apply the policy
+            params = {"action": "set", "peer_id": peer_id}
+            if strategy:
+                params["strategy"] = strategy
+            if fee_ppm is not None:
+                params["fee_ppm"] = fee_ppm
+            if rebalance:
+                params["rebalance"] = rebalance
+                
+            result = await node.call("revenue-policy", params)
+            if "error" in result:
+                errors.append({"peer_id": peer_id, "error": result["error"]})
+            else:
+                applied.append({
+                    "peer_id": peer_id,
+                    "channel_id": ch.get("channel_id"),
+                    "applied": params
+                })
+    
+    return {
+        "node": node_name,
+        "filter_type": filter_type,
+        "matched_count": len(matched_channels),
+        "applied_count": len(applied),
+        "dry_run": dry_run,
+        "applied": applied,
+        "errors": errors if errors else None,
+        "ai_note": f"{'Would apply' if dry_run else 'Applied'} policies to {len(applied)} channels matching '{filter_type}' filter"
+    }
+
+
+async def handle_enrich_peer(args: Dict) -> Dict:
+    """Get external data for peer evaluation from mempool.space."""
+    peer_id = args.get("peer_id")
+    timeout_seconds = args.get("timeout_seconds", 10)
+    
+    if not peer_id:
+        return {"error": "peer_id is required"}
+    
+    # Validate peer_id format (should be 66 hex chars)
+    if not isinstance(peer_id, str) or len(peer_id) != 66:
+        return {"error": "peer_id must be a 66-character hex pubkey"}
+    
+    MEMPOOL_API = "https://mempool.space/api"
+    
+    result = {
+        "peer_id": peer_id,
+        "source": "mempool.space",
+        "available": False
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            resp = await client.get(f"{MEMPOOL_API}/v1/lightning/nodes/{peer_id}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                result["available"] = True
+                result["alias"] = data.get("alias", "")
+                result["capacity_sats"] = data.get("capacity", 0)
+                result["channel_count"] = data.get("active_channel_count", 0)
+                result["first_seen"] = data.get("first_seen")
+                result["updated_at"] = data.get("updated_at")
+                result["color"] = data.get("color", "")
+                
+                # Calculate node age if first_seen is available
+                if data.get("first_seen"):
+                    import time
+                    node_age_days = (int(time.time()) - data["first_seen"]) // 86400
+                    result["node_age_days"] = node_age_days
+                    
+            elif resp.status_code == 404:
+                result["error"] = "Node not found in mempool.space database"
+            else:
+                result["error"] = f"API returned status {resp.status_code}"
+                
+    except httpx.TimeoutException:
+        result["error"] = f"API timeout after {timeout_seconds}s"
+    except Exception as e:
+        result["error"] = f"API error: {str(e)}"
+    
+    return result
+
+
+async def handle_enrich_proposal(args: Dict) -> Dict:
+    """Enhance a pending action with external peer data."""
+    node_name = args.get("node")
+    action_id = args.get("action_id")
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    if action_id is None:
+        return {"error": "action_id is required"}
+    
+    # Get pending actions
+    pending = await node.call("hive-pending-actions")
+    if "error" in pending:
+        return pending
+    
+    # Find the specific action
+    target_action = None
+    for action in pending.get("actions", []):
+        if action.get("id") == action_id:
+            target_action = action
+            break
+    
+    if not target_action:
+        return {"error": f"Action {action_id} not found in pending actions"}
+    
+    # Extract peer_id from action
+    peer_id = target_action.get("peer_id") or target_action.get("target_peer") or target_action.get("details", {}).get("peer_id")
+    
+    if not peer_id:
+        return {
+            "action": target_action,
+            "enrichment": None,
+            "note": "No peer_id found in action to enrich"
+        }
+    
+    # Get external peer data
+    external_data = await handle_enrich_peer({"peer_id": peer_id})
+    
+    # Get internal peer intel if available
+    internal_intel = None
+    try:
+        db = ensure_advisor_db()
+        if db:
+            internal_intel = db.get_peer_intel(peer_id)
+    except Exception:
+        pass
+    
+    # Generate enhanced recommendation
+    recommendation = None
+    reasoning = []
+    
+    action_type = target_action.get("action_type", "")
+    
+    if action_type in ("channel_open", "expansion"):
+        # Evaluate for channel open
+        if external_data.get("available"):
+            capacity = external_data.get("capacity_sats", 0)
+            channels = external_data.get("channel_count", 0)
+            node_age = external_data.get("node_age_days", 0)
+            
+            score = 0
+            if capacity > 100_000_000:  # >1 BTC
+                score += 2
+                reasoning.append(f"Good capacity: {capacity:,} sats")
+            elif capacity > 10_000_000:  # >0.1 BTC
+                score += 1
+                reasoning.append(f"Moderate capacity: {capacity:,} sats")
+            else:
+                reasoning.append(f"Low capacity: {capacity:,} sats")
+                
+            if channels >= 15:
+                score += 2
+                reasoning.append(f"Well-connected: {channels} channels")
+            elif channels >= 5:
+                score += 1
+                reasoning.append(f"Some connectivity: {channels} channels")
+            else:
+                reasoning.append(f"Low connectivity: {channels} channels")
+                
+            if node_age > 365:
+                score += 1
+                reasoning.append(f"Established node: {node_age} days old")
+            elif node_age < 30:
+                reasoning.append(f"New node: only {node_age} days old")
+                
+            if score >= 4:
+                recommendation = "approve"
+            elif score >= 2:
+                recommendation = "review"
+            else:
+                recommendation = "caution"
+        else:
+            reasoning.append("External data unavailable - manual review recommended")
+            recommendation = "review"
+            
+        if internal_intel:
+            if internal_intel.get("recommendation") == "avoid":
+                recommendation = "reject"
+                reasoning.append("Internal intel: peer marked as 'avoid'")
+            elif internal_intel.get("quality_score", 0) > 0.7:
+                reasoning.append(f"Internal intel: good quality score ({internal_intel['quality_score']:.2f})")
+    
+    return {
+        "node": node_name,
+        "action_id": action_id,
+        "action": target_action,
+        "external_data": external_data,
+        "internal_intel": internal_intel,
+        "recommendation": recommendation,
+        "reasoning": reasoning,
+        "ai_note": f"Enriched action {action_id} with peer data. Recommendation: {recommendation or 'N/A'}"
+    }
+
+
+# =============================================================================
 # Tool Dispatch Registry
 # =============================================================================
 
 TOOL_HANDLERS: Dict[str, Any] = {
     # Hive core tools
+    "hive_health": handle_health,
     "hive_fleet_snapshot": handle_fleet_snapshot,
     "hive_anomalies": handle_anomalies,
     "hive_compare_periods": handle_compare_periods,
@@ -8973,6 +13230,24 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_vote_promotion": handle_vote_promotion,
     "hive_pending_promotions": handle_pending_promotions,
     "hive_execute_promotion": handle_execute_promotion,
+    # Membership lifecycle
+    "hive_vouch": handle_vouch,
+    "hive_leave": handle_leave,
+    "hive_force_promote": handle_force_promote,
+    "hive_request_promotion": handle_request_promotion,
+    "hive_remove_member": handle_remove_member,
+    "hive_genesis": handle_genesis,
+    "hive_invite": handle_invite,
+    "hive_join": handle_join,
+    # Ban governance
+    "hive_propose_ban": handle_propose_ban,
+    "hive_vote_ban": handle_vote_ban,
+    "hive_pending_bans": handle_pending_bans,
+    # Health/reputation monitoring
+    "hive_nnlb_status": handle_nnlb_status,
+    "hive_peer_reputations": handle_peer_reputations,
+    "hive_reputation_stats": handle_reputation_stats,
+    "hive_contribution": handle_contribution,
     "hive_node_info": handle_node_info,
     "hive_channels": handle_channels,
     "hive_set_fees": handle_set_fees,
@@ -9014,15 +13289,24 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_portfolio_correlations": handle_revenue_portfolio_correlations,
     "revenue_policy": handle_revenue_policy,
     "revenue_set_fee": handle_revenue_set_fee,
+    "revenue_fee_anchor": handle_revenue_fee_anchor,
     "revenue_rebalance": handle_revenue_rebalance,
     "revenue_report": handle_revenue_report,
     "revenue_config": handle_revenue_config,
+    "config_adjust": handle_config_adjust,
+    "config_adjustment_history": handle_config_adjustment_history,
+    "config_effectiveness": handle_config_effectiveness,
+    "config_measure_outcomes": handle_config_measure_outcomes,
+    "config_recommend": handle_config_recommend,
     "revenue_debug": handle_revenue_debug,
     "revenue_history": handle_revenue_history,
-    "revenue_outgoing": handle_revenue_outgoing,
     "revenue_competitor_analysis": handle_revenue_competitor_analysis,
-    "goat_feeder_history": handle_goat_feeder_history,
-    "goat_feeder_trends": handle_goat_feeder_trends,
+    # Diagnostic tools
+    "hive_node_diagnostic": handle_hive_node_diagnostic,
+    "revenue_ops_health": handle_revenue_ops_health,
+    "advisor_validate_data": handle_advisor_validate_data,
+    "advisor_dedup_status": handle_advisor_dedup_status,
+    "rebalance_diagnostic": handle_rebalance_diagnostic,
     # Advisor database
     "advisor_record_snapshot": handle_advisor_record_snapshot,
     "advisor_get_trends": handle_advisor_get_trends,
@@ -9047,6 +13331,12 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "advisor_get_status": handle_advisor_get_status,
     "advisor_get_cycle_history": handle_advisor_get_cycle_history,
     "advisor_scan_opportunities": handle_advisor_scan_opportunities,
+    # Phase 3: Automation Tools
+    "auto_evaluate_proposal": handle_auto_evaluate_proposal,
+    "process_all_pending": handle_process_all_pending,
+    "stagnant_channels": handle_stagnant_channels,
+    "remediate_stagnant": handle_remediate_stagnant,
+    "execute_safe_opportunities": handle_execute_safe_opportunities,
     # Routing Pool
     "pool_status": handle_pool_status,
     "pool_member_status": handle_pool_member_status,
@@ -9122,6 +13412,20 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_mcf_assignments": handle_mcf_assignments,
     "hive_mcf_optimized_path": handle_mcf_optimized_path,
     "hive_mcf_health": handle_mcf_health,
+    # Phase 4: Membership & Settlement (Hex Automation)
+    "membership_dashboard": handle_membership_dashboard,
+    "check_neophytes": handle_check_neophytes,
+    "settlement_readiness": handle_settlement_readiness,
+    "run_settlement_cycle": handle_run_settlement_cycle,
+    # Phase 5: Monitoring & Health (Hex Automation)
+    "fleet_health_summary": handle_fleet_health_summary,
+    "routing_intelligence_health": handle_routing_intelligence_health,
+    "advisor_channel_history": handle_advisor_channel_history_tool,
+    "connectivity_recommendations": handle_connectivity_recommendations,
+    # Phase 2: Automation Tools (Hex Enhancement)
+    "bulk_policy": handle_bulk_policy,
+    "enrich_peer": handle_enrich_peer,
+    "enrich_proposal": handle_enrich_proposal,
 }
 
 

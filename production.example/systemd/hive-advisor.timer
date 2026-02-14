@@ -1,6 +1,6 @@
 [Unit]
 Description=Hive AI Advisor Timer (15 minute intervals)
-Documentation=https://github.com/lightning-goats/cl-hive
+Documentation=https://github.com/santyr/cl-hive
 
 [Timer]
 # Run every 15 minutes

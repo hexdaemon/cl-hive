@@ -247,7 +247,7 @@ class RoutingPool:
         # - Higher capacity = higher score
         # - Weighted by uptime (offline capacity doesn't help)
         weighted_capacity = int(capacity_sats * uptime_pct)
-        capital_score = uptime_pct  # Normalized by uptime, capacity used for weighting
+        capital_score = weighted_capacity  # Actual weighted capacity, used in pool share calc
 
         # Position score (20% weight)
         # - Higher centrality = more important position
@@ -422,15 +422,10 @@ class RoutingPool:
             self._log(f"No revenue for period {period}")
             return {}
 
-        # Get contributions for period
+        # Get contributions for period (read-only — snapshot must be triggered separately)
         contributions = self.db.get_pool_contributions(period)
         if not contributions:
-            self._log(f"No contributions recorded for {period}, snapshotting now")
-            self.snapshot_contributions(period)
-            contributions = self.db.get_pool_contributions(period)
-
-        if not contributions:
-            self._log(f"Still no contributions for {period}")
+            self._log(f"No contributions recorded for {period}")
             return {}
 
         # Calculate total shares
@@ -509,7 +504,7 @@ class RoutingPool:
                     revenue_share_sats=amount,
                     total_pool_revenue_sats=total_revenue
                 )
-                if ok is False:
+                if not ok:
                     raise RuntimeError(f"record_pool_distribution failed for {member_id}")
 
                 results.append(PoolDistribution(
@@ -551,12 +546,8 @@ class RoutingPool:
         # Get revenue
         revenue = self.db.get_pool_revenue(period=period)
 
-        # Get or create contributions
+        # Get contributions (read-only — snapshot must be triggered separately)
         contributions = self.db.get_pool_contributions(period)
-        if not contributions:
-            # No snapshot yet, calculate now
-            self.snapshot_contributions(period)
-            contributions = self.db.get_pool_contributions(period)
 
         # Calculate projected distribution
         projected = self.calculate_distribution(period)
@@ -630,17 +621,23 @@ class RoutingPool:
     # =========================================================================
 
     def _current_period(self) -> str:
-        """Get current ISO week period string (UTC)."""
+        """Get current ISO week period string (UTC).
+
+        Format: YYYY-WW (e.g., "2026-06") to match SettlementManager.get_period_string().
+        """
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         year, week, _ = now.isocalendar()
-        return f"{year}-W{week:02d}"
+        return f"{year}-{week:02d}"
 
     def _previous_period(self) -> str:
-        """Get previous ISO week period string (UTC)."""
+        """Get previous ISO week period string (UTC).
+
+        Format: YYYY-WW (e.g., "2026-05") to match SettlementManager.get_previous_period().
+        """
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         last_week = now - datetime.timedelta(days=7)
         year, week, _ = last_week.isocalendar()
-        return f"{year}-W{week:02d}"
+        return f"{year}-{week:02d}"
 
     def _get_member_capacity(self, member_id: str) -> int:
         """Get total channel capacity for a member."""

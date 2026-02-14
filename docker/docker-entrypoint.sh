@@ -505,11 +505,29 @@ echo "Advisor database: $ADVISOR_DB_PATH"
 cat >> "$CONFIG_FILE" << EOF
 
 # =============================================================================
+# Vitality Plugin Configuration
+# =============================================================================
+# Vitality monitors channel health and pings Amboss for online status
+
+vitality-amboss=true
+
+# =============================================================================
 # cl-hive Configuration
 # =============================================================================
 
 hive-governance-mode=$HIVE_GOVERNANCE_MODE
 hive-db-path=$LIGHTNING_DIR/$NETWORK/cl_hive.db
+
+# =============================================================================
+# Sling Rebalancer Configuration
+# =============================================================================
+# Stats retention prevents unbounded growth of sling's internal tables.
+# NOTE: These MUST be set here at startup — runtime setconfig on plugin-owned
+# options triggers a segfault in CLN v25.12.1 (configvar_finalize_overrides).
+
+sling-stats-delete-failures-age=30
+sling-stats-delete-successes-age=30
+sling-candidates-min-age=144
 
 # =============================================================================
 # cl-revenue-ops Configuration

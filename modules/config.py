@@ -149,7 +149,15 @@ class HiveConfig:
 
     # Internal version tracking
     _version: int = field(default=0, repr=False, compare=False)
-    
+
+    def __post_init__(self):
+        """Normalize fields on construction."""
+        self._normalize()
+
+    def _normalize(self):
+        """Normalize field values (case, whitespace, etc.)."""
+        self.governance_mode = str(self.governance_mode).strip().lower()
+
     def snapshot(self) -> 'HiveConfigSnapshot':
         """
         Create an immutable snapshot for cycle execution.
@@ -169,10 +177,8 @@ class HiveConfig:
         """
         valid_modes = ('advisor', 'failsafe')
         if hasattr(self, 'governance_mode'):
-            mode = str(self.governance_mode).strip().lower()
-            if mode not in valid_modes:
+            if self.governance_mode not in valid_modes:
                 return f"governance_mode must be one of {valid_modes}, got '{self.governance_mode}'"
-            self.governance_mode = mode
 
         for key, (min_val, max_val) in CONFIG_FIELD_RANGES.items():
             if key == 'max_expansion_feerate_perkb':

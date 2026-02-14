@@ -13,6 +13,7 @@ This module bridges cl-hive coordination with cl-revenue-ops profitability data.
 """
 
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -90,7 +91,7 @@ class ChannelYieldMetrics:
         """Calculate all derived metrics from base values."""
         # Net revenue
         self.total_cost_sats = self.open_cost_sats + self.rebalance_cost_sats
-        self.net_revenue_sats = self.routing_revenue_sats - self.rebalance_cost_sats
+        self.net_revenue_sats = self.routing_revenue_sats - self.total_cost_sats
 
         # ROI calculation
         if self.capacity_sats > 0 and self.period_days > 0:
@@ -350,9 +351,15 @@ class YieldMetricsManager:
         self.bridge = bridge
         self.our_pubkey: Optional[str] = None
 
+        # Lock protecting in-memory caches
+        self._lock = threading.Lock()
+
         # Cache for velocity calculations
         self._velocity_cache: Dict[str, Dict] = {}
         self._velocity_cache_ttl = 300  # 5 minutes
+
+        # Remote yield metrics from fleet members
+        self._remote_yield_metrics: Dict[str, List[Dict[str, Any]]] = {}
 
     def set_our_pubkey(self, pubkey: str) -> None:
         """Set our node's pubkey after initialization."""
@@ -558,12 +565,12 @@ class YieldMetricsManager:
                 # Risk increases as depletion approaches
                 depletion_risk = max(0.0, min(1.0, 1.0 - hours_to_depletion / 48))
             elif local_pct < DEPLETION_RISK_THRESHOLD:
-                depletion_risk = 0.5 + (DEPLETION_RISK_THRESHOLD - local_pct) * 2
+                depletion_risk = min(1.0, 0.5 + (DEPLETION_RISK_THRESHOLD - local_pct) * 2)
 
             if hours_to_saturation is not None and hours_to_saturation < 48:
                 saturation_risk = max(0.0, min(1.0, 1.0 - hours_to_saturation / 48))
             elif local_pct > SATURATION_RISK_THRESHOLD:
-                saturation_risk = 0.5 + (local_pct - SATURATION_RISK_THRESHOLD) * 2
+                saturation_risk = min(1.0, 0.5 + (local_pct - SATURATION_RISK_THRESHOLD) * 2)
 
             # Determine recommended action
             recommended_action = "none"
@@ -612,12 +619,16 @@ class YieldMetricsManager:
         """
         # Check cache first
         now = time.time()
-        cached = self._velocity_cache.get(channel_id)
-        if cached and now - cached.get("timestamp", 0) < self._velocity_cache_ttl:
-            return cached
+        with self._lock:
+            cached = self._velocity_cache.get(channel_id)
+            if cached and now - cached.get("timestamp", 0) < self._velocity_cache_ttl:
+                return dict(cached)
 
         try:
             # Query channel history from advisor database
+            # get_channel_history may not exist on all database implementations
+            if not hasattr(self.database, 'get_channel_history'):
+                return None
             history = self.database.get_channel_history(channel_id, hours=48)
 
             if not history or len(history) < 2:
@@ -646,7 +657,24 @@ class YieldMetricsManager:
             }
 
             # Cache result
-            self._velocity_cache[channel_id] = result
+            with self._lock:
+                # Evict stale entries if cache exceeds 500
+                if len(self._velocity_cache) > 500:
+                    stale_cutoff = now - self._velocity_cache_ttl
+                    stale_keys = [
+                        k for k, v in self._velocity_cache.items()
+                        if v.get("timestamp", 0) < stale_cutoff
+                    ]
+                    for k in stale_keys:
+                        del self._velocity_cache[k]
+                    # If still over limit after TTL eviction, remove oldest
+                    if len(self._velocity_cache) > 500:
+                        oldest_key = min(
+                            self._velocity_cache,
+                            key=lambda k: self._velocity_cache[k].get("timestamp", 0)
+                        )
+                        del self._velocity_cache[oldest_key]
+                self._velocity_cache[channel_id] = result
 
             return result
 
@@ -860,10 +888,6 @@ class YieldMetricsManager:
         if not peer_id:
             return False
 
-        # Initialize remote metrics storage if needed
-        if not hasattr(self, "_remote_yield_metrics"):
-            self._remote_yield_metrics: Dict[str, List[Dict[str, Any]]] = {}
-
         entry = {
             "reporter_id": reporter_id,
             "roi_pct": metrics_data.get("roi_pct", 0),
@@ -874,13 +898,28 @@ class YieldMetricsManager:
             "timestamp": time.time()
         }
 
-        if peer_id not in self._remote_yield_metrics:
-            self._remote_yield_metrics[peer_id] = []
+        with self._lock:
+            if peer_id not in self._remote_yield_metrics:
+                self._remote_yield_metrics[peer_id] = []
 
-        # Keep only recent reports per peer (last 5 reporters)
-        self._remote_yield_metrics[peer_id].append(entry)
-        if len(self._remote_yield_metrics[peer_id]) > 5:
-            self._remote_yield_metrics[peer_id] = self._remote_yield_metrics[peer_id][-5:]
+            # Keep only recent reports per peer (last 5 reporters)
+            self._remote_yield_metrics[peer_id].append(entry)
+            if len(self._remote_yield_metrics[peer_id]) > 5:
+                self._remote_yield_metrics[peer_id] = self._remote_yield_metrics[peer_id][-5:]
+
+            # Evict least-recently-updated peer if dict exceeds limit
+            max_peers = 200
+            if len(self._remote_yield_metrics) > max_peers:
+                oldest_pid = min(
+                    (p for p in self._remote_yield_metrics if p != peer_id),
+                    key=lambda p: max(
+                        (e.get("timestamp", 0) for e in self._remote_yield_metrics[p]),
+                        default=0
+                    ),
+                    default=None
+                )
+                if oldest_pid:
+                    del self._remote_yield_metrics[oldest_pid]
 
         return True
 
@@ -896,10 +935,8 @@ class YieldMetricsManager:
         Returns:
             Dict with consensus metrics or None if no data
         """
-        if not hasattr(self, "_remote_yield_metrics"):
-            return None
-
-        reports = self._remote_yield_metrics.get(peer_id, [])
+        with self._lock:
+            reports = list(self._remote_yield_metrics.get(peer_id, []))
         if not reports:
             return None
 
@@ -936,8 +973,11 @@ class YieldMetricsManager:
         if not hasattr(self, "_remote_yield_metrics"):
             return {}
 
+        with self._lock:
+            peer_ids = list(self._remote_yield_metrics.keys())
+
         consensus = {}
-        for peer_id in self._remote_yield_metrics:
+        for peer_id in peer_ids:
             result = self.get_fleet_yield_consensus(peer_id)
             if result:
                 consensus[peer_id] = result
@@ -945,21 +985,19 @@ class YieldMetricsManager:
 
     def cleanup_old_remote_yield_metrics(self, max_age_days: float = 7) -> int:
         """Remove old remote yield data."""
-        if not hasattr(self, "_remote_yield_metrics"):
-            return 0
-
         cutoff = time.time() - (max_age_days * 86400)
         cleaned = 0
 
-        for peer_id in list(self._remote_yield_metrics.keys()):
-            before = len(self._remote_yield_metrics[peer_id])
-            self._remote_yield_metrics[peer_id] = [
-                r for r in self._remote_yield_metrics[peer_id]
-                if r.get("timestamp", 0) > cutoff
-            ]
-            cleaned += before - len(self._remote_yield_metrics[peer_id])
+        with self._lock:
+            for peer_id in list(self._remote_yield_metrics.keys()):
+                before = len(self._remote_yield_metrics[peer_id])
+                self._remote_yield_metrics[peer_id] = [
+                    r for r in self._remote_yield_metrics[peer_id]
+                    if r.get("timestamp", 0) > cutoff
+                ]
+                cleaned += before - len(self._remote_yield_metrics[peer_id])
 
-            if not self._remote_yield_metrics[peer_id]:
-                del self._remote_yield_metrics[peer_id]
+                if not self._remote_yield_metrics[peer_id]:
+                    del self._remote_yield_metrics[peer_id]
 
         return cleaned

@@ -7,7 +7,7 @@
 FROM ubuntu:24.04
 
 LABEL maintainer="Lightning Goats Team"
-LABEL version="2.2.6"
+LABEL version="2.2.8"
 LABEL description="Production Lightning node with cl-hive coordination"
 
 # Prevent interactive prompts during install
@@ -155,22 +155,21 @@ RUN git clone --depth 1 https://github.com/ksedgwic/clboss.git \
     && rm -rf clboss
 
 # =============================================================================
-# TRUSTEDCOIN PLUGIN (OPTIONAL)
+# VITALITY PLUGIN (REQUIRED)
 # =============================================================================
-# Trustedcoin replaces bcli for Bitcoin backend, using block explorers.
-# Useful for VPS deployments without local bitcoind.
-# - Explorer-only mode: No bitcoind required, uses public explorers
-# - Hybrid mode: bitcoind primary with explorer fallback
+# Vitality monitors channel health, gossip health, and pings Amboss for online status.
+# Essential for production deployments to maintain uptime and Amboss visibility.
+# Config: vitality-amboss=true (set in docker-entrypoint.sh)
 
-ARG TRUSTEDCOIN_VERSION=v0.8.6
+ARG VITALITY_VERSION=v0.4.5
 RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "x86_64" ]; then ARCH="linux-amd64"; fi \
-    && if [ "$ARCH" = "aarch64" ]; then ARCH="linux-arm64"; fi \
-    && wget -O /tmp/trustedcoin.tar.gz "https://github.com/nbd-wtf/trustedcoin/releases/download/${TRUSTEDCOIN_VERSION}/trustedcoin-${TRUSTEDCOIN_VERSION}-${ARCH}.tar.gz" \
-    && tar -xzf /tmp/trustedcoin.tar.gz -C /tmp \
-    && mv /tmp/trustedcoin /usr/local/bin/trustedcoin \
-    && chmod +x /usr/local/bin/trustedcoin \
-    && rm /tmp/trustedcoin.tar.gz
+    && if [ "$ARCH" = "x86_64" ]; then TRIPLE="x86_64-linux-gnu"; fi \
+    && if [ "$ARCH" = "aarch64" ]; then TRIPLE="aarch64-linux-gnu"; fi \
+    && wget -O /tmp/vitality.tar.gz "https://github.com/daywalker90/vitality/releases/download/${VITALITY_VERSION}/vitality-${VITALITY_VERSION}-${TRIPLE}.tar.gz" \
+    && tar -xzf /tmp/vitality.tar.gz -C /tmp \
+    && mv /tmp/vitality /usr/local/bin/vitality \
+    && chmod +x /usr/local/bin/vitality \
+    && rm /tmp/vitality.tar.gz
 
 # =============================================================================
 # SLING PLUGIN (REQUIRED)
@@ -244,6 +243,7 @@ RUN ln -sf /opt/cl-hive/cl-hive.py /root/.lightning/plugins/cl-hive.py \
     && ln -sf /opt/cl-revenue-ops/cl-revenue-ops.py /root/.lightning/plugins/cl-revenue-ops.py \
     && ln -sf /opt/cl-revenue-ops/modules /root/.lightning/plugins/revenue-modules \
     && ln -sf /usr/local/bin/clboss /root/.lightning/plugins/clboss \
+    && ln -sf /usr/local/bin/vitality /root/.lightning/plugins/vitality \
     && ln -sf /usr/local/bin/sling /root/.lightning/plugins/sling \
     && ln -sf /opt/c-lightning-REST/cl-rest.js /root/.lightning/plugins/cl-rest.js
 

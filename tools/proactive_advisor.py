@@ -29,7 +29,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -260,7 +260,7 @@ class ProactiveAdvisor:
 
     def _load_or_create_budget(self) -> DailyBudget:
         """Load or create daily budget."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         stored = self.db.get_daily_budget(today)
         if stored:
             return DailyBudget(
@@ -309,6 +309,12 @@ class ProactiveAdvisor:
         )
 
         try:
+            # Housekeeping: expire stale decisions and enforce cap
+            expired = self.db.expire_stale_decisions(max_age_hours=48)
+            capped = self.db.cleanup_decisions(max_pending=200)
+            if expired or capped:
+                logger.info(f"  Housekeeping: expired {expired}, capped {capped} stale decisions")
+
             # Phase 1: Record snapshot for history
             logger.info("[Phase 1] Recording snapshot...")
             await self._record_snapshot(node_name)
@@ -384,9 +390,14 @@ class ProactiveAdvisor:
                 hours_ago_min=6,
                 hours_ago_max=24
             )
-            result.outcomes_measured = len(outcomes)
+            # Also update ai_decisions table with outcome measurements
+            decision_outcomes = self.db.measure_decision_outcomes(
+                min_hours=6,
+                max_hours=24
+            )
+            result.outcomes_measured = len(outcomes) + len(decision_outcomes)
             result.learning_summary = self.learning_engine.get_learning_summary()
-            logger.info(f"  Outcomes measured: {len(outcomes)}")
+            logger.info(f"  Outcomes measured: {len(outcomes)} actions, {len(decision_outcomes)} decisions")
             success_count = sum(1 for o in outcomes if o.success)
             if outcomes:
                 logger.info(f"  Success rate: {success_count}/{len(outcomes)} ({100*success_count/len(outcomes):.0f}%)")
@@ -426,6 +437,12 @@ class ProactiveAdvisor:
 
         # Store cycle result
         self.db.save_cycle_result(result.to_dict())
+
+        # Housekeeping: clean up old historical data (runs once per cycle)
+        try:
+            self.db.cleanup_old_data(days_to_keep=30)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old advisor data: {e}")
 
         # Final summary
         logger.info("-" * 60)
@@ -943,7 +960,7 @@ class ProactiveAdvisor:
         skipped = []
 
         # Check budget
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._daily_budget.date != today:
             self._daily_budget = DailyBudget(date=today)
 
@@ -1123,6 +1140,16 @@ class ProactiveAdvisor:
             if opp.adjusted_confidence < SAFETY_CONSTRAINTS["min_confidence_for_queue"]:
                 continue
 
+            # Skip actions the learning engine says to avoid
+            should_skip, skip_reason = self.learning_engine.should_skip_action(
+                opp.action_type.value,
+                opp.opportunity_type.value,
+                opp.confidence_score
+            )
+            if should_skip:
+                logger.info(f"  Learning skip: {opp.opportunity_type.value} - {skip_reason}")
+                continue
+
             # Queue for review
             queued.append(opp)
             await self._record_decision(node_name, opp, "queued_for_review")
@@ -1137,6 +1164,11 @@ class ProactiveAdvisor:
     ) -> None:
         """Record a decision to the audit trail."""
         try:
+            snapshot = {
+                "predicted_benefit": opp.predicted_benefit,
+                "current_state": opp.current_state,
+                "opportunity_type": opp.opportunity_type.value,
+            }
             await self.mcp.call(
                 "advisor_record_decision",
                 {
@@ -1146,7 +1178,9 @@ class ProactiveAdvisor:
                     "reasoning": opp.reasoning,
                     "channel_id": opp.channel_id,
                     "peer_id": opp.peer_id,
-                    "confidence": opp.adjusted_confidence
+                    "confidence": opp.adjusted_confidence,
+                    "predicted_benefit": opp.predicted_benefit,
+                    "snapshot_metrics": json.dumps(snapshot),
                 }
             )
         except Exception:

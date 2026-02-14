@@ -292,8 +292,8 @@ class GossipManager:
             "peer_id": our_pubkey,
             "capacity_sats": capacity_sats,
             "available_sats": available_sats,
-            "fee_policy": fee_policy,
-            "topology": topology,
+            "fee_policy": fee_policy.copy() if fee_policy else {},
+            "topology": topology.copy() if topology else [],
             "version": new_version,
             "timestamp": now,
             "state_hash": self.state_manager.calculate_fleet_hash(),
@@ -335,6 +335,20 @@ class GossipManager:
         if payload['peer_id'] != sender_id:
             self._log(f"Rejected gossip: sender mismatch "
                      f"({sender_id[:16]}... != {payload['peer_id'][:16]}...)")
+            return False
+
+        # Timestamp freshness check - reject messages too old or too far in the future
+        now = int(time.time())
+        msg_timestamp = payload.get('timestamp', 0)
+        MAX_GOSSIP_AGE = 3600  # 1 hour
+        MAX_CLOCK_SKEW = 300   # 5 minutes
+        if msg_timestamp < (now - MAX_GOSSIP_AGE):
+            self._log(f"Rejected stale gossip from {sender_id[:16]}...: "
+                     f"timestamp {now - msg_timestamp}s old")
+            return False
+        if msg_timestamp > (now + MAX_CLOCK_SKEW):
+            self._log(f"Rejected future gossip from {sender_id[:16]}...: "
+                     f"timestamp {msg_timestamp - now}s ahead")
             return False
         
         fee_policy = payload.get("fee_policy", {})

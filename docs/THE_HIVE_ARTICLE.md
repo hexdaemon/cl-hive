@@ -3,6 +3,7 @@
 **Turn your solo Lightning node into part of a coordinated fleet.**
 
 ---
+![Image](https://r2.primal.net/cache/9/97/87/9978775eca7fbe1f5f78548d888580613a8080ec826080580024d98526fdd4e6.png)
 
 ## The Problem with Running a Lightning Node Alone
 

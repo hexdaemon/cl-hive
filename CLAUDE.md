@@ -41,7 +41,7 @@ Core Lightning
 - **cl-revenue-ops**: Executes fee policies and rebalancing (called via RPC)
 - **Core Lightning**: Underlying node operations and HSM-based crypto
 
-### Module Organization
+### Module Organization (39 modules)
 
 | Module | Purpose |
 |--------|---------|
@@ -56,12 +56,34 @@ Core Lightning
 | `contribution.py` | Forwarding stats and anti-leech detection |
 | `planner.py` | Topology optimization - saturation analysis, expansion election, feerate gate |
 | `splice_manager.py` | Coordinated splice operations between hive members (Phase 11) |
+| `splice_coordinator.py` | High-level splice coordination and recommendation engine |
 | `mcf_solver.py` | Min-Cost Max-Flow solver for global fleet rebalance optimization |
 | `liquidity_coordinator.py` | Liquidity needs aggregation and rebalance assignment distribution |
 | `cost_reduction.py` | Fleet rebalance routing with MCF/BFS fallback |
-| `anticipatory_manager.py` | Kalman-filtered flow prediction, intra-day pattern detection |
+| `anticipatory_liquidity.py` | Kalman-filtered flow prediction, intra-day pattern detection |
+| `fee_coordination.py` | Pheromone-based fee coordination + stigmergic markers |
+| `fee_intelligence.py` | Fee intelligence aggregation and sharing across fleet |
+| `cooperative_expansion.py` | Fleet-wide expansion election protocol (Nominate→Elect→Open) |
+| `budget_manager.py` | Autonomous/failsafe mode budget tracking and enforcement |
+| `idempotency.py` | Message deduplication via event ID tracking |
+| `outbox.py` | Reliable message delivery with retry and exponential backoff |
+| `routing_intelligence.py` | Routing path intelligence sharing across fleet |
+| `routing_pool.py` | Routing pool management for fee distribution |
+| `settlement.py` | BOLT12 settlement system - proposal/vote/execute consensus |
+| `health_aggregator.py` | Fleet health scoring and NNLB status |
+| `network_metrics.py` | Network-level metrics collection |
+| `peer_reputation.py` | Peer reputation tracking and scoring |
+| `quality_scorer.py` | Peer quality scoring for membership decisions |
+| `relay.py` | Message relay logic for multi-hop fleet communication |
+| `rpc_commands.py` | RPC command handlers for all hive-* commands |
+| `channel_rationalization.py` | Channel optimization recommendations |
+| `strategic_positioning.py` | Strategic network positioning analysis |
+| `task_manager.py` | Background task coordination and scheduling |
+| `vpn_transport.py` | VPN transport layer (WireGuard integration) |
+| `yield_metrics.py` | Yield tracking and optimization metrics |
+| `governance.py` | Decision engine (advisor/failsafe mode routing) |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
-| `database.py` | SQLite with WAL mode, thread-local connections |
+| `database.py` | SQLite with WAL mode, thread-local connections, 46 tables |
 
 ### Key Patterns
 
@@ -87,6 +109,15 @@ Core Lightning
 - "Peek & Check" pattern in custommsg hook
 - JSON payload, max 65535 bytes per message
 
+**Idempotent Delivery**:
+- All protocol messages carry unique event IDs
+- `proto_events` table tracks processed events
+- `proto_outbox` table enables reliable retry with exponential backoff
+
+**Relay Protocol**:
+- Multi-hop message relay for peers not directly connected
+- Relay logic in `relay.py` with TTL-based loop prevention
+
 ### Governance Modes
 
 | Mode | Behavior |
@@ -94,7 +125,9 @@ Core Lightning
 | `advisor` | **Primary mode** - Queue to pending_actions for AI/human approval via MCP server |
 | `failsafe` | Emergency mode - Auto-execute only critical safety actions (bans) within strict limits |
 
-### Database Tables
+### Database Tables (46 tables)
+
+Key tables (see `database.py` for complete schema):
 
 | Table | Purpose |
 |-------|---------|
@@ -103,10 +136,25 @@ Core Lightning
 | `hive_state` | Key-value store for persistent state |
 | `contribution_ledger` | Forwarding contribution tracking |
 | `hive_bans` | Ban proposals and votes |
-| `promotion_requests` | Pending promotion requests |
+| `ban_proposals` / `ban_votes` | Distributed ban voting |
+| `promotion_requests` / `promotion_vouches` | Promotion workflow |
 | `hive_planner_log` | Planner decision audit log |
 | `pending_actions` | Actions awaiting approval (advisor mode) |
-| `splice_sessions` | Active and historical splice operations (Phase 11) |
+| `splice_sessions` | Active and historical splice operations |
+| `peer_fee_profiles` | Fee profiles shared by fleet members |
+| `fee_intelligence` | Aggregated fee intelligence data |
+| `fee_reports` | Fee earnings for settlement calculations |
+| `liquidity_needs` / `member_liquidity_state` | Liquidity coordination |
+| `pool_contributions` / `pool_revenue` / `pool_distributions` | Routing pool management |
+| `settlement_proposals` / `settlement_ready_votes` / `settlement_executions` | BOLT12 settlement |
+| `flow_samples` / `temporal_patterns` | Anticipatory liquidity data |
+| `peer_reputation` | Peer reputation scores |
+| `member_health` | Fleet member health tracking |
+| `budget_tracking` / `budget_holds` | Budget enforcement |
+| `proto_events` | Processed event IDs for idempotency |
+| `proto_outbox` | Reliable message delivery outbox |
+| `peer_presence` | Peer online/offline tracking |
+| `peer_capabilities` | Peer protocol capabilities |
 
 ## Safety Constraints
 
@@ -162,7 +210,7 @@ Note: Sling IS required for cl-revenue-ops itself.
 - Only external dependency: `pyln-client>=24.0`
 - All crypto done via CLN HSM (signmessage/checkmessage) - no crypto libs imported
 - Plugin options defined at top of `cl-hive.py` (30 configurable parameters)
-- Background loops: intent_monitor_loop, membership_loop, planner_loop, gossip_loop
+- Background loops (8): gossip_loop, membership_maintenance_loop, planner_loop, intent_monitor_loop, fee_intelligence_loop, settlement_loop, mcf_optimization_loop, outbox_retry_loop
 
 ## Testing Conventions
 
@@ -176,21 +224,46 @@ Note: Sling IS required for cl-revenue-ops itself.
 ```
 cl-hive/
 ├── cl-hive.py              # Main plugin entry point
-├── modules/
+├── modules/                # 39 modules
 │   ├── protocol.py         # Message types and encoding
 │   ├── handshake.py        # PKI authentication
-│   ├── state_manager.py    # Distributed state
+│   ├── state_manager.py    # Distributed state (HiveMap)
 │   ├── gossip.py           # Gossip protocol
 │   ├── intent_manager.py   # Intent locks
-│   ├── bridge.py           # cl-revenue-ops bridge
+│   ├── bridge.py           # cl-revenue-ops bridge (Circuit Breaker)
 │   ├── clboss_bridge.py    # Optional CLBoss bridge
 │   ├── membership.py       # Member management
 │   ├── contribution.py     # Contribution tracking
 │   ├── planner.py          # Topology planner
+│   ├── cooperative_expansion.py  # Fleet expansion elections
 │   ├── splice_manager.py   # Coordinated splice operations
+│   ├── splice_coordinator.py    # Splice coordination engine
+│   ├── mcf_solver.py       # Min-Cost Max-Flow solver
+│   ├── liquidity_coordinator.py # Liquidity needs aggregation
+│   ├── cost_reduction.py   # Fleet rebalance routing
+│   ├── anticipatory_liquidity.py # Kalman-filtered flow prediction
+│   ├── fee_coordination.py # Pheromone-based fee coordination
+│   ├── fee_intelligence.py # Fee intelligence sharing
+│   ├── settlement.py       # BOLT12 settlement system
+│   ├── routing_intelligence.py  # Routing path intelligence
+│   ├── routing_pool.py     # Routing pool management
+│   ├── budget_manager.py   # Budget tracking and enforcement
+│   ├── idempotency.py      # Message deduplication
+│   ├── outbox.py           # Reliable message delivery
+│   ├── relay.py            # Message relay logic
+│   ├── health_aggregator.py    # Fleet health scoring
+│   ├── network_metrics.py  # Network metrics collection
+│   ├── peer_reputation.py  # Peer reputation tracking
+│   ├── quality_scorer.py   # Peer quality scoring
+│   ├── channel_rationalization.py # Channel optimization
+│   ├── strategic_positioning.py   # Network positioning
+│   ├── yield_metrics.py    # Yield tracking
+│   ├── task_manager.py     # Background task coordination
+│   ├── vpn_transport.py    # VPN transport layer
+│   ├── rpc_commands.py     # RPC command handlers
 │   ├── governance.py       # Decision engine (advisor/failsafe)
 │   ├── config.py           # Configuration
-│   └── database.py         # Database layer
+│   └── database.py         # Database layer (46 tables)
 ├── tools/
 │   ├── mcp-hive-server.py  # MCP server for Claude Code integration
 │   ├── hive-monitor.py     # Real-time monitoring daemon
@@ -198,7 +271,7 @@ cl-hive/
 ├── config/
 │   ├── nodes.rest.example.json    # REST API config example
 │   └── nodes.docker.example.json  # Docker/Polar config example
-├── tests/                  # Test suite
+├── tests/                  # 1,340 tests across 46 files
 ├── docs/                   # Documentation
 │   ├── design/             # Design documents
 │   ├── planning/           # Implementation plans

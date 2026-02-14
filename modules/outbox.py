@@ -152,6 +152,12 @@ class OutboxManager:
             return stats
 
         for entry in pending:
+            # Check message expiry before retrying
+            if int(time.time()) >= entry.get("expires_at", float('inf')):
+                self._db.fail_outbox(entry["msg_id"], entry["peer_id"], "expired")
+                stats["failed"] += 1
+                continue
+
             msg_id = entry["msg_id"]
             peer_id = entry["peer_id"]
             msg_type = entry["msg_type"]
@@ -165,7 +171,7 @@ class OutboxManager:
                 stats["failed"] += 1
                 self._log(
                     f"Outbox: max retries for {msg_id[:16]}... -> {peer_id[:16]}...",
-                    level='debug'
+                    level='warn'
                 )
                 continue
 
@@ -173,20 +179,33 @@ class OutboxManager:
             try:
                 payload = json.loads(payload_json)
                 msg_bytes = serialize(HiveMessageType(msg_type), payload)
+            except Exception as e:
+                # Parse/serialize errors are permanent — retrying won't help
+                self._db.fail_outbox(msg_id, peer_id,
+                                     f"parse_error: {str(e)[:100]}")
+                stats["failed"] += 1
+                self._log(
+                    f"Outbox: permanent parse error for {msg_id[:16]}...: {e}",
+                    level='warn'
+                )
+                continue
+
+            try:
                 success = self._send_fn(peer_id, msg_bytes)
             except Exception as e:
-                next_retry = self._calculate_next_retry(retry_count)
-                self._db.update_outbox_sent(msg_id, peer_id, next_retry)
-                stats["skipped"] += 1
-                continue
+                success = False
 
             if success:
                 next_retry = self._calculate_next_retry(retry_count)
                 self._db.update_outbox_sent(msg_id, peer_id, next_retry)
                 stats["sent"] += 1
             else:
-                next_retry = self._calculate_next_retry(retry_count)
-                self._db.update_outbox_sent(msg_id, peer_id, next_retry)
+                # Send failed (peer unreachable) — schedule retry without
+                # incrementing retry_count so we don't burn retry budget
+                # on network failures.  Use shorter delay (base only).
+                short_delay = self.BASE_RETRY_SECONDS + random.uniform(0, 10)
+                next_retry = int(time.time() + short_delay)
+                self._db.update_outbox_retry(msg_id, peer_id, next_retry)
                 stats["skipped"] += 1
 
         return stats
@@ -220,11 +239,8 @@ class OutboxManager:
     def stats(self) -> Dict[str, Any]:
         """Return outbox stats for monitoring."""
         try:
-            pending = self._db.get_outbox_pending(limit=1000)
-            # Count by status from a broader query isn't available,
-            # but we can report pending count
             return {
-                "pending_count": len(pending),
+                "pending_count": self._db.count_outbox_pending(),
             }
         except Exception:
             return {"pending_count": 0}

@@ -872,10 +872,17 @@ class FleetPositioningStrategy:
         Returns:
             PositionRecommendation or None
         """
+        # Cleanup stale recommendation cooldown entries
+        now = time.time()
+        stale = [k for k, v in self._recent_recommendations.items()
+                 if now - v > POSITION_RECOMMENDATION_COOLDOWN_HOURS * 3600]
+        for k in stale:
+            del self._recent_recommendations[k]
+
         # Check cooldown
         cooldown_key = member_id or "fleet"
         last_rec = self._recent_recommendations.get(cooldown_key, 0)
-        if time.time() - last_rec < POSITION_RECOMMENDATION_COOLDOWN_HOURS * 3600:
+        if now - last_rec < POSITION_RECOMMENDATION_COOLDOWN_HOURS * 3600:
             return None
 
         # Get valuable corridors
@@ -1102,8 +1109,9 @@ class PhysarumChannelManager:
         self.yield_metrics = yield_metrics_mgr
         self._our_pubkey: Optional[str] = None
 
-        # Channel flow history
+        # Channel flow history (bounded: max 500 channels, TTL 7 days)
         self._flow_history: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+        self._max_flow_channels = 500
 
     def set_our_pubkey(self, pubkey: str) -> None:
         """Set our node's pubkey."""
@@ -1415,6 +1423,15 @@ class PhysarumChannelManager:
         if not hasattr(self, '_database') or not self._database:
             self._log("Physarum cycle skipped: no database", level="debug")
             return result
+
+        # Periodic cleanup: remove flow history entries not seen in > 7 days
+        seven_days_ago = now - 7 * 86400
+        stale_channels = [
+            cid for cid, entries in self._flow_history.items()
+            if not entries or max(ts for ts, _ in entries) < seven_days_ago
+        ]
+        for cid in stale_channels:
+            del self._flow_history[cid]
 
         # Get all recommendations
         recommendations = self.get_all_recommendations()
@@ -1917,14 +1934,26 @@ class StrategicPositioningManager:
             Dict with acknowledgment
         """
         # Store in flow history
-        self.physarum_mgr._flow_history[channel_id].append((time.time(), intensity))
+        fh = self.physarum_mgr._flow_history
+        fh[channel_id].append((time.time(), intensity))
 
         # Trim old entries
         cutoff = time.time() - (7 * 24 * 3600)  # Keep 7 days
-        self.physarum_mgr._flow_history[channel_id] = [
-            (t, i) for t, i in self.physarum_mgr._flow_history[channel_id]
+        fh[channel_id] = [
+            (t, i) for t, i in fh[channel_id]
             if t >= cutoff
         ]
+
+        # Evict oldest channel if dict exceeds limit
+        max_ch = getattr(self.physarum_mgr, '_max_flow_channels', 500)
+        if len(fh) > max_ch:
+            oldest_cid = min(
+                (c for c in fh if c != channel_id),
+                key=lambda c: fh[c][-1][0] if fh[c] else 0,
+                default=None
+            )
+            if oldest_cid:
+                del fh[oldest_cid]
 
         return {
             "recorded": True,
@@ -2022,7 +2051,7 @@ class StrategicPositioningManager:
                     "competition_level": c.competition_level,
                     "competitor_count": c.competitor_count,
                     "margin_estimate_ppm": c.margin_estimate_ppm,
-                    "fleet_coverage": c.fleet_coverage
+                    "fleet_coverage": c.fleet_members_present
                 })
 
         except Exception as e:
@@ -2053,9 +2082,9 @@ class StrategicPositioningManager:
                     "target_peer_id": r.target_peer_id,
                     "recommended_member": r.recommended_member or "",
                     "priority_tier": r.priority_tier,
-                    "target_capacity_sats": r.target_capacity_sats,
+                    "target_capacity_sats": r.recommended_capacity_sats,
                     "reason": r.reason,
-                    "value_score": round(r.value_score, 4),
+                    "value_score": round(r.priority_score, 4),
                     "is_exchange": r.is_exchange,
                     "is_underserved": r.is_underserved
                 })

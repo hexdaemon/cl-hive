@@ -30,6 +30,7 @@ class ContributionManager:
         self.plugin = plugin
         self.config = config
         self._lock = threading.Lock()
+        self._map_lock = threading.Lock()
         self._channel_map: Dict[str, str] = {}
         self._last_refresh = 0
         self._rate_limits: Dict[str, Tuple[int, int]] = {}
@@ -78,22 +79,27 @@ class ContributionManager:
             self._log(f"Failed to load daily stats: {exc}", level="warn")
 
     def _parse_msat(self, value: Any) -> Optional[int]:
-        if isinstance(value, int):
-            return value
-        if isinstance(value, dict) and "msat" in value:
-            return self._parse_msat(value["msat"])
-        if isinstance(value, str):
-            text = value.strip()
-            if text.endswith("msat"):
-                text = text[:-4]
-            if text.isdigit():
-                return int(text)
+        for _ in range(3):  # Max 3 levels of nesting
+            if isinstance(value, int):
+                return value
+            if isinstance(value, dict) and "msat" in value:
+                value = value["msat"]
+                continue
+            if isinstance(value, str):
+                text = value.strip()
+                if text.endswith("msat"):
+                    text = text[:-4]
+                if text.isdigit():
+                    return int(text)
+            return None
         return None
 
     def _refresh_channel_map(self) -> None:
         now = int(time.time())
-        if now - self._last_refresh < CHANNEL_MAP_REFRESH_SECONDS:
-            return
+        with self._map_lock:
+            if now - self._last_refresh < CHANNEL_MAP_REFRESH_SECONDS:
+                return
+
         try:
             data = self.rpc.listpeerchannels()
         except Exception as exc:
@@ -111,12 +117,14 @@ class ContributionManager:
                 if chan_id:
                     mapping[str(chan_id)] = peer_id
 
-        self._channel_map = mapping
-        self._last_refresh = now
+        with self._map_lock:
+            self._channel_map = mapping
+            self._last_refresh = now
 
     def _lookup_peer(self, channel_id: str) -> Optional[str]:
         self._refresh_channel_map()
-        return self._channel_map.get(channel_id)
+        with self._map_lock:
+            return self._channel_map.get(channel_id)
 
     def _allow_daily_global(self) -> bool:
         """
@@ -240,7 +248,7 @@ class ContributionManager:
         stats = self.get_contribution_stats(peer_id, window_days=LEECH_WINDOW_DAYS)
         ratio = stats["ratio"]
 
-        if ratio > LEECH_BAN_RATIO:
+        if ratio >= LEECH_WARN_RATIO:
             self.db.clear_leech_flag(peer_id)
             return {"is_leech": ratio < LEECH_WARN_RATIO, "ratio": ratio}
 

@@ -2,6 +2,42 @@
 
 All notable changes to cl-hive will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **Ban Enforcement**: Fixed ban enforcement race conditions and stigmergic marker thread safety (e94f63f)
+- **Coordinated Splicing**: Fixed 6 bugs across splice_manager, splice_coordinator, and PSBT exchange (e1660c7)
+- **Anticipatory Liquidity + NNLB**: Thread safety fixes, AttributeError on missing keys, key mismatch in pattern detection (4ecabac)
+- **Intent Lock + MCF**: Thread safety, TOCTOU race condition, TypeError and AttributeError fixes (6423375)
+- **HiveMap + Planner**: Feerate gate validation, freshness checks, defensive copies (f8f07f3)
+- **MCF Coordination**: TypeError crashes, missing permission checks, encapsulation violations (64c9c0d)
+- **Cooperative Rebalancing**: 10 bugs in crashes, thread safety, routing, MCF (656466e)
+- **Pheromone Fee Learning**: Repaired broken loop between cl-hive and cl-revenue-ops (fb9c471)
+- **State Manager**: Added capabilities field validation in state entries (d818771)
+- **MCF Assignments**: Replaced private _mcf_assignments access with public API (cf37109)
+
+## [2.2.8] - 2026-02-07
+
+### Added
+- vitality plugin v0.2.3 for automatic plugin health monitoring and restart
+- Thread safety locks in 7 coordination modules (AdaptiveFeeController, StigmergicCoordinator, MyceliumDefenseSystem, TimeBasedFeeAdjuster, FeeCoordinationManager, VPNTransportManager)
+- Cache bounds to prevent memory bloat (500-1000 entry limits on peer/route caches)
+- Docker image version 2.2.8
+
+### Fixed
+- **Thread Safety**: Fixed race conditions in concurrent modification of shared state
+- **Governance Bypass**: task_manager expansion now routes through governance engine (security)
+- **Outbox Retry**: Parse/serialization errors now fail permanently instead of infinite retry
+- **P0 Crashes**: Fixed AttributeError on _get_topology_snapshot() and None handling in task execution
+- **P1 Logic Errors**: Fixed analyzer references, field names, method calls across 12 modules
+- **P2 Edge Cases**: MCF solution validation, force_close counting, yield metric clamping
+
+### Removed
+- trustedcoin plugin (explorer-only Bitcoin backend no longer needed)
+
+### Changed
+- Updated .env.example documentation to reflect vitality instead of trustedcoin
+
 ## [1.9.0] - 2026-01-24
 
 ### Added

@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 import json
+import os
 import ssl
 
 logger = logging.getLogger(__name__)
@@ -395,10 +396,11 @@ class ExternalPeerIntelligence:
 
         url = f"https://1ml.com/node/{pubkey}/json"
 
-        # Create SSL context that doesn't verify (1ML has cert issues sometimes)
+        # Use proper TLS verification by default; opt-in bypass via env var
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        if os.environ.get("HIVE_1ML_SKIP_TLS_VERIFY"):
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
 
         req = Request(url, headers={"User-Agent": "cl-hive/1.0"})
 

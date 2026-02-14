@@ -82,6 +82,7 @@ class MockDatabase:
 
     def record_pool_distribution(self, **kwargs):
         self.pool_distributions.append(kwargs)
+        return True
 
 
 class MockPlugin:
@@ -388,12 +389,11 @@ class TestPeriodHandling:
 
         period = pool._current_period()
 
-        # Should be YYYY-WNN format
-        assert len(period) == 8
+        # Should be YYYY-WW format (e.g., "2026-06")
+        assert len(period) == 7
         assert period[4] == "-"
-        assert period[5] == "W"
         year = int(period[:4])
-        week = int(period[6:])
+        week = int(period[5:])
         assert year >= 2024
         assert 1 <= week <= 53
 

@@ -67,6 +67,8 @@ def mock_database():
     # Mock global constraint tracking (BUG-001 fix)
     db.count_consecutive_expansion_rejections.return_value = 0
     db.get_recent_expansion_rejections.return_value = []
+    # Mock budget tracking
+    db.get_available_budget.return_value = 2_000_000
     # Mock ignored peers (planner ignore feature)
     db.is_peer_ignored.return_value = False
     # Mock peer event summary for quality scorer (neutral values)
@@ -131,6 +133,10 @@ def mock_config():
     cfg.expansion_pause_threshold = 3  # Pause after 3 consecutive rejections
     cfg.planner_safety_reserve_sats = 500_000  # 500k sats safety reserve
     cfg.planner_fee_buffer_sats = 100_000  # 100k sats for on-chain fees
+    # Budget constraints (needed for pre-intent budget validation)
+    cfg.failsafe_budget_per_day = 10_000_000  # 10M sats daily budget
+    cfg.budget_reserve_pct = 0.20  # 20% reserve
+    cfg.budget_max_per_channel_pct = 0.50  # 50% of daily budget per channel
     return cfg
 
 

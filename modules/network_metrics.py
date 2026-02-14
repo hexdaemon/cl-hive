@@ -797,13 +797,13 @@ class NetworkMetricsCalculator:
         fleet_health = self.get_fleet_health()
 
         # Find members this node is NOT connected to
-        topology = self._get_topology_snapshot()
+        topology = self.get_topology_snapshot()
         if not topology:
             return {"error": "Could not get fleet topology"}
 
-        member_topology = topology.member_topologies.get(member_id, set())
+        hive_connections = topology.member_hive_connections.get(member_id, set())
         all_members = set(all_metrics.keys())
-        not_connected_to = all_members - member_topology - {member_id}
+        not_connected_to = all_members - hive_connections - {member_id}
 
         # Find best connection targets (highest centrality nodes we're not connected to)
         connection_targets = []

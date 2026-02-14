@@ -859,8 +859,13 @@ class TestRpcCommandHandlers:
         plugin = MockPlugin()
         manager = StrategicPositioningManager(plugin=plugin)
 
+        mock_db = MagicMock()
+        mock_db.get_member.return_value = {"tier": "member", "peer_id": "our_pubkey_123"}
+
         ctx = MagicMock(spec=HiveContext)
         ctx.strategic_positioning_mgr = manager
+        ctx.our_pubkey = "our_pubkey_123"
+        ctx.database = mock_db
 
         result = report_flow_intensity(
             ctx,

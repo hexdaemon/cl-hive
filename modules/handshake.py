@@ -516,6 +516,12 @@ class HandshakeManager:
                 for key, _ in oldest[: len(self._pending_challenges) - MAX_PENDING_CHALLENGES]:
                     self._pending_challenges.pop(key, None)
 
+            # Sweep expired challenges (TTL-based expiry)
+            expired = [k for k, v in self._pending_challenges.items()
+                       if now - v['issued_at'] > CHALLENGE_TTL_SECONDS]
+            for k in expired:
+                del self._pending_challenges[k]
+
         return nonce
 
     def get_pending_challenge(self, peer_id: str) -> Optional[Dict[str, Any]]:

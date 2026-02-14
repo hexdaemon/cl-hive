@@ -237,8 +237,17 @@ class StateManager:
             if not isinstance(entry, str) or not entry or len(entry) > MAX_PEER_ID_LEN:
                 return False
 
+        # Validate capabilities field (prevent unbounded arrays or non-string entries)
+        capabilities = data.get("capabilities", [])
+        if not isinstance(capabilities, list) or len(capabilities) > 20:
+            return False
+        for cap in capabilities:
+            if not isinstance(cap, str) or len(cap) > 32:
+                return False
+
+        # Cap available at capacity (don't mutate caller's dict — caller handles it)
         if data.get('available_sats', 0) > data.get('capacity_sats', 0):
-            data['available_sats'] = data['capacity_sats']
+            return False
 
         return True
 
@@ -262,19 +271,13 @@ class StateManager:
                     if not peer_id:
                         continue
 
-                    # Create HivePeerState from DB data
-                    peer_state = HivePeerState(
-                        peer_id=peer_id,
-                        capacity_sats=state_data.get('capacity_sats', 0),
-                        available_sats=state_data.get('available_sats', 0),
-                        fee_policy=state_data.get('fee_policy', {}),
-                        topology=state_data.get('topology', []),
-                        version=state_data.get('version', 0),
-                        last_update=state_data.get('last_gossip', 0),
-                        state_hash=state_data.get('state_hash', ""),
-                    )
-                    self._local_state[peer_id] = peer_state
-                    loaded += 1
+                    # Create HivePeerState from DB data using from_dict for
+                    # defensive copies and consistent field handling
+                    state_data['last_update'] = state_data.get('last_gossip', 0)
+                    peer_state = HivePeerState.from_dict(state_data)
+                    if peer_state:
+                        self._local_state[peer_id] = peer_state
+                        loaded += 1
 
             if loaded > 0:
                 self._log(f"Loaded {loaded} peer states from database")
@@ -317,14 +320,20 @@ class StateManager:
                          f"(local v{existing.version} >= remote v{remote_version})")
                 return False
 
-            # Create new state entry
+            # Create new state entry (use from_dict for defensive copies and field defaults)
             now = int(time.time())
+            # Cap available_sats at capacity_sats
+            avail = gossip_data.get('available_sats', 0)
+            cap = gossip_data.get('capacity_sats', 0)
+            if avail > cap:
+                avail = cap
+
             new_state = HivePeerState(
                 peer_id=peer_id,
-                capacity_sats=gossip_data.get('capacity_sats', 0),
-                available_sats=gossip_data.get('available_sats', 0),
-                fee_policy=gossip_data.get('fee_policy', {}),
-                topology=gossip_data.get('topology', []),
+                capacity_sats=cap,
+                available_sats=avail,
+                fee_policy=dict(gossip_data.get('fee_policy', {})),  # defensive copy
+                topology=list(gossip_data.get('topology', [])),      # defensive copy
                 version=remote_version,
                 last_update=gossip_data.get('timestamp', now),
                 state_hash=gossip_data.get('state_hash', ""),
@@ -333,7 +342,7 @@ class StateManager:
                 budget_reserved_until=gossip_data.get('budget_reserved_until', 0),
                 budget_last_update=gossip_data.get('budget_last_update', 0),
                 # Capabilities (MCF support, etc. - backward compatible, defaults to empty)
-                capabilities=gossip_data.get('capabilities', []),
+                capabilities=list(gossip_data.get('capabilities', [])),  # defensive copy
             )
 
             # Update in-memory cache
@@ -549,14 +558,20 @@ class StateManager:
         return our_state
     
     def get_peer_state(self, peer_id: str) -> Optional[HivePeerState]:
-        """Get cached state for a specific peer."""
+        """Get cached state for a specific peer (returns a defensive copy)."""
         with self._lock:
-            return self._local_state.get(peer_id)
+            state = self._local_state.get(peer_id)
+            if state is None:
+                return None
+            return HivePeerState.from_dict(state.to_dict())
 
     def get_all_peer_states(self) -> List[HivePeerState]:
-        """Get all cached peer states (returns a copy for thread safety)."""
+        """Get all cached peer states (returns defensive copies for thread safety)."""
         with self._lock:
-            return list(self._local_state.values())
+            return [
+                HivePeerState.from_dict(state.to_dict())
+                for state in self._local_state.values()
+            ]
 
     def get_fleet_budget_summary(self, min_channel_sats: int = 0,
                                   stale_threshold_sec: int = 600) -> Dict[str, Any]:
@@ -669,12 +684,15 @@ class StateManager:
     def get_cached_hash(self) -> Tuple[str, int]:
         """
         Get the cached fleet hash if still fresh.
-        
+
         Returns:
             Tuple of (hash_hex, age_seconds)
         """
-        age = int(time.time()) - self._last_hash_time
-        return (self._last_hash, age)
+        with self._lock:
+            last_hash = self._last_hash
+            last_hash_time = self._last_hash_time
+        age = int(time.time()) - last_hash_time
+        return (last_hash, age)
     
     # =========================================================================
     # ANTI-ENTROPY (DIVERGENCE DETECTION)
@@ -708,6 +726,8 @@ class StateManager:
         Apply a FULL_SYNC payload to update local state.
 
         Merges remote state, preferring higher versions.
+        The entire batch is applied atomically under a single lock
+        to prevent concurrent hash calculations from seeing partial state.
 
         Args:
             remote_states: List of peer state dictionaries
@@ -715,9 +735,8 @@ class StateManager:
         Returns:
             Number of states that were updated
         """
-        updated_count = 0
-        states_to_persist = []
-
+        # Validate all entries before acquiring lock
+        validated = []
         for state_dict in remote_states:
             peer_id = state_dict.get('peer_id')
             if not peer_id:
@@ -725,22 +744,26 @@ class StateManager:
             if not self._validate_state_entry(state_dict):
                 self._log(f"Rejected invalid FULL_SYNC entry for {peer_id[:16]}...", level="warn")
                 continue
+            new_state = HivePeerState.from_dict(state_dict)
+            if new_state is None:
+                continue
+            validated.append((peer_id, new_state, state_dict.get('version', 0)))
 
-            remote_version = state_dict.get('version', 0)
+        # Apply all updates atomically under a single lock
+        updated_count = 0
+        states_to_persist = []
 
-            with self._lock:
+        with self._lock:
+            for peer_id, new_state, remote_version in validated:
                 local_state = self._local_state.get(peer_id)
 
                 # Only update if remote is newer
                 if not local_state or local_state.version < remote_version:
-                    new_state = HivePeerState.from_dict(state_dict)
-                    if new_state is None:
-                        continue
                     self._local_state[peer_id] = new_state
                     states_to_persist.append((peer_id, new_state, remote_version))
                     updated_count += 1
 
-        # Persist to database outside lock
+        # Persist to database outside lock (DB has version guard)
         for peer_id, new_state, remote_version in states_to_persist:
             self.db.update_hive_state(
                 peer_id=peer_id,
@@ -761,35 +784,44 @@ class StateManager:
     
     def load_from_database(self) -> int:
         """
-        Load cached state from database on startup.
-        
+        Load cached state from database.
+
+        Only loads entries that are newer than what's already in memory,
+        so this is safe to call after gossip has already been received.
+
         Returns:
-            Number of states loaded
+            Number of states actually loaded or updated
         """
         db_states = self.db.get_all_hive_states()
+        loaded = 0
 
         with self._lock:
             for state_dict in db_states:
                 peer_id = state_dict.get('peer_id')
-                if peer_id:
-                    self._local_state[peer_id] = HivePeerState(
-                        peer_id=peer_id,
-                        capacity_sats=state_dict.get('capacity_sats', 0),
-                        available_sats=state_dict.get('available_sats', 0),
-                        fee_policy=state_dict.get('fee_policy', {}),
-                        topology=state_dict.get('topology', []),
-                        version=state_dict.get('version', 0),
-                        last_update=state_dict.get('last_gossip', 0),
-                        state_hash=state_dict.get('state_hash', "")
-                    )
-            loaded = len(self._local_state)
+                if not peer_id:
+                    continue
+                # DB uses 'last_gossip', HivePeerState uses 'last_update'
+                state_dict['last_update'] = state_dict.get('last_gossip', 0)
+                peer_state = HivePeerState.from_dict(state_dict)
+                if not peer_state:
+                    continue
 
-        self._log(f"Loaded {loaded} peer states from database")
+                # Only load if we don't have a newer version in memory
+                existing = self._local_state.get(peer_id)
+                if not existing or existing.version < peer_state.version:
+                    self._local_state[peer_id] = peer_state
+                    loaded += 1
+
+        if loaded > 0:
+            self._log(f"Loaded {loaded} peer states from database")
         return loaded
     
     def cleanup_stale_states(self, max_age_seconds: int = STALE_STATE_THRESHOLD) -> int:
         """
         Remove states that haven't been updated recently.
+
+        Removes from both in-memory cache and database to prevent
+        stale entries from reappearing after restart.
 
         Args:
             max_age_seconds: Maximum age before state is considered stale
@@ -809,6 +841,14 @@ class StateManager:
             for peer_id in stale_peers:
                 del self._local_state[peer_id]
 
+        # Also remove from database outside lock
+        for peer_id in stale_peers:
+            try:
+                self.db.delete_hive_state(peer_id)
+            except Exception as e:
+                self._log(f"Failed to delete stale state from DB for {peer_id[:16]}...: {e}",
+                         level="warn")
+
         if stale_peers:
             self._log(f"Cleaned up {len(stale_peers)} stale states")
 
@@ -826,7 +866,10 @@ class StateManager:
             Dict with fleet-wide metrics
         """
         with self._lock:
-            states = list(self._local_state.values())
+            states = [
+                HivePeerState.from_dict(state.to_dict())
+                for state in self._local_state.values()
+            ]
 
         if not states:
             return {

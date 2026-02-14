@@ -515,14 +515,13 @@ class Bridge:
                 f"RPC call {method} timed out after {RPC_TIMEOUT}s",
                 level='warn'
             )
-            raise TimeoutError(f"RPC call {method} timed out after {RPC_TIMEOUT}s")
+            raise TimeoutError(f"RPC call {method} timed out after {RPC_TIMEOUT}s") from None
         except RpcError as e:
             cb.record_failure()
             self._log(f"RPC call {method} failed: {e}", level='warn')
             raise
-        except TimeoutError as e:
-            cb.record_failure()
-            self._log(f"RPC call {method} timed out: {e}", level='warn')
+        except TimeoutError:
+            # Re-raised from subprocess.TimeoutExpired above (already recorded)
             raise
         except Exception as e:
             cb.record_failure()
@@ -556,15 +555,16 @@ class Bridge:
         # Security: Rate limit policy changes per peer (Issue #27)
         now = time.time()
         if not bypass_rate_limit:
-            last_change = self._policy_last_change.get(peer_id, 0)
-            if now - last_change < POLICY_RATE_LIMIT_SECONDS:
-                wait_time = int(POLICY_RATE_LIMIT_SECONDS - (now - last_change))
-                self._log(
-                    f"Rate limited: Cannot change policy for {peer_id[:16]}... "
-                    f"(wait {wait_time}s)",
-                    level='debug'
-                )
-                return False
+            with self._budget_lock:
+                last_change = self._policy_last_change.get(peer_id, 0)
+                if now - last_change < POLICY_RATE_LIMIT_SECONDS:
+                    wait_time = int(POLICY_RATE_LIMIT_SECONDS - (now - last_change))
+                    self._log(
+                        f"Rate limited: Cannot change policy for {peer_id[:16]}... "
+                        f"(wait {wait_time}s)",
+                        level='debug'
+                    )
+                    return False
 
         try:
             if is_member:
@@ -585,10 +585,12 @@ class Bridge:
 
             success = result.get("status") == "success"
             if success:
-                self._policy_last_change[peer_id] = now
-                if len(self._policy_last_change) > MAX_POLICY_CACHE:
-                    oldest_key = min(self._policy_last_change, key=self._policy_last_change.get)
-                    del self._policy_last_change[oldest_key]
+                with self._budget_lock:
+                    self._policy_last_change[peer_id] = now
+                    if len(self._policy_last_change) > MAX_POLICY_CACHE:
+                        if self._policy_last_change:
+                            oldest_key = min(self._policy_last_change, key=self._policy_last_change.get)
+                            del self._policy_last_change[oldest_key]
                 self._log(f"Set {'hive' if is_member else 'dynamic'} policy for {peer_id[:16]}...")
             else:
                 self._log(f"Policy set returned: {result}", level='warn')
@@ -706,7 +708,8 @@ class Bridge:
             self._daily_rebalance_sats = max(0, self._daily_rebalance_sats - amount_sats)
 
     def trigger_rebalance(self, target_peer: str, amount_sats: int,
-                          source_peer: str) -> bool:
+                          source_peer: str,
+                          max_fee_sats: int = None) -> bool:
         """
         Trigger a rebalance toward a Hive peer.
 
@@ -716,6 +719,7 @@ class Bridge:
             target_peer: Destination peer_id (will lookup SCID automatically)
             amount_sats: Amount to rebalance in satoshis
             source_peer: Source peer_id to drain liquidity from (required)
+            max_fee_sats: Optional max fee cap in sats (for fleet zero-fee routes)
 
         Returns:
             True if rebalance was initiated successfully
@@ -768,11 +772,15 @@ class Bridge:
             return False
 
         try:
-            result = self.safe_call("revenue-rebalance", {
+            payload = {
                 "from_channel": source_scid,
                 "to_channel": target_scid,
                 "amount_sats": amount_sats
-            })
+            }
+            if max_fee_sats is not None:
+                payload["max_fee_sats"] = max_fee_sats
+
+            result = self.safe_call("revenue-rebalance", payload)
 
             success = result.get("status") in ("success", "initiated", "pending")
             if success:

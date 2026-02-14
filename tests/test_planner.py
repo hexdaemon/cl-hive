@@ -22,8 +22,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.planner import (
     Planner, ChannelInfo, SaturationResult, RpcError, ExpansionRecommendation,
+    ChannelSizer, ChannelSizeResult,
     MAX_IGNORES_PER_CYCLE, SATURATION_RELEASE_THRESHOLD_PCT,
     MIN_TARGET_CAPACITY_SATS, NETWORK_CACHE_TTL_SECONDS,
+    MIN_QUALITY_SCORE,
     # Cooperation module constants (Phase 7)
     HIVE_COVERAGE_MAJORITY_PCT, LOW_COMPETITION_CHANNELS,
     MEDIUM_COMPETITION_CHANNELS, HIGH_COMPETITION_CHANNELS,
@@ -57,6 +59,8 @@ def mock_database():
     # Mock global constraint tracking (BUG-001 fix)
     db.count_consecutive_expansion_rejections.return_value = 0
     db.get_recent_expansion_rejections.return_value = []
+    # Mock budget tracking
+    db.get_available_budget.return_value = 2_000_000  # Matches failsafe_budget_per_day
     # Mock ignored peers (planner ignore feature)
     db.is_peer_ignored.return_value = False
     # Mock peer event summary for quality scorer (neutral values)
@@ -1433,6 +1437,270 @@ class TestCooperationModuleIntegration:
         assert planner.liquidity_coordinator == mock_liq
         assert planner.splice_coordinator == mock_splice
         assert planner.health_aggregator == mock_health
+
+
+# =============================================================================
+# CHANNEL SIZER TESTS (Phase 6.3)
+# =============================================================================
+
+class TestChannelSizer:
+    """Tests for the ChannelSizer intelligent sizing engine."""
+
+    def _default_params(self, **overrides):
+        """Return default params for ChannelSizer.calculate_size()."""
+        params = dict(
+            target='02' + 'a' * 64,
+            target_capacity_sats=5_000_000_000,  # 50 BTC (mid-size)
+            target_channel_count=50,
+            hive_share_pct=0.01,
+            target_share_cap=0.10,
+            onchain_balance_sats=100_000_000,  # 1 BTC
+            min_channel_sats=1_000_000,
+            max_channel_sats=50_000_000,
+            default_channel_sats=5_000_000,
+            avg_fee_rate_ppm=500,
+            quality_score=0.5,
+            quality_confidence=0.5,
+            quality_recommendation='neutral',
+        )
+        params.update(overrides)
+        return params
+
+    def test_default_baseline_within_bounds(self):
+        """Default sizing should produce result between min and max."""
+        sizer = ChannelSizer()
+        result = sizer.calculate_size(**self._default_params())
+        assert result.recommended_size_sats >= 1_000_000
+        assert result.recommended_size_sats <= 50_000_000
+
+    def test_mid_size_node_preferred(self):
+        """Mid-size node (50 BTC) should score higher than very large (5000 BTC)."""
+        sizer = ChannelSizer()
+        mid = sizer.calculate_size(**self._default_params(
+            target_capacity_sats=50_00_000_000,  # 50 BTC
+            target_channel_count=50
+        ))
+        large = sizer.calculate_size(**self._default_params(
+            target_capacity_sats=500_000_000_000,  # 5000 BTC
+            target_channel_count=500
+        ))
+        assert mid.recommended_size_sats >= large.recommended_size_sats
+
+    def test_excellent_quality_bonus(self):
+        """Excellent quality (0.9) should size larger than neutral (0.5)."""
+        sizer = ChannelSizer()
+        excellent = sizer.calculate_size(**self._default_params(
+            quality_score=0.9, quality_confidence=0.8, quality_recommendation='excellent'
+        ))
+        neutral = sizer.calculate_size(**self._default_params(
+            quality_score=0.5, quality_confidence=0.8, quality_recommendation='neutral'
+        ))
+        assert excellent.recommended_size_sats > neutral.recommended_size_sats
+
+    def test_caution_quality_reduction(self):
+        """Caution quality (0.2) should size smaller than neutral (0.5)."""
+        sizer = ChannelSizer()
+        caution = sizer.calculate_size(**self._default_params(
+            quality_score=0.2, quality_confidence=0.8, quality_recommendation='caution'
+        ))
+        neutral = sizer.calculate_size(**self._default_params(
+            quality_score=0.5, quality_confidence=0.8, quality_recommendation='neutral'
+        ))
+        assert caution.recommended_size_sats < neutral.recommended_size_sats
+
+    def test_budget_limited_sizing(self):
+        """Channel size should be capped at available budget."""
+        sizer = ChannelSizer()
+        result = sizer.calculate_size(**self._default_params(
+            available_budget_sats=2_000_000
+        ))
+        assert result.recommended_size_sats <= 2_000_000
+
+    def test_liquidity_constrained_sizing(self):
+        """Low balance should produce smaller channel size."""
+        sizer = ChannelSizer()
+        low_balance = sizer.calculate_size(**self._default_params(
+            onchain_balance_sats=3_000_000  # Very tight
+        ))
+        high_balance = sizer.calculate_size(**self._default_params(
+            onchain_balance_sats=500_000_000  # Flush
+        ))
+        assert low_balance.recommended_size_sats <= high_balance.recommended_size_sats
+
+    def test_zero_capacity_target(self):
+        """Zero capacity target should produce a low capacity score."""
+        sizer = ChannelSizer()
+        result = sizer.calculate_size(**self._default_params(
+            target_capacity_sats=0
+        ))
+        assert result.factors['capacity_score'] == 0.5
+        assert result.factors['target_capacity_btc'] == 0.0
+
+    def test_zero_channels_low_routing(self):
+        """Target with zero channels should have low routing score."""
+        sizer = ChannelSizer()
+        result = sizer.calculate_size(**self._default_params(
+            target_channel_count=0
+        ))
+        assert result.factors['routing_score'] < 1.0
+
+    def test_low_confidence_quality_neutral(self):
+        """Low confidence quality should use neutral factor (1.0)."""
+        sizer = ChannelSizer()
+        result = sizer.calculate_size(**self._default_params(
+            quality_score=0.9, quality_confidence=0.1
+        ))
+        assert result.factors['quality_factor'] == 1.0
+        assert result.factors.get('quality_note') == 'low_confidence_neutral'
+
+    def test_insufficient_budget_flagged(self):
+        """Budget below minimum should be flagged in factors."""
+        sizer = ChannelSizer()
+        result = sizer.calculate_size(**self._default_params(
+            available_budget_sats=500_000,  # Below min_channel_sats of 1M
+            min_channel_sats=1_000_000
+        ))
+        assert result.factors.get('insufficient_budget') is True
+
+    def test_share_gap_influences_size(self):
+        """Larger share gap (more underserved) should produce larger channel."""
+        sizer = ChannelSizer()
+        underserved = sizer.calculate_size(**self._default_params(
+            hive_share_pct=0.0, target_share_cap=0.10
+        ))
+        well_served = sizer.calculate_size(**self._default_params(
+            hive_share_pct=0.09, target_share_cap=0.10
+        ))
+        assert underserved.recommended_size_sats >= well_served.recommended_size_sats
+
+
+# =============================================================================
+# QUALITY SCORE VARIATION TESTS (Phase 6.2)
+# =============================================================================
+
+class TestQualityScoreVariation:
+    """Tests for quality score filtering in get_underserved_targets()."""
+
+    def _setup_planner_with_target(self, planner, mock_plugin, mock_database,
+                                    mock_state_manager, target, capacity_sats=200_000_000):
+        """Setup a planner with a target in the network cache."""
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [{
+                'source': '02' + 'd' * 64,
+                'destination': target,
+                'short_channel_id': '100x1x0',
+                'satoshis': capacity_sats,
+                'active': True
+            }]
+        }
+        planner._refresh_network_cache(force=True)
+
+        # No existing channels
+        mock_plugin.rpc.listpeerchannels.return_value = {'channels': []}
+
+        # No hive members with channels to target (underserved)
+        mock_database.get_all_members.return_value = [
+            {'peer_id': '02' + 'a' * 64, 'tier': 'member'}
+        ]
+        mock_state_manager.get_all_peer_states.return_value = []
+
+    @staticmethod
+    def _filter_target(results, target):
+        """Filter results for a specific target pubkey."""
+        return [r for r in results if r.target == target]
+
+    def _make_quality_result(self, score, confidence, recommendation):
+        """Create a mock quality result."""
+        result = MagicMock()
+        result.overall_score = score
+        result.confidence = confidence
+        result.recommendation = recommendation
+        return result
+
+    def test_high_quality_scores_higher(self, planner, mock_config, mock_plugin,
+                                         mock_database, mock_state_manager):
+        """High quality target should score higher than neutral."""
+        target = '02' + 'e' * 64
+        self._setup_planner_with_target(planner, mock_plugin, mock_database,
+                                         mock_state_manager, target)
+
+        # Mock quality scorer returning high quality
+        mock_scorer = MagicMock()
+        mock_scorer.calculate_score.return_value = self._make_quality_result(0.85, 0.8, 'excellent')
+        planner.quality_scorer = mock_scorer
+
+        results_high = self._filter_target(planner.get_underserved_targets(mock_config), target)
+
+        # Now test with neutral quality
+        mock_scorer.calculate_score.return_value = self._make_quality_result(0.5, 0.8, 'neutral')
+        results_neutral = self._filter_target(planner.get_underserved_targets(mock_config), target)
+
+        assert len(results_high) == 1
+        assert len(results_neutral) == 1
+        # High quality should produce a higher combined score
+        assert results_high[0].score > results_neutral[0].score
+
+    def test_avoid_recommendation_filtered(self, planner, mock_config, mock_plugin,
+                                            mock_database, mock_state_manager):
+        """Target with 'avoid' recommendation should be filtered out."""
+        target = '02' + 'e' * 64
+        self._setup_planner_with_target(planner, mock_plugin, mock_database,
+                                         mock_state_manager, target)
+
+        mock_scorer = MagicMock()
+        mock_scorer.calculate_score.return_value = self._make_quality_result(0.2, 0.8, 'avoid')
+        planner.quality_scorer = mock_scorer
+
+        results = self._filter_target(planner.get_underserved_targets(mock_config), target)
+        assert len(results) == 0
+
+    def test_low_quality_included_when_flag_set(self, planner, mock_config, mock_plugin,
+                                                 mock_database, mock_state_manager):
+        """Low quality target should be included when include_low_quality=True."""
+        target = '02' + 'e' * 64
+        self._setup_planner_with_target(planner, mock_plugin, mock_database,
+                                         mock_state_manager, target)
+
+        mock_scorer = MagicMock()
+        mock_scorer.calculate_score.return_value = self._make_quality_result(0.2, 0.8, 'avoid')
+        planner.quality_scorer = mock_scorer
+
+        results = self._filter_target(
+            planner.get_underserved_targets(mock_config, include_low_quality=True), target
+        )
+        assert len(results) == 1
+
+    def test_below_min_quality_with_high_confidence_filtered(self, planner, mock_config,
+                                                              mock_plugin, mock_database,
+                                                              mock_state_manager):
+        """Below MIN_QUALITY_SCORE with sufficient confidence should be filtered."""
+        target = '02' + 'e' * 64
+        self._setup_planner_with_target(planner, mock_plugin, mock_database,
+                                         mock_state_manager, target)
+
+        mock_scorer = MagicMock()
+        # Score below MIN_QUALITY_SCORE (0.45), high confidence, not 'avoid'
+        mock_scorer.calculate_score.return_value = self._make_quality_result(0.3, 0.8, 'caution')
+        planner.quality_scorer = mock_scorer
+
+        results = self._filter_target(planner.get_underserved_targets(mock_config), target)
+        assert len(results) == 0
+
+    def test_below_min_quality_with_low_confidence_passes(self, planner, mock_config,
+                                                           mock_plugin, mock_database,
+                                                           mock_state_manager):
+        """Below MIN_QUALITY_SCORE with low confidence should pass (neutral treatment)."""
+        target = '02' + 'e' * 64
+        self._setup_planner_with_target(planner, mock_plugin, mock_database,
+                                         mock_state_manager, target)
+
+        mock_scorer = MagicMock()
+        # Score below threshold but LOW confidence - should not filter
+        mock_scorer.calculate_score.return_value = self._make_quality_result(0.3, 0.1, 'caution')
+        planner.quality_scorer = mock_scorer
+
+        results = self._filter_target(planner.get_underserved_targets(mock_config), target)
+        assert len(results) == 1
 
 
 if __name__ == "__main__":

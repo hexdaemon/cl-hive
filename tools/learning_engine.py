@@ -215,6 +215,12 @@ class LearningEngine:
                 snapshot_metrics = {}
         snapshot_metrics = snapshot_metrics or {}
 
+        # Enrich decision with data from snapshot_metrics if not already present
+        if not decision.get("predicted_benefit") and snapshot_metrics:
+            decision["predicted_benefit"] = snapshot_metrics.get("predicted_benefit", 0)
+        if not decision.get("opportunity_type") and snapshot_metrics.get("opportunity_type"):
+            decision["opportunity_type"] = snapshot_metrics["opportunity_type"]
+
         # Get current state for comparison
         current_state = self._get_current_channel_state(node_name, channel_id)
 
@@ -281,28 +287,45 @@ class LearningEngine:
         before: Dict,
         after: Optional[Dict]
     ) -> ActionOutcome:
-        """Measure outcome of a fee change decision."""
+        """
+        Measure outcome of a fee change decision using revenue-based comparison.
+
+        Primary metric: fees_earned_sats delta (direct revenue measurement).
+        Secondary metric: forward_count delta (volume proxy).
+        When both are 0 (no activity), outcome is neutral rather than failed.
+        """
         if not after:
             after = {}
 
-        # Compare routing volume/revenue before and after
+        before_revenue = before.get("fees_earned_sats", 0)
+        after_revenue = after.get("fees_earned_sats", 0)
         before_flow = before.get("forward_count", 0)
         after_flow = after.get("forward_count", 0)
-        before_fee = before.get("fee_ppm", 0)
         after_fee = after.get("fee_ppm", 0)
 
-        # Success: maintained or improved flow with same/higher fee
-        # OR: significantly increased flow with moderately lower fee
-        if after_flow >= before_flow and after_fee >= before_fee * 0.9:
+        # Primary metric: revenue change (direct measurement)
+        revenue_delta = after_revenue - before_revenue
+
+        # Secondary metric: flow count change (volume proxy)
+        flow_delta = after_flow - before_flow
+
+        # Success criteria:
+        # 1. Revenue increased or maintained with fee change
+        # 2. Or flow increased significantly even if revenue flat
+        # 3. No activity = neutral (don't penalize inactive channels)
+        if revenue_delta > 0:
             success = True
-            actual_benefit = (after_flow - before_flow) * after_fee // 1000
-        elif after_flow > before_flow * 1.5 and after_fee >= before_fee * 0.7:
+            actual_benefit = revenue_delta
+        elif revenue_delta == 0 and flow_delta > 0:
             success = True
-            actual_benefit = (after_flow - before_flow) * after_fee // 1000
+            actual_benefit = flow_delta * after_fee // 1_000_000  # estimate from count
+        elif revenue_delta == 0 and flow_delta == 0:
+            # No data yet — neutral (don't penalize for no activity)
+            success = True
+            actual_benefit = 0
         else:
             success = False
-            # Negative benefit if flow dropped significantly
-            actual_benefit = (after_flow - before_flow) * after_fee // 1000
+            actual_benefit = revenue_delta  # negative
 
         predicted_benefit = decision.get("predicted_benefit", 0)
         if predicted_benefit != 0:

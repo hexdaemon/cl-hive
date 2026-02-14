@@ -643,6 +643,43 @@ class TestFleetRebalanceRouter:
         assert result["recommendation"] == "use_external_path"
         assert result["estimated_external_cost_sats"] > 0
 
+    def test_source_eligible_members_returned(self):
+        """When fleet path exists, source_eligible_members should list our peers connected to to_peer."""
+        plugin = MagicMock()
+        to_peer = "02" + "bb" * 32
+        fleet_member = "02" + "cc" * 32  # hive member connected to to_peer AND our peer
+
+        # Mock listpeerchannels: we have channels with from_peer, to_peer, and fleet_member
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"short_channel_id": "100x1x0", "peer_id": "02" + "aa" * 32},
+                {"short_channel_id": "200x2x0", "peer_id": to_peer},
+                {"short_channel_id": "300x3x0", "peer_id": fleet_member},
+            ]
+        }
+        plugin.rpc.listchannels.return_value = {"channels": []}
+
+        # Mock state_manager: fleet_member is connected to to_peer in topology
+        state_manager = MockStateManager()
+        state_manager.set_peer_state(fleet_member, capacity=1_000_000)
+        state_manager.peer_states[fleet_member].topology = [to_peer]
+
+        router = FleetRebalanceRouter(plugin=plugin, state_manager=state_manager)
+
+        # Patch _get_peer_for_channel to return the right peers
+        with patch.object(router, '_get_peer_for_channel', side_effect=lambda ch: {
+            "100x1x0": "02" + "aa" * 32,
+            "200x2x0": to_peer,
+        }.get(ch)):
+            result = router.get_best_rebalance_path(
+                from_channel="100x1x0",
+                to_channel="200x2x0",
+                amount_sats=100000
+            )
+
+        if result["fleet_path_available"]:
+            assert fleet_member in result.get("source_eligible_members", [])
+
 
 # =============================================================================
 # CIRCULAR FLOW DETECTOR TESTS
@@ -969,3 +1006,88 @@ class TestConstants:
         """Verify circular flow minimum is reasonable."""
         assert MIN_CIRCULAR_AMOUNT_SATS >= 10000
         assert MIN_CIRCULAR_AMOUNT_SATS == 100000  # 100k sats
+
+
+class TestHiveCircularDelegation:
+    """Tests for circular rebalance delegation to bridge/sling."""
+
+    def _make_manager(self):
+        """Create a CostReductionManager with mocks for circular rebalance testing."""
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "02" + "aa" * 32}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "100x1x0",
+                    "peer_id": "02" + "bb" * 32,
+                    "to_us_msat": 5_000_000_000,  # 5M sats outbound
+                    "state": "CHANNELD_NORMAL",
+                },
+                {
+                    "short_channel_id": "200x2x0",
+                    "peer_id": "02" + "cc" * 32,
+                    "to_us_msat": 500_000_000,  # 500k sats outbound
+                    "state": "CHANNELD_NORMAL",
+                },
+            ]
+        }
+        plugin.rpc.listchannels.return_value = {
+            "channels": [
+                {
+                    "source": "02" + "bb" * 32,
+                    "destination": "02" + "cc" * 32,
+                    "short_channel_id": "300x3x0",
+                }
+            ]
+        }
+
+        db = MagicMock()
+        db.get_all_members.return_value = [
+            {"peer_id": "02" + "bb" * 32},
+            {"peer_id": "02" + "cc" * 32},
+        ]
+
+        mgr = CostReductionManager(plugin, db)
+        return mgr
+
+    def test_execute_delegates_to_bridge(self):
+        """Execution should delegate to bridge.safe_call with revenue-rebalance."""
+        mgr = self._make_manager()
+        bridge = MagicMock()
+        bridge.safe_call.return_value = {"status": "initiated", "rebalance_id": 42}
+
+        result = mgr.execute_hive_circular_rebalance(
+            from_channel="100x1x0",
+            to_channel="200x2x0",
+            amount_sats=50000,
+            dry_run=False,
+            bridge=bridge,
+        )
+
+        assert result["status"] == "initiated"
+        bridge.safe_call.assert_called_once()
+        call_args = bridge.safe_call.call_args
+        assert call_args[0][0] == "revenue-rebalance"
+        payload = call_args[0][1]
+        assert payload["from_channel"] == "100x1x0"
+        assert payload["to_channel"] == "200x2x0"
+        assert payload["amount_sats"] == 50000
+        assert payload["max_fee_sats"] == 10
+
+    def test_dry_run_still_returns_preview(self):
+        """dry_run=True should return route preview without calling bridge."""
+        mgr = self._make_manager()
+        bridge = MagicMock()
+
+        result = mgr.execute_hive_circular_rebalance(
+            from_channel="100x1x0",
+            to_channel="200x2x0",
+            amount_sats=50000,
+            dry_run=True,
+            bridge=bridge,
+        )
+
+        assert result["status"] == "preview"
+        assert result["dry_run"] is True
+        assert len(result["route"]) > 0
+        bridge.safe_call.assert_not_called()

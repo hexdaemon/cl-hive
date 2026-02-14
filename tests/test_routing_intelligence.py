@@ -283,6 +283,7 @@ class TestHiveRoutingMap:
         """Test rejecting probe from non-member."""
         mock_rpc = MagicMock()
         non_member = "02" + "z" * 64
+        mock_rpc.checkmessage.return_value = {"verified": True, "pubkey": non_member}
 
         payload = {
             "reporter_id": non_member,
@@ -966,6 +967,7 @@ class TestRouteProbeBatch:
         """Test rejecting batch from non-member."""
         mock_rpc = MagicMock()
         non_member = "02" + "z" * 64
+        mock_rpc.checkmessage.return_value = {"verified": True, "pubkey": non_member}
 
         now = int(time.time())
         payload = {

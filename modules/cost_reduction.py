@@ -13,12 +13,16 @@ reactively when desperate and fees are high.
 Author: Lightning Goats Team
 """
 
+import threading
 import time
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict, deque
 
+# TODO: Integrate routing_intelligence.HiveRoutingMap to bias MCF/BFS path
+# selection toward routes with high collective success rates. Currently,
+# fleet route probe data is collected but not consumed here.
 from . import network_metrics
 from .mcf_solver import (
     MCFCoordinator,
@@ -429,9 +433,8 @@ class FleetRebalanceRouter:
         self.liquidity_coordinator = liquidity_coordinator
         self._our_pubkey: Optional[str] = None
 
-        # Cache for fleet topology
-        self._topology_cache: Dict[str, Set[str]] = {}  # member -> connected peers
-        self._topology_cache_time: float = 0
+        # Cache for fleet topology (atomic snapshot pattern for thread safety)
+        self._topology_snapshot: Tuple[Dict[str, Set[str]], float] = ({}, 0)  # (topology, timestamp)
         self._topology_cache_ttl: float = 300  # 5 minutes
 
     def set_our_pubkey(self, pubkey: str) -> None:
@@ -448,13 +451,15 @@ class FleetRebalanceRouter:
         Get fleet member topology (who is connected to whom).
 
         Returns cached topology if fresh, otherwise rebuilds from state.
+        Uses atomic snapshot replacement for thread safety.
         """
         now = time.time()
+        snapshot = self._topology_snapshot  # Atomic read
 
         # Return cached if fresh
-        if (self._topology_cache and
-            now - self._topology_cache_time < self._topology_cache_ttl):
-            return self._topology_cache
+        if (snapshot[0] and
+            now - snapshot[1] < self._topology_cache_ttl):
+            return snapshot[0]
 
         # Rebuild from state manager
         topology = {}
@@ -470,8 +475,7 @@ class FleetRebalanceRouter:
             except Exception as e:
                 self._log(f"Error getting fleet topology: {e}", level="debug")
 
-        self._topology_cache = topology
-        self._topology_cache_time = now
+        self._topology_snapshot = (topology, now)  # Atomic replacement
         return topology
 
     def _get_fleet_members(self) -> List[str]:
@@ -562,12 +566,14 @@ class FleetRebalanceRouter:
                     reliability_score=max(0.5, 1.0 - 0.1 * len(path))
                 )
 
-            # Add neighbors (other fleet members this member is connected to)
+            # Add neighbors (other fleet members this member has a direct channel to)
             current_peers = topology.get(current, set())
-            for member, member_peers in topology.items():
+            for member in topology:
                 if member not in visited and member != current:
-                    # Check if there's a connection
-                    if current_peers & member_peers:  # Shared peers
+                    # Check if current has a direct channel to member
+                    # (member appears in current's peer set, or current in member's)
+                    member_peers = topology.get(member, set())
+                    if member in current_peers or current in member_peers:
                         queue.append((member, path + [member]))
 
         return None
@@ -652,6 +658,27 @@ class FleetRebalanceRouter:
                 if savings >= FLEET_PATH_SAVINGS_THRESHOLD:
                     result["recommendation"] = "use_fleet_path"
 
+            # Find source-eligible fleet members: our direct peers that are
+            # also connected to to_peer.  These make ideal sling source
+            # candidates because the route us -> member -> to_peer is 2-hop
+            # and zero-fee through fleet channels.
+            topology = self._get_fleet_topology()
+            try:
+                our_peers = set()
+                channels = self.plugin.rpc.listpeerchannels()
+                for ch in channels.get("channels", []):
+                    pid = ch.get("peer_id")
+                    if pid and ch.get("short_channel_id"):
+                        our_peers.add(pid)
+            except Exception:
+                our_peers = set()
+
+            source_eligible = []
+            for member, peers in topology.items():
+                if member in our_peers and to_peer in peers:
+                    source_eligible.append(member)
+            result["source_eligible_members"] = source_eligible
+
         return result
 
     def _get_peer_for_channel(self, channel_id: str) -> Optional[str]:
@@ -727,7 +754,8 @@ class FleetRebalanceRouter:
         hubs.sort(key=lambda h: h["hub_score"], reverse=True)
         return hubs
 
-    def _score_path_with_hub_bonus(self, path: List[str], amount_sats: int) -> float:
+    def _score_path_with_hub_bonus(self, path: List[str], amount_sats: int,
+                                    hub_scores: Optional[Dict[str, float]] = None) -> float:
         """
         Score a fleet path considering hub scores of members.
 
@@ -736,6 +764,7 @@ class FleetRebalanceRouter:
         Args:
             path: List of member pubkeys in the path
             amount_sats: Amount being routed
+            hub_scores: Optional pre-fetched hub scores to avoid repeated lookups
 
         Returns:
             Combined score (lower is better for routing)
@@ -743,7 +772,8 @@ class FleetRebalanceRouter:
         if not path:
             return float('inf')
 
-        hub_scores = self.get_member_hub_scores()
+        if hub_scores is None:
+            hub_scores = self.get_member_hub_scores()
 
         # Base cost component
         cost = self._estimate_fleet_cost(amount_sats, len(path))
@@ -794,10 +824,13 @@ class FleetRebalanceRouter:
             # Fall back to regular path finding
             return self.find_fleet_path(from_peer, to_peer, amount_sats)
 
+        # Fetch hub scores once for all path scoring
+        hub_scores = self.get_member_hub_scores()
+
         # Score each path with hub bonus
         scored_paths = []
         for path in all_paths:
-            score = self._score_path_with_hub_bonus(path, amount_sats)
+            score = self._score_path_with_hub_bonus(path, amount_sats, hub_scores=hub_scores)
             scored_paths.append((path, score))
 
         # Sort by score (lower is better)
@@ -805,8 +838,7 @@ class FleetRebalanceRouter:
 
         # Return best path
         best_path = scored_paths[0][0]
-        hub_scores = self.get_member_hub_scores()
-        avg_hub = sum(hub_scores.get(m, 0.0) for m in best_path) / len(best_path)
+        avg_hub = sum(hub_scores.get(m, 0.0) for m in best_path) / max(1, len(best_path))
 
         return FleetPath(
             path=best_path,
@@ -815,6 +847,9 @@ class FleetRebalanceRouter:
             estimated_time_seconds=30 * len(best_path),
             reliability_score=max(0.5, min(0.95, 0.8 + avg_hub * 0.2))  # Hub score boosts reliability
         )
+
+    # Maximum number of candidate paths to collect in DFS
+    _MAX_CANDIDATE_PATHS = 100
 
     def _find_all_fleet_paths(
         self,
@@ -826,6 +861,7 @@ class FleetRebalanceRouter:
         Find all fleet paths between peers up to max_depth.
 
         Returns multiple paths for hub-aware selection.
+        Bounded to _MAX_CANDIDATE_PATHS to prevent combinatorial explosion.
         """
         topology = self._get_fleet_topology()
         all_paths = []
@@ -848,8 +884,13 @@ class FleetRebalanceRouter:
         if not end_members:
             return []
 
+        max_paths = self._MAX_CANDIDATE_PATHS
+
         # DFS to find all paths
         def dfs(current: str, path: List[str], visited: Set[str]):
+            if len(all_paths) >= max_paths:
+                return
+
             if len(path) > max_depth:
                 return
 
@@ -858,10 +899,13 @@ class FleetRebalanceRouter:
                 return
 
             current_peers = topology.get(current, set())
-            for member, member_peers in topology.items():
+            for member in topology:
+                if len(all_paths) >= max_paths:
+                    return
                 if member not in visited and member != current:
-                    # Check if connected
-                    if current_peers & member_peers:
+                    # Check if current has a direct channel to member
+                    member_peers = topology.get(member, set())
+                    if member in current_peers or current in member_peers:
                         visited.add(member)
                         path.append(member)
                         dfs(member, path, visited)
@@ -870,6 +914,8 @@ class FleetRebalanceRouter:
 
         # Search from each start member
         for start in start_members:
+            if len(all_paths) >= max_paths:
+                break
             dfs(start, [start], {start})
 
         return all_paths
@@ -980,6 +1026,12 @@ class CircularFlowDetector:
         self._rebalance_history: List[RebalanceOutcome] = []
         self._max_history_size = 1000
 
+        # Remote circular flow alerts received from fleet
+        self._remote_circular_alerts: List[Dict[str, Any]] = []
+
+        # Thread safety for history and alerts
+        self._history_lock = threading.Lock()
+
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
         if self.plugin:
@@ -1027,11 +1079,12 @@ class CircularFlowDetector:
             member_id=member_id
         )
 
-        self._rebalance_history.append(outcome)
+        with self._history_lock:
+            self._rebalance_history.append(outcome)
 
-        # Trim history if too large
-        if len(self._rebalance_history) > self._max_history_size:
-            self._rebalance_history = self._rebalance_history[-self._max_history_size:]
+            # Trim history if too large
+            if len(self._rebalance_history) > self._max_history_size:
+                self._rebalance_history = self._rebalance_history[-self._max_history_size:]
 
     def detect_circular_flows(
         self,
@@ -1048,9 +1101,10 @@ class CircularFlowDetector:
         """
         circular_flows = []
 
-        # Filter to recent rebalances
+        # Filter to recent rebalances (snapshot under lock)
         cutoff = time.time() - (window_hours * 3600)
-        recent = [r for r in self._rebalance_history if r.timestamp >= cutoff]
+        with self._history_lock:
+            recent = [r for r in self._rebalance_history if r.timestamp >= cutoff]
 
         if len(recent) < 2:
             return circular_flows
@@ -1209,11 +1263,11 @@ class CircularFlowDetector:
                     continue
 
                 recommendation = self._get_circular_flow_recommendation(
-                    cf.cycle, cf.total_amount_sats, cf.total_cost_sats
+                    cf.members, cf.total_amount_sats, cf.total_cost_sats
                 )
 
                 shareable.append({
-                    "members_involved": cf.cycle,
+                    "members_involved": cf.members,
                     "total_amount_sats": cf.total_amount_sats,
                     "total_cost_sats": cf.total_cost_sats,
                     "cycle_count": cf.cycle_count,
@@ -1248,10 +1302,6 @@ class CircularFlowDetector:
         if len(members) < 2:
             return False
 
-        # Initialize remote alerts storage if needed
-        if not hasattr(self, "_remote_circular_alerts"):
-            self._remote_circular_alerts: List[Dict[str, Any]] = []
-
         entry = {
             "reporter_id": reporter_id,
             "members_involved": members,
@@ -1262,11 +1312,12 @@ class CircularFlowDetector:
             "timestamp": time.time()
         }
 
-        self._remote_circular_alerts.append(entry)
+        with self._history_lock:
+            self._remote_circular_alerts.append(entry)
 
-        # Keep only last 100 alerts
-        if len(self._remote_circular_alerts) > 100:
-            self._remote_circular_alerts = self._remote_circular_alerts[-100:]
+            # Keep only last 100 alerts
+            if len(self._remote_circular_alerts) > 100:
+                self._remote_circular_alerts = self._remote_circular_alerts[-100:]
 
         return True
 
@@ -1288,21 +1339,23 @@ class CircularFlowDetector:
             for cf in local_flows:
                 alerts.append({
                     "source": "local",
-                    "members_involved": cf.cycle,
+                    "members_involved": cf.members,
                     "total_amount_sats": cf.total_amount_sats,
                     "total_cost_sats": cf.total_cost_sats,
                     "cycle_count": cf.cycle_count,
                     "recommendation": self._get_circular_flow_recommendation(
-                        cf.cycle, cf.total_amount_sats, cf.total_cost_sats
+                        cf.members, cf.total_amount_sats, cf.total_cost_sats
                     )
                 })
         except Exception:
             pass
 
-        # Remote alerts
-        if include_remote and hasattr(self, "_remote_circular_alerts"):
+        # Remote alerts (snapshot under lock)
+        if include_remote:
             now = time.time()
-            for alert in self._remote_circular_alerts:
+            with self._history_lock:
+                remote_snapshot = list(self._remote_circular_alerts)
+            for alert in remote_snapshot:
                 # Only include recent alerts (last 24 hours)
                 if now - alert.get("timestamp", 0) < 86400:
                     alert_copy = alert.copy()
@@ -1331,8 +1384,6 @@ class CircularFlowDetector:
 
     def cleanup_old_remote_alerts(self, max_age_hours: float = 24) -> int:
         """Remove old remote circular flow alerts."""
-        if not hasattr(self, "_remote_circular_alerts"):
-            return 0
 
         cutoff = time.time() - (max_age_hours * 3600)
         before = len(self._remote_circular_alerts)
@@ -1404,6 +1455,14 @@ class CostReductionManager:
         self._mcf_enabled: bool = True  # Can be disabled via config
 
         self._our_pubkey: Optional[str] = None
+
+        # MCF ACK tracking (thread-safe)
+        self._mcf_acks: Dict[str, Dict[str, Any]] = {}
+        self._mcf_acks_lock = threading.Lock()
+
+        # MCF completion tracking (thread-safe)
+        self._mcf_completions: Dict[str, Dict[str, Any]] = {}
+        self._mcf_completions_lock = threading.Lock()
 
     def set_our_pubkey(self, pubkey: str) -> None:
         """Set our node's pubkey."""
@@ -1559,9 +1618,28 @@ class CostReductionManager:
         Returns:
             Dict with recording result and any circular flow warnings
         """
-        # Get peer IDs
-        from_peer = self.fleet_router._get_peer_for_channel(from_channel) or ""
-        to_peer = self.fleet_router._get_peer_for_channel(to_channel) or ""
+        # Get peer IDs with a single RPC call (skip if peers unknown)
+        from_peer = None
+        to_peer = None
+        try:
+            if self.plugin and self.plugin.rpc:
+                channels = self.plugin.rpc.listpeerchannels()
+                for ch in channels.get("channels", []):
+                    scid = ch.get("short_channel_id", "").replace(":", "x")
+                    if scid == from_channel.replace(":", "x"):
+                        from_peer = ch.get("peer_id")
+                    elif scid == to_channel.replace(":", "x"):
+                        to_peer = ch.get("peer_id")
+                    if from_peer and to_peer:
+                        break
+        except Exception:
+            pass
+
+        if not from_peer or not to_peer:
+            return {
+                "status": "recorded",
+                "warning": "Could not resolve peers for circular flow tracking"
+            }
 
         # Record for circular flow detection
         self.circular_detector.record_rebalance_outcome(
@@ -1746,6 +1824,7 @@ class CostReductionManager:
                 assignments = self._mcf_coordinator.get_our_assignments()
                 for assignment in assignments:
                     if (assignment.from_channel == from_channel and
+                        assignment.to_channel == to_channel and
                         assignment.amount_sats >= amount_sats):
                         return {
                             "source": "mcf",
@@ -1796,27 +1875,26 @@ class CostReductionManager:
         if not self._mcf_coordinator:
             return
 
-        # Track ACK for monitoring
+        # Track ACK for monitoring (thread-safe)
         ack_key = f"{member_id}:{solution_timestamp}"
-        if not hasattr(self, "_mcf_acks"):
-            self._mcf_acks: Dict[str, Dict[str, Any]] = {}
 
-        self._mcf_acks[ack_key] = {
-            "member_id": member_id,
-            "solution_timestamp": solution_timestamp,
-            "assignment_count": assignment_count,
-            "received_at": int(time.time())
-        }
+        with self._mcf_acks_lock:
+            self._mcf_acks[ack_key] = {
+                "member_id": member_id,
+                "solution_timestamp": solution_timestamp,
+                "assignment_count": assignment_count,
+                "received_at": int(time.time())
+            }
 
-        # Limit cache size
-        if len(self._mcf_acks) > 500:
-            # Remove oldest entries
-            sorted_acks = sorted(
-                self._mcf_acks.items(),
-                key=lambda x: x[1].get("received_at", 0)
-            )
-            for k, _ in sorted_acks[:100]:
-                del self._mcf_acks[k]
+            # Limit cache size
+            if len(self._mcf_acks) > 500:
+                # Remove oldest entries
+                sorted_acks = sorted(
+                    self._mcf_acks.items(),
+                    key=lambda x: x[1].get("received_at", 0)
+                )
+                for k, _ in sorted_acks[:100]:
+                    del self._mcf_acks[k]
 
         self._log(f"Recorded MCF ACK from {member_id[:16]}... for solution {solution_timestamp}")
 
@@ -1840,42 +1918,38 @@ class CostReductionManager:
             actual_cost_sats: Actual cost incurred
             failure_reason: Reason for failure if not successful
         """
-        if not hasattr(self, "_mcf_completions"):
-            self._mcf_completions: Dict[str, Dict[str, Any]] = {}
+        with self._mcf_completions_lock:
+            self._mcf_completions[assignment_id] = {
+                "member_id": member_id,
+                "assignment_id": assignment_id,
+                "success": success,
+                "actual_amount_sats": actual_amount_sats,
+                "actual_cost_sats": actual_cost_sats,
+                "failure_reason": failure_reason,
+                "completed_at": int(time.time())
+            }
 
-        self._mcf_completions[assignment_id] = {
-            "member_id": member_id,
-            "assignment_id": assignment_id,
-            "success": success,
-            "actual_amount_sats": actual_amount_sats,
-            "actual_cost_sats": actual_cost_sats,
-            "failure_reason": failure_reason,
-            "completed_at": int(time.time())
-        }
-
-        # Limit cache size
-        if len(self._mcf_completions) > 1000:
-            sorted_completions = sorted(
-                self._mcf_completions.items(),
-                key=lambda x: x[1].get("completed_at", 0)
-            )
-            for k, _ in sorted_completions[:200]:
-                del self._mcf_completions[k]
+            # Limit cache size
+            if len(self._mcf_completions) > 1000:
+                sorted_completions = sorted(
+                    self._mcf_completions.items(),
+                    key=lambda x: x[1].get("completed_at", 0)
+                )
+                for k, _ in sorted_completions[:200]:
+                    del self._mcf_completions[k]
 
         status = "succeeded" if success else f"failed: {failure_reason}"
         self._log(f"MCF assignment {assignment_id[:20]}... {status} ({actual_amount_sats} sats)")
 
     def get_mcf_acks(self) -> List[Dict[str, Any]]:
         """Get all recorded MCF acknowledgments."""
-        if not hasattr(self, "_mcf_acks"):
-            return []
-        return list(self._mcf_acks.values())
+        with self._mcf_acks_lock:
+            return list(self._mcf_acks.values())
 
     def get_mcf_completions(self) -> List[Dict[str, Any]]:
         """Get all recorded MCF completion reports."""
-        if not hasattr(self, "_mcf_completions"):
-            return []
-        return list(self._mcf_completions.values())
+        with self._mcf_completions_lock:
+            return list(self._mcf_completions.values())
 
     def execute_hive_circular_rebalance(
         self,
@@ -1883,13 +1957,15 @@ class CostReductionManager:
         to_channel: str,
         amount_sats: int,
         via_members: Optional[List[str]] = None,
-        dry_run: bool = True
+        dry_run: bool = True,
+        bridge: Any = None
     ) -> Dict[str, Any]:
         """
-        Execute a circular rebalance through the hive using explicit sendpay route.
+        Execute a circular rebalance through the hive, delegating to sling via bridge.
 
-        This bypasses sling's automatic route finding and uses an explicit route
-        through hive members, ensuring zero-fee internal routing.
+        Dry-run mode shows the route preview. Execution delegates to cl-revenue-ops
+        via the bridge, which feeds the rebalance through sling with proper retries,
+        parallelism, and budget enforcement.
 
         Args:
             from_channel: Source channel SCID (where we have outbound liquidity)
@@ -1898,6 +1974,7 @@ class CostReductionManager:
             via_members: Optional list of intermediate member pubkeys. If not provided,
                         will attempt to find a path automatically.
             dry_run: If True, just show the route without executing (default: True)
+            bridge: Bridge instance for delegating execution to cl-revenue-ops
 
         Returns:
             Dict with route details and execution result (or preview if dry_run)
@@ -1932,7 +2009,7 @@ class CostReductionManager:
                 return {"error": f"Destination channel {to_channel} not found"}
 
             # Verify source has enough outbound liquidity
-            from_local = from_chan.get('to_us_msat', 0)
+            from_local = int(from_chan.get('to_us_msat', 0))
             if from_local < amount_msat:
                 return {
                     "error": f"Insufficient outbound liquidity in {from_channel}",
@@ -2068,70 +2145,45 @@ class CostReductionManager:
                 result["message"] = "Dry run - route preview only. Set dry_run=false to execute."
                 return result
 
-            # Execute the rebalance
-            # 1. Create invoice for ourselves
-            import secrets
-            label = f"hive-rebalance-{int(time.time())}-{secrets.token_hex(4)}"
-            invoice = rpc.invoice(
-                amount_msat=amount_msat,
-                label=label,
-                description="Hive circular rebalance"
-            )
-            payment_hash = invoice['payment_hash']
-            payment_secret = invoice.get('payment_secret')
-
-            result["invoice_label"] = label
-            result["payment_hash"] = payment_hash
-
-            # 2. Send via explicit route
-            try:
-                sendpay_result = rpc.sendpay(
-                    route=route,
-                    payment_hash=payment_hash,
-                    payment_secret=payment_secret,
-                    amount_msat=amount_msat
+            # Governance gate: only execute if explicitly requested (dry_run=False is
+            # an explicit RPC call). The caller is responsible for governance checks.
+            # Log the execution for audit trail.
+            if self.plugin:
+                self.plugin.log(
+                    f"cl-hive: Executing hive circular rebalance: {amount_sats} sats "
+                    f"{from_channel} -> {to_channel}",
+                    level="info"
                 )
-                result["sendpay_result"] = sendpay_result
 
-                # 3. Wait for completion using short polling to avoid RPC lock starvation
-                # Use short timeouts (2s) with retries to allow other RPC calls
-                max_attempts = 30  # 30 * 2s = 60s total
-                waitsendpay_result = None
-                for attempt in range(max_attempts):
-                    try:
-                        waitsendpay_result = rpc.waitsendpay(
-                            payment_hash=payment_hash,
-                            timeout=2  # Short timeout to release RPC lock frequently
-                        )
-                        # Success - payment completed
-                        break
-                    except Exception as wait_err:
-                        err_str = str(wait_err)
-                        # Check if it's just a timeout (payment still in progress)
-                        if "Timed out" in err_str or "timeout" in err_str.lower():
-                            # Payment still in progress, continue polling
-                            continue
-                        # Real error - payment failed
-                        raise
+            # Execute via bridge delegation to cl-revenue-ops / sling
+            if not bridge:
+                result["status"] = "failed"
+                result["error"] = "Bridge not available — cl-revenue-ops required for rebalance execution"
+                return result
 
-                if waitsendpay_result:
-                    result["status"] = "success"
-                    result["waitsendpay_result"] = waitsendpay_result
-                    result["message"] = f"Successfully rebalanced {amount_sats} sats through hive at zero fees!"
+            try:
+                bridge_result = bridge.safe_call("revenue-rebalance", {
+                    "from_channel": from_channel,
+                    "to_channel": to_channel,
+                    "amount_sats": amount_sats,
+                    "max_fee_sats": 10  # Nominal cap — fleet routes are zero-fee
+                })
+
+                bridge_status = bridge_result.get("status", "unknown")
+                if bridge_status in ("success", "initiated", "pending"):
+                    result["status"] = "initiated"
+                    result["message"] = (
+                        f"Rebalance of {amount_sats} sats delegated to sling via cl-revenue-ops"
+                    )
+                    result["bridge_result"] = bridge_result
                 else:
-                    result["status"] = "timeout"
-                    result["error"] = "Payment timed out after 60 seconds"
+                    result["status"] = "failed"
+                    result["error"] = bridge_result.get("error", f"Bridge returned status: {bridge_status}")
+                    result["bridge_result"] = bridge_result
 
             except Exception as e:
-                error_str = str(e)
                 result["status"] = "failed"
-                result["error"] = error_str
-
-                # Clean up the invoice
-                try:
-                    rpc.delinvoice(label=label, status="unpaid")
-                except Exception:
-                    pass
+                result["error"] = f"Bridge call failed: {e}"
 
             return result
 

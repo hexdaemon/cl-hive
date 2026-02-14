@@ -666,7 +666,7 @@ class TestOutboxManagerBackoff:
         next_retry = outbox._calculate_next_retry(0)
         delay = next_retry - int(time.time())
         assert delay >= outbox.BASE_RETRY_SECONDS
-        assert delay <= outbox.BASE_RETRY_SECONDS * 1.26
+        assert delay <= outbox.BASE_RETRY_SECONDS * 1.30  # 25% jitter + int() rounding
 
 
 class TestOutboxManagerStats:

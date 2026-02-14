@@ -167,6 +167,8 @@ class Alert:
 class FleetMonitor:
     """Monitors a fleet of Hive nodes."""
 
+    MAX_ALERTS = 1000
+
     def __init__(self, nodes: Dict[str, NodeConnection], db_path: str = None):
         self.nodes = nodes
         self.state: Dict[str, NodeState] = {}
@@ -198,6 +200,8 @@ class FleetMonitor:
             details=details or {}
         )
         self.alerts.append(alert)
+        if len(self.alerts) > self.MAX_ALERTS:
+            self.alerts = self.alerts[-self.MAX_ALERTS:]
 
         # Log based on severity
         log_msg = f"[{node}] {message}"
@@ -365,8 +369,8 @@ class FleetMonitor:
                 "remote_sats": total_sats - our_sats,
                 "balance_ratio": round(balance_ratio, 3),
                 # Fee info
-                "fee_base_msat": ch.get("fee_base_msat", 0),
-                "fee_ppm": ch.get("fee_proportional_millionths", 0),
+                "fee_base_msat": ch.get("updates", {}).get("local", {}).get("fee_base_msat", 0),
+                "fee_ppm": ch.get("updates", {}).get("local", {}).get("fee_proportional_millionths", 0),
                 # Flow state from revenue-ops
                 "flow_state": flow.get("state", "unknown"),
                 "flow_ratio": round(flow.get("flow_ratio", 0), 3),

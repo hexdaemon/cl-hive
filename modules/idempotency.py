@@ -38,6 +38,7 @@ EVENT_ID_FIELDS: Dict[str, list] = {
     "TASK_REQUEST": ["request_id"],
     "TASK_RESPONSE": ["request_id", "responder_id"],
     # Phase 11: Splice coordination
+    "SPLICE_INIT_RESPONSE": ["session_id", "responder_id"],
     "SPLICE_INIT_REQUEST": ["session_id"],
     "SPLICE_UPDATE": ["session_id", "update_seq"],
     "SPLICE_SIGNED": ["session_id"],

@@ -66,6 +66,9 @@ class TaskManager:
         self.plugin = plugin
         self.our_pubkey = our_pubkey
 
+        # Governance engine reference (set by cl-hive.py after init)
+        self.decision_engine: Any = None
+
         # Rate limiting trackers
         self._request_rate: Dict[str, List[int]] = {}
         self._response_rate: Dict[str, List[int]] = {}
@@ -108,6 +111,19 @@ class TaskManager:
 
         # Remove old entries
         tracker[sender_id] = [t for t in tracker[sender_id] if t > cutoff]
+
+        # Evict empty/stale keys to prevent unbounded dict growth
+        if len(tracker) > 200:
+            stale = [k for k, v in tracker.items() if not v]
+            for k in stale:
+                del tracker[k]
+        # Also evict keys whose most recent timestamp is older than the window
+        stale_window = [
+            k for k, v in tracker.items()
+            if v and max(v) <= cutoff
+        ]
+        for k in stale_window:
+            del tracker[k]
 
         return len(tracker[sender_id]) < max_count
 
@@ -385,8 +401,44 @@ class TaskManager:
             f"(type={task_type}, target={task_params.get('target', '')[:16]}...)"
         )
 
-        # Execute the task asynchronously (or queue it)
-        # For now, we'll execute immediately in a try/except
+        # Route through governance engine for approval
+        if self.decision_engine:
+            try:
+                context = {
+                    "action": "delegated_task_execute",
+                    "task_type": task_type,
+                    "task_params": task_params,
+                    "requester_id": requester_id,
+                    "request_id": request_id,
+                }
+                decision = self.decision_engine.propose_action(
+                    action_type="channel_open" if task_type == TASK_TYPE_EXPAND_TO else "delegated_task",
+                    target=task_params.get("target", requester_id),
+                    context=context,
+                )
+                # In advisor mode, this queues to pending_actions — do NOT execute
+                if not getattr(decision, "approved", False):
+                    self._log(
+                        f"Task {request_id} queued for governance approval "
+                        f"(mode={getattr(decision, 'mode', 'unknown')})"
+                    )
+                    self.db.update_incoming_task_status(request_id, "pending_approval")
+                    return {"status": "pending_approval", "request_id": request_id}
+            except Exception as e:
+                self._log(f"Governance check failed for task {request_id}: {e}", level='error')
+                # Fail closed: do not execute without governance approval
+                self.db.update_incoming_task_status(request_id, "pending_approval")
+                return {"status": "pending_approval", "request_id": request_id}
+        else:
+            # No decision engine available — fail closed, queue for manual review
+            self._log(
+                f"No governance engine — task {request_id} queued for manual approval",
+                level='warn'
+            )
+            self.db.update_incoming_task_status(request_id, "pending_approval")
+            return {"status": "pending_approval", "request_id": request_id}
+
+        # Only reaches here if governance explicitly approved (failsafe emergency)
         self._execute_task(request_id, task_type, task_params, requester_id, rpc)
 
         return {"status": "accepted", "request_id": request_id}
@@ -472,6 +524,14 @@ class TaskManager:
         """Execute a channel open task."""
         target = task_params.get('target')
         amount_sats = task_params.get('amount_sats')
+
+        if not target or amount_sats is None:
+            self._log("Invalid expand task params: missing target or amount_sats", level='error')
+            self.db.update_incoming_task_status(
+                request_id, 'failed',
+                result_data=json.dumps({"error": "missing target or amount_sats"})
+            )
+            return
 
         self._log(f"Executing expand_to task: {target[:16]}... for {amount_sats} sats")
 

@@ -9,7 +9,7 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -333,7 +333,7 @@ class TestOpportunityScanner:
             }
         }
 
-        opportunities = asyncio.get_event_loop().run_until_complete(
+        opportunities = asyncio.new_event_loop().run_until_complete(
             opportunity_scanner._scan_velocity_alerts("test-node", state)
         )
 
@@ -358,7 +358,7 @@ class TestOpportunityScanner:
             }
         }
 
-        opportunities = asyncio.get_event_loop().run_until_complete(
+        opportunities = asyncio.new_event_loop().run_until_complete(
             opportunity_scanner._scan_profitability("test-node", state)
         )
 
@@ -383,7 +383,7 @@ class TestOpportunityScanner:
             ]
         }
 
-        opportunities = asyncio.get_event_loop().run_until_complete(
+        opportunities = asyncio.new_event_loop().run_until_complete(
             opportunity_scanner._scan_imbalanced_channels("test-node", state)
         )
 
@@ -543,7 +543,7 @@ class TestAdvisorDBSchema:
 
     def test_daily_budget(self, temp_db):
         """Test daily budget tracking."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         budget = {
             "fee_changes_used": 5,

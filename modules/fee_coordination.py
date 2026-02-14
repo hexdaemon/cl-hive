@@ -12,10 +12,12 @@ This module integrates with cl-revenue-ops for fee execution while
 maintaining coordination at the cl-hive layer.
 """
 
+import json
 import math
+import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import network_metrics
@@ -37,11 +39,11 @@ SECONDARY_FEE_MULTIPLIER = 1.5    # Secondary: premium for overflow
 BASE_EVAPORATION_RATE = 0.2       # 20% base evaporation per cycle
 MIN_EVAPORATION_RATE = 0.1        # Minimum evaporation
 MAX_EVAPORATION_RATE = 0.9        # Maximum evaporation
-PHEROMONE_EXPLOIT_THRESHOLD = 10.0  # Above this: exploit current fee
+PHEROMONE_EXPLOIT_THRESHOLD = 2.0   # Above this: exploit current fee (lowered for low-traffic nodes)
 PHEROMONE_DEPOSIT_SCALE = 0.001   # Scale factor for deposits
 
 # Stigmergic markers
-MARKER_HALF_LIFE_HOURS = 24       # Markers decay with 24-hour half-life
+MARKER_HALF_LIFE_HOURS = 168      # Markers decay with 7-day half-life (extended for low-traffic nodes)
 MARKER_MIN_STRENGTH = 0.1         # Below this, markers are ignored
 
 # Mycelium defense
@@ -402,9 +404,8 @@ class FlowCorridorManager:
         self.liquidity_coordinator = liquidity_coordinator
         self.our_pubkey: Optional[str] = None
 
-        # Cache of assignments
-        self._assignments: Dict[Tuple[str, str], CorridorAssignment] = {}
-        self._assignments_timestamp: float = 0
+        # Cache of assignments — single atomic tuple: (dict, timestamp)
+        self._assignments_snapshot: Tuple[Dict[Tuple[str, str], CorridorAssignment], float] = ({}, 0)
         self._assignments_ttl: float = 3600  # 1 hour cache
 
     def set_our_pubkey(self, pubkey: str) -> None:
@@ -568,24 +569,25 @@ class FlowCorridorManager:
         """Get all corridor assignments, refreshing if needed."""
         now = time.time()
 
+        assignments, ts = self._assignments_snapshot
         if (not force_refresh and
-            self._assignments and
-            now - self._assignments_timestamp < self._assignments_ttl):
-            return list(self._assignments.values())
+            assignments and
+            now - ts < self._assignments_ttl):
+            return list(assignments.values())
 
-        # Refresh assignments
+        # Refresh assignments (build into local dict, then atomic swap)
         corridors = self.identify_corridors()
-        self._assignments = {}
+        new_assignments = {}
 
         for corridor in corridors:
             assignment = self.assign_corridor(corridor)
             key = (corridor.source_peer_id, corridor.destination_peer_id)
-            self._assignments[key] = assignment
+            new_assignments[key] = assignment
 
-        self._assignments_timestamp = now
-        self._log(f"Refreshed {len(self._assignments)} corridor assignments")
+        self._assignments_snapshot = (new_assignments, now)
+        self._log(f"Refreshed {len(new_assignments)} corridor assignments")
 
-        return list(self._assignments.values())
+        return list(new_assignments.values())
 
     def is_primary_for_corridor(
         self,
@@ -595,7 +597,8 @@ class FlowCorridorManager:
     ) -> bool:
         """Check if member is primary for a specific corridor."""
         key = (source, destination)
-        assignment = self._assignments.get(key)
+        assignments, _ = self._assignments_snapshot
+        assignment = assignments.get(key)
         if assignment:
             return assignment.primary_member == member_id
         return False
@@ -612,7 +615,8 @@ class FlowCorridorManager:
         Returns (fee_ppm, is_primary)
         """
         key = (source, destination)
-        assignment = self._assignments.get(key)
+        assignments, _ = self._assignments_snapshot
+        assignment = assignments.get(key)
 
         if not assignment:
             return DEFAULT_FEE_PPM, False
@@ -640,6 +644,9 @@ class AdaptiveFeeController:
         self.plugin = plugin
         self.our_pubkey: Optional[str] = None
 
+        # Lock protecting pheromone state from concurrent modification
+        self._lock = threading.Lock()
+
         # Pheromone levels per channel (fee memory)
         self._pheromone: Dict[str, float] = defaultdict(float)
 
@@ -659,7 +666,8 @@ class AdaptiveFeeController:
         self._velocity_cache: Dict[str, float] = {}
         self._velocity_cache_time: Dict[str, float] = {}
 
-        # Network fee volatility tracking
+        # Network fee volatility tracking (separate lock to avoid nesting with _lock)
+        self._fee_obs_lock = threading.Lock()
         self._fee_observations: List[Tuple[float, int]] = []  # (timestamp, fee)
 
     def set_our_pubkey(self, pubkey: str) -> None:
@@ -677,7 +685,8 @@ class AdaptiveFeeController:
         Dynamic environment: High evaporation (explore new fee points)
         """
         # Get balance velocity (if available)
-        velocity = self._velocity_cache.get(channel_id, 0.0)
+        with self._lock:
+            velocity = self._velocity_cache.get(channel_id, 0.0)
 
         # Get network fee volatility
         fee_volatility = self._calculate_fee_volatility()
@@ -697,12 +706,15 @@ class AdaptiveFeeController:
 
     def _calculate_fee_volatility(self) -> float:
         """Calculate recent fee volatility in the network."""
-        if len(self._fee_observations) < 2:
+        with self._fee_obs_lock:
+            observations = list(self._fee_observations)
+
+        if len(observations) < 2:
             return 0.0
 
         # Filter to recent observations (last hour)
         now = time.time()
-        recent = [f for t, f in self._fee_observations if now - t < 3600]
+        recent = [f for t, f in observations if now - t < 3600]
 
         if len(recent) < 2:
             return 0.0
@@ -714,18 +726,20 @@ class AdaptiveFeeController:
 
     def update_velocity(self, channel_id: str, velocity_pct_per_hour: float) -> None:
         """Update cached velocity for a channel."""
-        self._velocity_cache[channel_id] = velocity_pct_per_hour
-        self._velocity_cache_time[channel_id] = time.time()
+        with self._lock:
+            self._velocity_cache[channel_id] = velocity_pct_per_hour
+            self._velocity_cache_time[channel_id] = time.time()
 
     def record_fee_observation(self, fee_ppm: int) -> None:
         """Record a network fee observation for volatility calculation."""
-        self._fee_observations.append((time.time(), fee_ppm))
+        with self._fee_obs_lock:
+            self._fee_observations.append((time.time(), fee_ppm))
 
-        # Keep only recent observations
-        cutoff = time.time() - 3600
-        self._fee_observations = [
-            (t, f) for t, f in self._fee_observations if t > cutoff
-        ]
+            # Keep only recent observations
+            cutoff = time.time() - 3600
+            self._fee_observations = [
+                (t, f) for t, f in self._fee_observations if t > cutoff
+            ]
 
     def update_pheromone(
         self,
@@ -748,37 +762,39 @@ class AdaptiveFeeController:
         now = time.time()
         evap_rate = self.calculate_evaporation_rate(channel_id)
 
-        # Apply time-based exponential decay (half-life model)
-        # If no timestamp exists, apply at least one cycle of decay
-        if channel_id in self._pheromone_last_update:
-            last_update = self._pheromone_last_update[channel_id]
-            hours_elapsed = (now - last_update) / 3600.0
-            if hours_elapsed > 0 and self._pheromone[channel_id] > 0:
-                # Convert per-cycle evaporation to continuous decay
-                # If evap_rate = 0.2 means 20% loss per hour, apply proportionally
-                decay_factor = math.pow(1 - evap_rate, hours_elapsed)
-                self._pheromone[channel_id] *= decay_factor
-        elif self._pheromone[channel_id] > 0:
-            # No timestamp but has pheromone - apply one cycle of decay
-            # This handles legacy data and ensures evaporation on failure
-            self._pheromone[channel_id] *= (1 - evap_rate)
+        with self._lock:
+            # Apply time-based exponential decay (half-life model)
+            # If no timestamp exists, apply at least one cycle of decay
+            if channel_id in self._pheromone_last_update:
+                last_update = self._pheromone_last_update[channel_id]
+                hours_elapsed = (now - last_update) / 3600.0
+                if hours_elapsed > 0 and self._pheromone[channel_id] > 0:
+                    # Convert per-cycle evaporation to continuous decay
+                    # If evap_rate = 0.2 means 20% loss per hour, apply proportionally
+                    decay_factor = math.pow(1 - evap_rate, hours_elapsed)
+                    self._pheromone[channel_id] *= decay_factor
+            elif self._pheromone[channel_id] > 0:
+                # No timestamp but has pheromone - apply one cycle of decay
+                # This handles legacy data and ensures evaporation on failure
+                self._pheromone[channel_id] *= (1 - evap_rate)
 
-        # Update timestamp
-        self._pheromone_last_update[channel_id] = now
+            # Update timestamp
+            self._pheromone_last_update[channel_id] = now
 
-        if routing_success:
-            # Deposit proportional to revenue
-            deposit = revenue_sats * PHEROMONE_DEPOSIT_SCALE
-            self._pheromone[channel_id] += deposit
+            if routing_success:
+                # Deposit proportional to revenue
+                deposit = revenue_sats * PHEROMONE_DEPOSIT_SCALE
+                self._pheromone[channel_id] += deposit
 
-            # Track the fee that earned this pheromone
-            self._pheromone_fee[channel_id] = current_fee
+                # Track fee via exponential moving average (not just last value)
+                prev_fee = self._pheromone_fee.get(channel_id, current_fee)
+                self._pheromone_fee[channel_id] = int(0.3 * current_fee + 0.7 * prev_fee)
 
-            self._log(
-                f"Channel {channel_id[:8]}: pheromone deposit {deposit:.2f}, "
-                f"total now {self._pheromone[channel_id]:.2f}",
-                level="debug"
-            )
+                self._log(
+                    f"Channel {channel_id[:8]}: pheromone deposit {deposit:.2f}, "
+                    f"total now {self._pheromone[channel_id]:.2f}",
+                    level="debug"
+                )
 
     def suggest_fee(
         self,
@@ -791,7 +807,8 @@ class AdaptiveFeeController:
 
         Returns (suggested_fee, reason)
         """
-        pheromone = self._pheromone.get(channel_id, 0)
+        with self._lock:
+            pheromone = self._pheromone.get(channel_id, 0)
 
         if pheromone > PHEROMONE_EXPLOIT_THRESHOLD:
             # Strong signal - exploit current fee
@@ -800,11 +817,11 @@ class AdaptiveFeeController:
             # Weak signal - explore
             if local_balance_pct < 0.3:
                 # Depleting - raise fees to slow outflow
-                new_fee = int(current_fee * 1.15)
+                new_fee = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, int(current_fee * 1.15)))
                 return new_fee, "explore_raise_depleting"
             elif local_balance_pct > 0.7:
                 # Saturating - lower fees to attract flow
-                new_fee = int(current_fee * 0.85)
+                new_fee = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, int(current_fee * 0.85)))
                 return new_fee, "explore_lower_saturating"
             else:
                 # Balanced - small exploration
@@ -812,11 +829,13 @@ class AdaptiveFeeController:
 
     def get_pheromone_level(self, channel_id: str) -> float:
         """Get current pheromone level for a channel."""
-        return self._pheromone.get(channel_id, 0.0)
+        with self._lock:
+            return self._pheromone.get(channel_id, 0.0)
 
     def get_all_pheromone_levels(self) -> Dict[str, float]:
         """Get all pheromone levels."""
-        return dict(self._pheromone)
+        with self._lock:
+            return dict(self._pheromone)
 
     def set_channel_peer_mapping(self, channel_id: str, peer_id: str) -> None:
         """
@@ -825,20 +844,26 @@ class AdaptiveFeeController:
         This is needed for sharing pheromones - we share by peer_id
         so other members with channels to the same peer can learn.
         """
-        self._channel_peer_map[channel_id] = peer_id
+        with self._lock:
+            self._channel_peer_map[channel_id] = peer_id
 
     def update_channel_peer_mappings(self, channels: List[Dict[str, Any]]) -> None:
         """
-        Update channel-to-peer mappings from a list of channel info.
+        Replace channel-to-peer mappings from a list of channel info.
+
+        Replaces the entire map (not merge) so closed channels are evicted.
 
         Args:
             channels: List of channel dicts with 'short_channel_id' and 'peer_id'
         """
+        new_map = {}
         for ch in channels:
             channel_id = ch.get("short_channel_id")
             peer_id = ch.get("peer_id")
             if channel_id and peer_id:
-                self._channel_peer_map[channel_id] = peer_id
+                new_map[channel_id] = peer_id
+        with self._lock:
+            self._channel_peer_map = new_map
 
     def get_shareable_pheromones(
         self,
@@ -866,18 +891,23 @@ class AdaptiveFeeController:
         exclude_peer_ids = exclude_peer_ids or set()
         shareable = []
 
-        for channel_id, level in self._pheromone.items():
+        with self._lock:
+            pheromone_snapshot = dict(self._pheromone)
+            fee_snapshot = dict(self._pheromone_fee)
+            peer_map_snapshot = dict(self._channel_peer_map)
+
+        for channel_id, level in pheromone_snapshot.items():
             # Check level threshold
             if level < min_level:
                 continue
 
             # Get the fee that earned this pheromone
-            fee_ppm = self._pheromone_fee.get(channel_id)
+            fee_ppm = fee_snapshot.get(channel_id)
             if fee_ppm is None:
                 continue
 
             # Get peer_id for this channel
-            peer_id = self._channel_peer_map.get(channel_id)
+            peer_id = peer_map_snapshot.get(channel_id)
             if not peer_id:
                 continue
 
@@ -928,6 +958,10 @@ class AdaptiveFeeController:
         if level <= 0 or fee_ppm <= 0:
             return False
 
+        # Bound values to prevent manipulation via gossip
+        fee_ppm = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, fee_ppm))
+        level = max(0.0, min(100.0, level))
+
         # Store remote pheromone, keyed by the external peer
         entry = {
             "reporter_id": reporter_id,
@@ -937,10 +971,24 @@ class AdaptiveFeeController:
             "weight": weighting_factor
         }
 
-        # Keep only recent reports per peer (last 10)
-        self._remote_pheromones[peer_id].append(entry)
-        if len(self._remote_pheromones[peer_id]) > 10:
-            self._remote_pheromones[peer_id] = self._remote_pheromones[peer_id][-10:]
+        with self._lock:
+            # Keep only recent reports per peer (last 10)
+            self._remote_pheromones[peer_id].append(entry)
+            if len(self._remote_pheromones[peer_id]) > 10:
+                self._remote_pheromones[peer_id] = self._remote_pheromones[peer_id][-10:]
+
+            # Cap total peer count at 500
+            if len(self._remote_pheromones) > 500:
+                oldest_pid = min(
+                    (p for p in self._remote_pheromones if p != peer_id),
+                    key=lambda p: max(
+                        (r.get("timestamp", 0) for r in self._remote_pheromones[p]),
+                        default=0
+                    ),
+                    default=None
+                )
+                if oldest_pid:
+                    del self._remote_pheromones[oldest_pid]
 
         return True
 
@@ -956,7 +1004,8 @@ class AdaptiveFeeController:
         Returns:
             Tuple of (suggested_fee_ppm, confidence) or None if no data
         """
-        reports = self._remote_pheromones.get(peer_id, [])
+        with self._lock:
+            reports = list(self._remote_pheromones.get(peer_id, []))
         if not reports:
             return None
 
@@ -974,7 +1023,7 @@ class AdaptiveFeeController:
         for r in recent:
             age_hours = (now - r.get("timestamp", now)) / 3600
             recency_weight = max(0.1, 1.0 - (age_hours / 24))
-            level_weight = r.get("level", 0) / 10  # Normalize level
+            level_weight = min(10.0, max(0.0, r.get("level", 0))) / 10  # Normalize and bound level
             weight = recency_weight * level_weight * r.get("weight", 0.3)
 
             weighted_fee += r.get("fee_ppm", 0) * weight
@@ -990,8 +1039,10 @@ class AdaptiveFeeController:
 
     def get_all_fleet_hints(self) -> Dict[str, Tuple[int, float]]:
         """Get fee hints for all peers with remote pheromone data."""
+        with self._lock:
+            peer_ids = list(self._remote_pheromones.keys())
         hints = {}
-        for peer_id in self._remote_pheromones:
+        for peer_id in peer_ids:
             hint = self.get_fleet_fee_hint(peer_id)
             if hint:
                 hints[peer_id] = hint
@@ -1002,17 +1053,18 @@ class AdaptiveFeeController:
         cutoff = time.time() - (max_age_hours * 3600)
         cleaned = 0
 
-        for peer_id in list(self._remote_pheromones.keys()):
-            before = len(self._remote_pheromones[peer_id])
-            self._remote_pheromones[peer_id] = [
-                r for r in self._remote_pheromones[peer_id]
-                if r.get("timestamp", 0) > cutoff
-            ]
-            cleaned += before - len(self._remote_pheromones[peer_id])
+        with self._lock:
+            for peer_id in list(self._remote_pheromones.keys()):
+                before = len(self._remote_pheromones[peer_id])
+                self._remote_pheromones[peer_id] = [
+                    r for r in self._remote_pheromones[peer_id]
+                    if r.get("timestamp", 0) > cutoff
+                ]
+                cleaned += before - len(self._remote_pheromones[peer_id])
 
-            # Remove empty entries
-            if not self._remote_pheromones[peer_id]:
-                del self._remote_pheromones[peer_id]
+                # Remove empty entries
+                if not self._remote_pheromones[peer_id]:
+                    del self._remote_pheromones[peer_id]
 
         return cleaned
 
@@ -1026,31 +1078,53 @@ class AdaptiveFeeController:
         Returns:
             Number of channels that had pheromone evaporated
         """
-        now = time.time()
-        evaporated = 0
-        min_pheromone = 0.01  # Below this, remove entirely
+        # Pre-compute fee volatility outside lock (uses _fee_obs_lock)
+        fee_volatility = self._calculate_fee_volatility()
 
-        for channel_id in list(self._pheromone.keys()):
-            if self._pheromone[channel_id] <= 0:
-                continue
+        with self._lock:
+            now = time.time()
+            evaporated = 0
+            min_pheromone = 0.01  # Below this, remove entirely
 
-            last_update = self._pheromone_last_update.get(channel_id, now)
-            hours_elapsed = (now - last_update) / 3600.0
+            for channel_id in list(self._pheromone.keys()):
+                if self._pheromone[channel_id] <= 0:
+                    continue
 
-            if hours_elapsed > 0:
-                evap_rate = self.calculate_evaporation_rate(channel_id)
-                decay_factor = math.pow(1 - evap_rate, hours_elapsed)
-                old_level = self._pheromone[channel_id]
-                self._pheromone[channel_id] *= decay_factor
-                self._pheromone_last_update[channel_id] = now
+                last_update = self._pheromone_last_update.get(channel_id, now)
+                hours_elapsed = (now - last_update) / 3600.0
 
-                if old_level > min_pheromone and self._pheromone[channel_id] <= min_pheromone:
-                    # Pheromone dropped below threshold, clean up
-                    del self._pheromone[channel_id]
-                    self._pheromone_fee.pop(channel_id, None)
-                    self._pheromone_last_update.pop(channel_id, None)
+                if hours_elapsed > 0:
+                    # Inline evaporation rate calc to avoid deadlock
+                    # (calculate_evaporation_rate also acquires _lock)
+                    velocity = self._velocity_cache.get(channel_id, 0.0)
+                    base = BASE_EVAPORATION_RATE
+                    velocity_factor = min(0.4, abs(velocity) * 4)
+                    volatility_factor = min(0.3, fee_volatility / 200)
+                    evap_rate = base + velocity_factor + volatility_factor
+                    evap_rate = max(MIN_EVAPORATION_RATE, min(MAX_EVAPORATION_RATE, evap_rate))
 
-                evaporated += 1
+                    decay_factor = math.pow(1 - evap_rate, hours_elapsed)
+                    old_level = self._pheromone[channel_id]
+                    self._pheromone[channel_id] *= decay_factor
+                    self._pheromone_last_update[channel_id] = now
+
+                    if old_level > min_pheromone and self._pheromone[channel_id] <= min_pheromone:
+                        # Pheromone dropped below threshold, clean up
+                        del self._pheromone[channel_id]
+                        self._pheromone_fee.pop(channel_id, None)
+                        self._pheromone_last_update.pop(channel_id, None)
+
+                    evaporated += 1
+
+            # Evict stale velocity cache entries (already under lock)
+            stale_cutoff = now - 48 * 3600  # 48 hours
+            stale_keys = [
+                k for k, t in self._velocity_cache_time.items()
+                if t < stale_cutoff
+            ]
+            for k in stale_keys:
+                self._velocity_cache.pop(k, None)
+                self._velocity_cache_time.pop(k, None)
 
         return evaporated
 
@@ -1072,6 +1146,9 @@ class StigmergicCoordinator:
         self.plugin = plugin
         self.state_manager = state_manager
         self.our_pubkey: Optional[str] = None
+
+        # Lock protecting markers from concurrent modification
+        self._lock = threading.Lock()
 
         # Route markers (in-memory, also persisted via gossip)
         self._markers: Dict[Tuple[str, str], List[RouteMarker]] = defaultdict(list)
@@ -1105,14 +1182,29 @@ class StigmergicCoordinator:
             success=success,
             volume_sats=volume_sats,
             timestamp=time.time(),
-            strength=volume_sats / 100_000  # Larger payments = stronger signal
+            strength=max(0.1, min(1.0, volume_sats / 100_000))  # Capped to [0.1, 1.0] like gossip markers
         )
 
         key = (source, destination)
-        self._markers[key].append(marker)
+        with self._lock:
+            self._markers[key].append(marker)
+            # Prune old markers
+            self._prune_markers(key)
 
-        # Prune old markers
-        self._prune_markers(key)
+            # Evict least-active route pair if dict exceeds limit
+            max_routes = 1000
+            if len(self._markers) > max_routes:
+                now = time.time()
+                oldest_key = min(
+                    (k for k in self._markers if k != key),
+                    key=lambda k: max(
+                        (m.timestamp for m in self._markers[k]),
+                        default=0
+                    ),
+                    default=None
+                )
+                if oldest_key:
+                    del self._markers[oldest_key]
 
         self._log(
             f"Deposited marker: {source[:8]}->{destination[:8]} "
@@ -1139,19 +1231,18 @@ class StigmergicCoordinator:
     def read_markers(self, source: str, destination: str) -> List[RouteMarker]:
         """
         Read markers left by other fleet members for this route.
+        Returns copies with decayed strength (does not mutate stored markers).
         """
         key = (source, destination)
-        markers = self._markers.get(key, [])
-
         now = time.time()
         result = []
 
-        for m in markers:
-            # Update strength based on decay
-            current_strength = self._calculate_marker_strength(m, now)
-            if current_strength > MARKER_MIN_STRENGTH:
-                m.strength = current_strength
-                result.append(m)
+        with self._lock:
+            markers = self._markers.get(key, [])
+            for m in markers:
+                current_strength = self._calculate_marker_strength(m, now)
+                if current_strength > MARKER_MIN_STRENGTH:
+                    result.append(replace(m, strength=current_strength))
 
         return result
 
@@ -1176,42 +1267,72 @@ class StigmergicCoordinator:
         failed = [m for m in markers if not m.success]
 
         if successful:
-            # Find strongest successful marker
-            best = max(successful, key=lambda m: m.strength)
-
-            # Don't undercut successful fleet member
-            recommended = max(FLEET_FEE_FLOOR_PPM, best.fee_ppm)
-            confidence = min(0.9, 0.5 + best.strength * 0.1)
+            # Strength-weighted average of successful markers
+            total_weight = sum(m.strength for m in successful)
+            if total_weight > 0:
+                weighted_fee = sum(m.fee_ppm * m.strength for m in successful) / total_weight
+                recommended = max(FLEET_FEE_FLOOR_PPM, int(weighted_fee))
+            else:
+                recommended = max(FLEET_FEE_FLOOR_PPM, default_fee)
+            confidence = min(0.9, 0.5 + len(successful) * 0.05)
 
             return recommended, confidence
 
         if failed:
-            # All failures - try lower or avoid
-            avg_failed_fee = sum(m.fee_ppm for m in failed) / len(failed)
-            recommended = max(FLEET_FEE_FLOOR_PPM, int(avg_failed_fee * 0.8))
-            confidence = 0.4
-
-            return recommended, confidence
+            # All failures — no reliable directional signal. Failures can mean
+            # fee too high (payer routes around us) OR too low (no capacity,
+            # uncompetitive). Return default fee with low confidence and let
+            # other signals (pheromones, intelligence) provide direction.
+            return default_fee, 0.35
 
         return default_fee, 0.3
 
     def receive_marker_from_gossip(self, marker_data: Dict) -> Optional[RouteMarker]:
         """Process a marker received from fleet gossip."""
         try:
+            # Bound strength to [0, 1] to prevent manipulation via gossip
+            raw_strength = marker_data.get("strength", 1.0)
+            bounded_strength = max(0.0, min(1.0, float(raw_strength)))
+
+            # Bound fee_ppm to fleet floor/ceiling to prevent manipulation
+            fee_ppm = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, int(marker_data.get("fee_ppm", 0))))
+
+            # Bound volume_sats to reasonable max (100M sats = 1 BTC)
+            volume_sats = max(0, min(100_000_000, int(marker_data.get("volume_sats", 0))))
+
+            # Clamp timestamp to prevent future-dated or stale markers
+            now = int(time.time())
+            timestamp = max(now - 86400, min(now + 60, int(marker_data.get("timestamp", now))))
+
             marker = RouteMarker(
                 depositor=marker_data["depositor"],
                 source_peer_id=marker_data["source_peer_id"],
                 destination_peer_id=marker_data["destination_peer_id"],
-                fee_ppm=marker_data["fee_ppm"],
+                fee_ppm=fee_ppm,
                 success=marker_data["success"],
-                volume_sats=marker_data["volume_sats"],
-                timestamp=marker_data["timestamp"],
-                strength=marker_data.get("strength", 1.0)
+                volume_sats=volume_sats,
+                timestamp=timestamp,
+                strength=bounded_strength
             )
 
             key = (marker.source_peer_id, marker.destination_peer_id)
-            self._markers[key].append(marker)
-            self._prune_markers(key)
+            with self._lock:
+                self._markers[key].append(marker)
+                self._prune_markers(key)
+
+                # Evict least-active route pair if dict exceeds limit
+                max_routes = 1000
+                if len(self._markers) > max_routes:
+                    oldest_key = min(
+                        (k for k in self._markers if k != key),
+                        key=lambda k: max(
+                            (m.timestamp for m in self._markers[k]),
+                            default=0
+                        ),
+                        default=None
+                    )
+                    if oldest_key:
+                        del self._markers[oldest_key]
 
             return marker
         except (KeyError, TypeError) as e:
@@ -1219,16 +1340,16 @@ class StigmergicCoordinator:
             return None
 
     def get_all_markers(self) -> List[RouteMarker]:
-        """Get all active markers."""
+        """Get all active markers. Returns copies with decayed strength."""
         result = []
         now = time.time()
 
-        for markers in self._markers.values():
-            for m in markers:
-                current_strength = self._calculate_marker_strength(m, now)
-                if current_strength > MARKER_MIN_STRENGTH:
-                    m.strength = current_strength
-                    result.append(m)
+        with self._lock:
+            for markers in self._markers.values():
+                for m in markers:
+                    current_strength = self._calculate_marker_strength(m, now)
+                    if current_strength > MARKER_MIN_STRENGTH:
+                        result.append(replace(m, strength=current_strength))
 
         return result
 
@@ -1261,7 +1382,10 @@ class StigmergicCoordinator:
         max_age_secs = max_age_hours * 3600
         shareable = []
 
-        for markers in self._markers.values():
+        with self._lock:
+            markers_snapshot = {k: list(v) for k, v in self._markers.items()}
+
+        for markers in markers_snapshot.values():
             for m in markers:
                 # Only share our own markers
                 if m.depositor != our_pubkey:
@@ -1319,6 +1443,9 @@ class MyceliumDefenseSystem:
         self.gossip_mgr = gossip_mgr
         self.our_pubkey: Optional[str] = None
 
+        # Lock protecting warning/defense state from concurrent modification
+        self._lock = threading.Lock()
+
         # Active warnings (most recent per peer)
         self._warnings: Dict[str, PeerWarning] = {}
 
@@ -1328,7 +1455,8 @@ class MyceliumDefenseSystem:
         # Temporary defensive fees
         self._defensive_fees: Dict[str, Dict] = {}
 
-        # Peer statistics cache
+        # Peer statistics cache (protected by _stats_lock)
+        self._stats_lock = threading.Lock()
         self._peer_stats: Dict[str, Dict] = {}
 
     def set_our_pubkey(self, pubkey: str) -> None:
@@ -1337,6 +1465,9 @@ class MyceliumDefenseSystem:
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
             self.plugin.log(f"cl-hive: [MyceliumDefense] {msg}", level=level)
+
+    # Maximum tracked peers in stats cache
+    MAX_PEER_STATS = 500
 
     def update_peer_stats(
         self,
@@ -1347,19 +1478,33 @@ class MyceliumDefenseSystem:
         failed_forwards: int
     ) -> None:
         """Update statistics for a peer."""
-        self._peer_stats[peer_id] = {
-            "inflow": inflow_sats,
-            "outflow": outflow_sats,
-            "successful": successful_forwards,
-            "failed": failed_forwards,
-            "updated_at": time.time()
-        }
+        with self._stats_lock:
+            self._peer_stats[peer_id] = {
+                "inflow": inflow_sats,
+                "outflow": outflow_sats,
+                "successful": successful_forwards,
+                "failed": failed_forwards,
+                "updated_at": time.time()
+            }
+
+            # Evict stale entries if exceeding limit
+            if len(self._peer_stats) > self.MAX_PEER_STATS:
+                oldest = min(
+                    (p for p in self._peer_stats if p != peer_id),
+                    key=lambda p: self._peer_stats[p].get("updated_at", 0),
+                    default=None
+                )
+                if oldest:
+                    del self._peer_stats[oldest]
 
     def detect_threat(self, peer_id: str) -> Optional[PeerWarning]:
         """
         Detect peers that are draining us or behaving badly.
         """
-        stats = self._peer_stats.get(peer_id)
+        with self._stats_lock:
+            stats = self._peer_stats.get(peer_id)
+            if stats is not None:
+                stats = dict(stats)  # snapshot under lock
         if not stats:
             return None
 
@@ -1403,8 +1548,9 @@ class MyceliumDefenseSystem:
         """
         Send warning to fleet (like chemical signal through mycelium).
         """
-        # Store locally
-        self._warnings[warning.peer_id] = warning
+        # Store locally (under lock — shared with handle_warning/check_warning_expiration)
+        with self._lock:
+            self._warnings[warning.peer_id] = warning
 
         # Broadcast via gossip if available
         if self.gossip_mgr:
@@ -1434,48 +1580,49 @@ class MyceliumDefenseSystem:
         peer_id = warning.peer_id
         reporter = warning.reporter
 
-        # Store warning in reports tracker
-        self._warning_reports[peer_id][reporter] = warning
+        with self._lock:
+            # Store warning in reports tracker
+            self._warning_reports[peer_id][reporter] = warning
 
-        # Clean expired reports for this peer
-        now = time.time()
-        self._warning_reports[peer_id] = {
-            r: w for r, w in self._warning_reports[peer_id].items()
-            if now < (w.timestamp + w.ttl)
-        }
+            # Clean expired reports for this peer
+            now = time.time()
+            self._warning_reports[peer_id] = {
+                r: w for r, w in self._warning_reports[peer_id].items()
+                if now < (w.timestamp + w.ttl)
+            }
 
-        # Store most recent warning
-        self._warnings[peer_id] = warning
+            # Store most recent warning
+            self._warnings[peer_id] = warning
 
-        # Check if this is a self-detected threat (immediate defense)
-        is_self_detected = (reporter == self.our_pubkey)
+            # Check if this is a self-detected threat (immediate defense)
+            is_self_detected = (reporter == self.our_pubkey)
 
-        # Count independent reports (excluding self if also reported by others)
-        report_count = len(self._warning_reports[peer_id])
+            # Count independent reports (excluding self if also reported by others)
+            report_count = len(self._warning_reports[peer_id])
 
-        # Quorum check: self-detected OR enough independent reports
-        quorum_met = is_self_detected or (report_count >= DEFENSE_QUORUM_THRESHOLD)
+            # Quorum check: self-detected OR enough independent reports
+            quorum_met = is_self_detected or (report_count >= DEFENSE_QUORUM_THRESHOLD)
 
-        if not quorum_met:
-            self._log(
-                f"Warning for {peer_id[:12]} from {reporter[:12]} "
-                f"(reports: {report_count}/{DEFENSE_QUORUM_THRESHOLD}, awaiting quorum)",
-                level="debug"
-            )
-            return None
+            if not quorum_met:
+                self._log(
+                    f"Warning for {peer_id[:12]} from {reporter[:12]} "
+                    f"(reports: {report_count}/{DEFENSE_QUORUM_THRESHOLD}, awaiting quorum)",
+                    level="debug"
+                )
+                return None
 
-        # Calculate defensive fee increase (average severity from all reporters)
-        total_severity = sum(w.severity for w in self._warning_reports[peer_id].values())
-        avg_severity = total_severity / report_count
-        multiplier = 1 + (avg_severity * (DEFENSIVE_FEE_MAX_MULTIPLIER - 1))
+            # Calculate defensive fee increase (average severity from all reporters)
+            total_severity = sum(w.severity for w in self._warning_reports[peer_id].values())
+            avg_severity = total_severity / report_count
+            multiplier = 1 + (avg_severity * (DEFENSIVE_FEE_MAX_MULTIPLIER - 1))
 
-        self._defensive_fees[peer_id] = {
-            "multiplier": multiplier,
-            "expires_at": warning.timestamp + warning.ttl,
-            "threat_type": warning.threat_type,
-            "reporter": reporter,
-            "report_count": report_count
-        }
+            self._defensive_fees[peer_id] = {
+                "multiplier": multiplier,
+                "expires_at": warning.timestamp + warning.ttl,
+                "threat_type": warning.threat_type,
+                "reporter": reporter,
+                "report_count": report_count
+            }
 
         self._log(
             f"Defensive fee multiplier {multiplier:.2f}x applied to "
@@ -1492,16 +1639,17 @@ class MyceliumDefenseSystem:
 
     def get_defensive_multiplier(self, peer_id: str) -> float:
         """Get current defensive fee multiplier for a peer."""
-        defense = self._defensive_fees.get(peer_id)
-        if not defense:
-            return 1.0
+        with self._lock:
+            defense = self._defensive_fees.get(peer_id)
+            if not defense:
+                return 1.0
 
-        # Check if expired
-        if time.time() > defense["expires_at"]:
-            del self._defensive_fees[peer_id]
-            return 1.0
+            # Check if expired
+            if time.time() > defense["expires_at"]:
+                del self._defensive_fees[peer_id]
+                return 1.0
 
-        return defense["multiplier"]
+            return defense["multiplier"]
 
     def check_warning_expiration(self) -> List[str]:
         """
@@ -1512,26 +1660,27 @@ class MyceliumDefenseSystem:
         now = time.time()
         expired = []
 
-        for peer_id, warning in list(self._warnings.items()):
-            if warning.is_expired():
-                del self._warnings[peer_id]
-                expired.append(peer_id)
-
-        for peer_id in list(self._defensive_fees.keys()):
-            if now > self._defensive_fees[peer_id]["expires_at"]:
-                del self._defensive_fees[peer_id]
-                if peer_id not in expired:
+        with self._lock:
+            for peer_id, warning in list(self._warnings.items()):
+                if warning.is_expired():
+                    del self._warnings[peer_id]
                     expired.append(peer_id)
 
-        # Clean up expired reports from quorum tracking
-        for peer_id in list(self._warning_reports.keys()):
-            self._warning_reports[peer_id] = {
-                r: w for r, w in self._warning_reports[peer_id].items()
-                if now < (w.timestamp + w.ttl)
-            }
-            # Remove peer entry if no reports left
-            if not self._warning_reports[peer_id]:
-                del self._warning_reports[peer_id]
+            for peer_id in list(self._defensive_fees.keys()):
+                if now > self._defensive_fees[peer_id]["expires_at"]:
+                    del self._defensive_fees[peer_id]
+                    if peer_id not in expired:
+                        expired.append(peer_id)
+
+            # Clean up expired reports from quorum tracking
+            for peer_id in list(self._warning_reports.keys()):
+                self._warning_reports[peer_id] = {
+                    r: w for r, w in self._warning_reports[peer_id].items()
+                    if now < (w.timestamp + w.ttl)
+                }
+                # Remove peer entry if no reports left
+                if not self._warning_reports[peer_id]:
+                    del self._warning_reports[peer_id]
 
         if expired:
             self._log(f"Expired warnings for {len(expired)} peers")
@@ -1540,17 +1689,25 @@ class MyceliumDefenseSystem:
 
     def get_active_warnings(self) -> List[PeerWarning]:
         """Get all active (non-expired) warnings."""
-        return [w for w in self._warnings.values() if not w.is_expired()]
+        with self._lock:
+            warnings_snapshot = list(self._warnings.values())
+        return [w for w in warnings_snapshot if not w.is_expired()]
 
     def get_defense_status(self) -> Dict:
         """Get current defense system status."""
         self.check_warning_expiration()
 
+        with self._lock:
+            warnings_snapshot = list(self._warnings.values())
+            num_warnings = len(self._warnings)
+            num_defensive = len(self._defensive_fees)
+            defensive_peers = list(self._defensive_fees.keys())
+
         return {
-            "active_warnings": len(self._warnings),
-            "defensive_fees_active": len(self._defensive_fees),
-            "warnings": [w.to_dict() for w in self._warnings.values()],
-            "defensive_peers": list(self._defensive_fees.keys()),
+            "active_warnings": num_warnings,
+            "defensive_fees_active": num_defensive,
+            "warnings": [w.to_dict() for w in warnings_snapshot],
+            "defensive_peers": defensive_peers,
             "ban_candidates": self.get_ban_candidates()
         }
 
@@ -1633,7 +1790,8 @@ class MyceliumDefenseSystem:
         }
 
         # Local warning
-        local = self._warnings.get(peer_id)
+        with self._lock:
+            local = self._warnings.get(peer_id)
         if local and not local.is_expired():
             result["local_warning"] = local.to_dict()
 
@@ -1673,7 +1831,8 @@ class MyceliumDefenseSystem:
         candidates = []
 
         # Check all peers with active warnings
-        checked_peers = set(self._warnings.keys())
+        with self._lock:
+            checked_peers = set(self._warnings.keys())
 
         # Also check peers in reputation system with warnings
         if hasattr(self, '_peer_rep_mgr') and self._peer_rep_mgr:
@@ -1797,6 +1956,9 @@ class TimeBasedFeeAdjuster:
         self.anticipatory_mgr = anticipatory_mgr
         self.our_pubkey: Optional[str] = None
 
+        # Lock protecting adjustment cache
+        self._cache_lock = threading.Lock()
+
         # Cache: channel_id -> (adjustment, timestamp)
         self._adjustment_cache: Dict[str, Tuple[TimeFeeAdjustment, float]] = {}
 
@@ -1827,23 +1989,24 @@ class TimeBasedFeeAdjuster:
 
     def _get_cached_adjustment(self, channel_id: str) -> Optional[TimeFeeAdjustment]:
         """Get cached adjustment if still valid."""
-        if channel_id not in self._adjustment_cache:
-            return None
+        with self._cache_lock:
+            if channel_id not in self._adjustment_cache:
+                return None
 
-        adjustment, cached_at = self._adjustment_cache[channel_id]
-        ttl_seconds = TIME_FEE_CACHE_TTL_HOURS * 3600
+            adjustment, cached_at = self._adjustment_cache[channel_id]
+            ttl_seconds = TIME_FEE_CACHE_TTL_HOURS * 3600
 
-        if time.time() - cached_at > ttl_seconds:
-            del self._adjustment_cache[channel_id]
-            return None
+            if time.time() - cached_at > ttl_seconds:
+                del self._adjustment_cache[channel_id]
+                return None
 
-        # Also check if hour changed (invalidate on hour boundary)
-        current_hour, _ = self._get_current_time_context()
-        if adjustment.current_hour != current_hour:
-            del self._adjustment_cache[channel_id]
-            return None
+            # Also check if hour changed (invalidate on hour boundary)
+            current_hour, _ = self._get_current_time_context()
+            if adjustment.current_hour != current_hour:
+                del self._adjustment_cache[channel_id]
+                return None
 
-        return adjustment
+            return adjustment
 
     def get_time_adjustment(
         self,
@@ -1913,14 +2076,17 @@ class TimeBasedFeeAdjuster:
 
         for pattern in patterns:
             # Check hour match (allow ±1 hour tolerance)
-            hour_match = abs(pattern.hour_of_day - current_hour) <= 1
-            if pattern.hour_of_day == 23 and current_hour == 0:
-                hour_match = True
-            if pattern.hour_of_day == 0 and current_hour == 23:
-                hour_match = True
+            if pattern.hour_of_day is None:
+                hour_match = True  # None means any hour
+            else:
+                hour_match = abs(pattern.hour_of_day - current_hour) <= 1
+                if pattern.hour_of_day == 23 and current_hour == 0:
+                    hour_match = True
+                if pattern.hour_of_day == 0 and current_hour == 23:
+                    hour_match = True
 
             # Check day match (if pattern is day-specific)
-            day_match = pattern.day_of_week == -1 or pattern.day_of_week == current_day
+            day_match = pattern.day_of_week is None or pattern.day_of_week == current_day
 
             if hour_match and day_match and pattern.confidence > best_confidence:
                 matching_pattern = pattern
@@ -1982,7 +2148,8 @@ class TimeBasedFeeAdjuster:
         )
 
         # Cache the result
-        self._adjustment_cache[channel_id] = (result, time.time())
+        with self._cache_lock:
+            self._adjustment_cache[channel_id] = (result, time.time())
 
         if adjustment_type != "none":
             self._log(
@@ -2026,7 +2193,7 @@ class TimeBasedFeeAdjuster:
                     "hour": pattern.hour_of_day,
                     "day": pattern.day_of_week,
                     "day_name": self.DAY_NAMES[pattern.day_of_week]
-                        if pattern.day_of_week >= 0 else "Any",
+                        if pattern.day_of_week is not None and pattern.day_of_week >= 0 else "Any",
                     "intensity": round(pattern.intensity, 2),
                     "direction": pattern.direction,
                     "confidence": round(pattern.confidence, 2),
@@ -2059,7 +2226,7 @@ class TimeBasedFeeAdjuster:
                     "hour": pattern.hour_of_day,
                     "day": pattern.day_of_week,
                     "day_name": self.DAY_NAMES[pattern.day_of_week]
-                        if pattern.day_of_week >= 0 else "Any",
+                        if pattern.day_of_week is not None and pattern.day_of_week >= 0 else "Any",
                     "intensity": round(pattern.intensity, 2),
                     "direction": pattern.direction,
                     "confidence": round(pattern.confidence, 2),
@@ -2078,8 +2245,12 @@ class TimeBasedFeeAdjuster:
         """
         current_hour, current_day = self._get_current_time_context()
 
+        # Take a snapshot under lock before iterating
+        with self._cache_lock:
+            cache_snapshot = dict(self._adjustment_cache)
+
         active = []
-        for channel_id, (adjustment, _) in self._adjustment_cache.items():
+        for channel_id, (adjustment, _) in cache_snapshot.items():
             if adjustment.adjustment_type != "none":
                 active.append(adjustment.to_dict())
 
@@ -2101,9 +2272,10 @@ class TimeBasedFeeAdjuster:
 
     def clear_cache(self) -> int:
         """Clear adjustment cache. Returns number of entries cleared."""
-        count = len(self._adjustment_cache)
-        self._adjustment_cache.clear()
-        return count
+        with self._cache_lock:
+            count = len(self._adjustment_cache)
+            self._adjustment_cache.clear()
+            return count
 
 
 # =============================================================================
@@ -2149,8 +2321,14 @@ class FeeCoordinationManager:
         # Phase 7.4: Time-based fee adjuster
         self.time_adjuster = TimeBasedFeeAdjuster(plugin, anticipatory_mgr)
 
+        # Lock protecting fee change time tracking
+        self._lock = threading.Lock()
+
         # Salience detection: Track last fee change times per channel
         self._fee_change_times: Dict[str, float] = {}
+
+        # Optional reference to FeeIntelligenceManager for cross-system blending
+        self.fee_intelligence_mgr = None
 
     def set_our_pubkey(self, pubkey: str) -> None:
         self.our_pubkey = pubkey
@@ -2164,17 +2342,31 @@ class FeeCoordinationManager:
         """Set or update the anticipatory liquidity manager for time-based fees."""
         self.time_adjuster.set_anticipatory_manager(mgr)
 
+    def set_fee_intelligence_mgr(self, mgr: Any) -> None:
+        """Set reference to FeeIntelligenceManager for cross-system blending."""
+        self.fee_intelligence_mgr = mgr
+
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
             self.plugin.log(f"cl-hive: [FeeCoord] {msg}", level=level)
 
     def _get_last_fee_change_time(self, channel_id: str) -> float:
         """Get the timestamp of the last fee change for a channel."""
-        return self._fee_change_times.get(channel_id, 0)
+        with self._lock:
+            return self._fee_change_times.get(channel_id, 0)
 
     def record_fee_change(self, channel_id: str) -> None:
         """Record that a fee change was made for a channel."""
-        self._fee_change_times[channel_id] = time.time()
+        with self._lock:
+            self._fee_change_times[channel_id] = time.time()
+
+            # Evict entries past their cooldown (no longer useful)
+            if len(self._fee_change_times) > 500:
+                cutoff = time.time() - SALIENT_FEE_CHANGE_COOLDOWN * 2
+                self._fee_change_times = {
+                    k: v for k, v in self._fee_change_times.items()
+                    if v > cutoff
+                }
         self._log(f"Recorded fee change for {channel_id}")
 
     def _get_centrality_fee_adjustment(self) -> Tuple[float, float]:
@@ -2242,6 +2434,20 @@ class FeeCoordinationManager:
         5. Time-based adjustment (Phase 7.4)
         6. Centrality-based adjustment (Use Case 8)
         """
+        # Safety: hive member channels MUST always have 0 fees
+        if self.database and peer_id:
+            member = self.database.get_member(peer_id)
+            if member and member.get("tier") in ("member", "neophyte"):
+                return FeeRecommendation(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    recommended_fee_ppm=0,
+                    is_primary=False,
+                    current_fee_ppm=current_fee,
+                    confidence=1.0,
+                    reason="hive_member_zero_fee",
+                )
+
         # Start with current fee
         recommended_fee = current_fee
         is_primary = False
@@ -2269,6 +2475,37 @@ class FeeCoordinationManager:
         if adaptive_fee != recommended_fee:
             recommended_fee = adaptive_fee
             reasons.append(adaptive_reason)
+
+        # 2a. Incorporate fleet pheromone hints
+        fleet_hint = self.adaptive_controller.get_fleet_fee_hint(peer_id)
+        if fleet_hint:
+            hint_fee, hint_confidence = fleet_hint
+            if hint_confidence > 0.3:
+                blend_weight = min(0.25, hint_confidence * 0.3)
+                recommended_fee = int(
+                    recommended_fee * (1 - blend_weight) +
+                    hint_fee * blend_weight
+                )
+                reasons.append(f"fleet_pheromone_{hint_confidence:.2f}")
+
+        # 2b. Incorporate fee intelligence if available
+        if self.fee_intelligence_mgr:
+            try:
+                intel = self.fee_intelligence_mgr.get_fee_recommendation(
+                    target_peer_id=peer_id,
+                    our_health=50
+                )
+                if intel.get("confidence", 0) > 0.3:
+                    intel_fee = intel["recommended_fee_ppm"]
+                    # Blend: weight scales with intelligence confidence (max 30%)
+                    blend_weight = min(0.3, intel["confidence"] * 0.4)
+                    recommended_fee = int(
+                        recommended_fee * (1 - blend_weight) +
+                        intel_fee * blend_weight
+                    )
+                    reasons.append(f"intelligence_{intel['confidence']:.2f}")
+            except Exception:
+                pass  # Intelligence unavailable, continue without it
 
         # 3. Check stigmergic markers
         if source_hint and destination_hint:
@@ -2344,7 +2581,11 @@ class FeeCoordinationManager:
 
         # If not salient, recommend keeping current fee
         if not is_salient:
+            recommended_fee = current_fee
             reasons.append(f"not_salient:{salience_reason}")
+        elif recommended_fee != current_fee:
+            # Salient change — record so cooldown activates for next check
+            self.record_fee_change(channel_id)
 
         return FeeRecommendation(
             channel_id=channel_id,
@@ -2393,6 +2634,287 @@ class FeeCoordinationManager:
             self.stigmergic_coord.deposit_marker(
                 source, destination, fee_ppm, success, revenue_sats if success else 0
             )
+
+    def save_state_to_database(self) -> Dict[str, int]:
+        """
+        Save pheromone levels and stigmergic markers to database.
+        Called periodically from fee_intelligence_loop (~5 min) and on shutdown.
+
+        Returns:
+            Dict with counts of saved pheromones and markers.
+        """
+        # Snapshot pheromone data under lock
+        pheromone_snapshot = []
+        with self.adaptive_controller._lock:
+            for channel_id, level in self.adaptive_controller._pheromone.items():
+                if level < 0.01:
+                    continue
+                pheromone_snapshot.append({
+                    'channel_id': channel_id,
+                    'level': level,
+                    'fee_ppm': self.adaptive_controller._pheromone_fee.get(channel_id, 0),
+                    'last_update': self.adaptive_controller._pheromone_last_update.get(
+                        channel_id, time.time()
+                    ),
+                })
+
+        self.database.save_pheromone_levels(pheromone_snapshot)
+
+        # Snapshot marker data under lock
+        now = time.time()
+        marker_snapshot = []
+        with self.stigmergic_coord._lock:
+            for (src, dst), markers in self.stigmergic_coord._markers.items():
+                for m in markers:
+                    current_strength = self.stigmergic_coord._calculate_marker_strength(m, now)
+                    if current_strength < MARKER_MIN_STRENGTH:
+                        continue
+                    marker_snapshot.append({
+                        'depositor': m.depositor,
+                        'source_peer_id': m.source_peer_id,
+                        'destination_peer_id': m.destination_peer_id,
+                        'fee_ppm': m.fee_ppm,
+                        'success': m.success,
+                        'volume_sats': m.volume_sats,
+                        'timestamp': m.timestamp,
+                        'strength': m.strength,
+                    })
+
+        self.database.save_stigmergic_markers(marker_snapshot)
+
+        # Snapshot defense state under lock
+        now = time.time()
+        reports_snapshot = []
+        fees_snapshot = []
+        with self.defense_system._lock:
+            for peer_id, reporters in self.defense_system._warning_reports.items():
+                for reporter_id, warning in reporters.items():
+                    if warning.timestamp + warning.ttl > now:
+                        reports_snapshot.append({
+                            'peer_id': warning.peer_id,
+                            'reporter_id': reporter_id,
+                            'threat_type': warning.threat_type,
+                            'severity': warning.severity,
+                            'timestamp': warning.timestamp,
+                            'ttl': warning.ttl,
+                            'evidence_json': json.dumps(warning.evidence) if warning.evidence else '{}',
+                        })
+            for peer_id, fee_info in self.defense_system._defensive_fees.items():
+                if fee_info['expires_at'] > now:
+                    fees_snapshot.append({
+                        'peer_id': peer_id,
+                        'multiplier': fee_info['multiplier'],
+                        'expires_at': fee_info['expires_at'],
+                        'threat_type': fee_info['threat_type'],
+                        'reporter': fee_info['reporter'],
+                        'report_count': fee_info['report_count'],
+                    })
+
+        self.database.save_defense_state(reports_snapshot, fees_snapshot)
+
+        # Snapshot remote pheromones under lock
+        remote_snapshot = []
+        cutoff_48h = now - 48 * 3600
+        with self.adaptive_controller._lock:
+            for peer_id, entries in self.adaptive_controller._remote_pheromones.items():
+                for entry in entries:
+                    if entry.get('timestamp', 0) > cutoff_48h:
+                        remote_snapshot.append({
+                            'peer_id': peer_id,
+                            'reporter_id': entry.get('reporter_id', ''),
+                            'level': entry.get('level', 0),
+                            'fee_ppm': entry.get('fee_ppm', 0),
+                            'timestamp': entry.get('timestamp', 0),
+                            'weight': entry.get('weight', 0.3),
+                        })
+
+        self.database.save_remote_pheromones(remote_snapshot)
+
+        # Snapshot fee observations under lock
+        obs_snapshot = []
+        cutoff_1h = now - 3600
+        with self.adaptive_controller._fee_obs_lock:
+            for ts, fee in self.adaptive_controller._fee_observations:
+                if ts > cutoff_1h:
+                    obs_snapshot.append({'timestamp': ts, 'fee_ppm': fee})
+
+        self.database.save_fee_observations(obs_snapshot)
+
+        return {
+            'pheromones': len(pheromone_snapshot),
+            'markers': len(marker_snapshot),
+            'defense_reports': len(reports_snapshot),
+            'defense_fees': len(fees_snapshot),
+            'remote_pheromones': len(remote_snapshot),
+            'fee_observations': len(obs_snapshot),
+        }
+
+    def restore_state_from_database(self) -> Dict[str, int]:
+        """
+        Restore pheromone levels and stigmergic markers from database.
+        Called once on startup. Applies time-based decay since last save.
+
+        Returns:
+            Dict with counts of restored pheromones and markers.
+        """
+        now = time.time()
+        pheromone_count = 0
+        marker_count = 0
+
+        # Restore pheromones
+        rows = self.database.load_pheromone_levels()
+        with self.adaptive_controller._lock:
+            for row in rows:
+                channel_id = row['channel_id']
+                level = row['level']
+                last_update = row['last_update']
+
+                # Apply time-based decay since last save
+                hours_elapsed = (now - last_update) / 3600.0
+                if hours_elapsed > 0:
+                    decay_factor = math.pow(1 - BASE_EVAPORATION_RATE, hours_elapsed)
+                    level *= decay_factor
+
+                if level < 0.01:
+                    continue
+
+                self.adaptive_controller._pheromone[channel_id] = level
+                self.adaptive_controller._pheromone_fee[channel_id] = row['fee_ppm']
+                self.adaptive_controller._pheromone_last_update[channel_id] = now
+                pheromone_count += 1
+
+        # Restore markers
+        rows = self.database.load_stigmergic_markers()
+        with self.stigmergic_coord._lock:
+            for row in rows:
+                marker = RouteMarker(
+                    depositor=row['depositor'],
+                    source_peer_id=row['source_peer_id'],
+                    destination_peer_id=row['destination_peer_id'],
+                    fee_ppm=row['fee_ppm'],
+                    success=bool(row['success']),
+                    volume_sats=row['volume_sats'],
+                    timestamp=row['timestamp'],
+                    strength=row['strength'],
+                )
+
+                # Check if marker is still strong enough after decay
+                current_strength = self.stigmergic_coord._calculate_marker_strength(marker, now)
+                if current_strength < MARKER_MIN_STRENGTH:
+                    continue
+
+                key = (marker.source_peer_id, marker.destination_peer_id)
+                self.stigmergic_coord._markers[key].append(marker)
+                marker_count += 1
+
+        # Restore defense state
+        defense_report_count = 0
+        defense_fee_count = 0
+        defense_data = self.database.load_defense_state()
+
+        with self.defense_system._lock:
+            # Rebuild _warning_reports
+            for row in defense_data.get('reports', []):
+                if row['timestamp'] + row['ttl'] <= now:
+                    continue
+                try:
+                    evidence = json.loads(row.get('evidence_json', '{}') or '{}')
+                except (json.JSONDecodeError, TypeError):
+                    evidence = {}
+                warning = PeerWarning(
+                    peer_id=row['peer_id'],
+                    threat_type=row['threat_type'],
+                    severity=row['severity'],
+                    reporter=row['reporter_id'],
+                    timestamp=row['timestamp'],
+                    ttl=row['ttl'],
+                    evidence=evidence,
+                )
+                self.defense_system._warning_reports[row['peer_id']][row['reporter_id']] = warning
+                defense_report_count += 1
+
+            # Derive _warnings from reports: pick highest severity per peer
+            for peer_id, reporters in self.defense_system._warning_reports.items():
+                if reporters:
+                    best = max(reporters.values(), key=lambda w: w.severity)
+                    self.defense_system._warnings[peer_id] = best
+
+            # Rebuild _defensive_fees
+            for row in defense_data.get('active_fees', []):
+                if row['expires_at'] <= now:
+                    continue
+                self.defense_system._defensive_fees[row['peer_id']] = {
+                    'multiplier': row['multiplier'],
+                    'expires_at': row['expires_at'],
+                    'threat_type': row['threat_type'],
+                    'reporter': row['reporter'],
+                    'report_count': row['report_count'],
+                }
+                defense_fee_count += 1
+
+        # Restore remote pheromones
+        remote_count = 0
+        remote_rows = self.database.load_remote_pheromones()
+        cutoff_48h = now - 48 * 3600
+
+        with self.adaptive_controller._lock:
+            for row in remote_rows:
+                if row['timestamp'] <= cutoff_48h:
+                    continue
+                peer_id = row['peer_id']
+                entry = {
+                    'reporter_id': row['reporter_id'],
+                    'level': row['level'],
+                    'fee_ppm': row['fee_ppm'],
+                    'timestamp': row['timestamp'],
+                    'weight': row['weight'],
+                }
+                self.adaptive_controller._remote_pheromones[peer_id].append(entry)
+                remote_count += 1
+
+            # Cap at 10 per peer (same as receive_pheromone_from_gossip limit)
+            for peer_id in list(self.adaptive_controller._remote_pheromones.keys()):
+                entries = self.adaptive_controller._remote_pheromones[peer_id]
+                if len(entries) > 10:
+                    self.adaptive_controller._remote_pheromones[peer_id] = entries[-10:]
+
+        # Restore fee observations
+        obs_count = 0
+        obs_rows = self.database.load_fee_observations()
+        cutoff_1h = now - 3600
+
+        with self.adaptive_controller._fee_obs_lock:
+            for row in obs_rows:
+                if row['timestamp'] <= cutoff_1h:
+                    continue
+                self.adaptive_controller._fee_observations.append(
+                    (row['timestamp'], row['fee_ppm'])
+                )
+                obs_count += 1
+
+        return {
+            'pheromones': pheromone_count,
+            'markers': marker_count,
+            'defense_reports': defense_report_count,
+            'defense_fees': defense_fee_count,
+            'remote_pheromones': remote_count,
+            'fee_observations': obs_count,
+        }
+
+    def should_auto_backfill(self) -> bool:
+        """
+        Check if routing intelligence is empty and should be auto-backfilled.
+        Returns True when DB has no pheromones AND no recent markers.
+        """
+        if self.database.get_pheromone_count() > 0:
+            return False
+
+        latest = self.database.get_latest_marker_timestamp()
+        if latest is None:
+            return True
+
+        # Also backfill if markers are older than 24 hours
+        return (time.time() - latest) > 24 * 3600
 
     def get_coordination_status(self) -> Dict:
         """Get overall fee coordination status."""

@@ -84,7 +84,7 @@ class MemberContribution:
     """A member's contribution metrics for a settlement period."""
     peer_id: str
     capacity_sats: int
-    forwards_sats: int
+    forwards_sats: int  # Routing activity metric: forward count from gossip (not sats volume)
     fees_earned_sats: int
     uptime_pct: float
     bolt12_offer: Optional[str] = None
@@ -509,8 +509,8 @@ class SettlementManager:
             ideals.keys(),
             key=lambda pid: (-(ideals[pid] - floors[pid]), pid)
         )
-        for i in range(max(0, remainder)):
-            floors[frac_order[i % len(frac_order)]] += 1
+        for i in range(max(0, min(remainder, len(frac_order)))):
+            floors[frac_order[i]] += 1
 
         # Step 4: build SettlementResult list
         results: List[SettlementResult] = []
@@ -647,6 +647,7 @@ class SettlementManager:
                 MemberContribution(
                     peer_id=c["peer_id"],
                     capacity_sats=int(c.get("capacity", 0)),
+                    # forward_count is the routing activity metric from gossip
                     forwards_sats=int(c.get("forward_count", 0)),
                     fees_earned_sats=int(c.get("fees_earned", 0)),
                     rebalance_costs_sats=int(c.get("rebalance_costs", 0)),
@@ -658,6 +659,12 @@ class SettlementManager:
         results = self.calculate_fair_shares(member_contributions)
         total_fees = sum(int(c.get("fees_earned", 0)) for c in contributions)
         payments, min_payment = self.generate_payment_plan(results, total_fees=total_fees)
+
+        # Track residual dust that couldn't be settled (below min_payment threshold)
+        total_payer_debt = sum(-r.balance for r in results if r.balance < -min_payment)
+        total_in_payments = sum(int(p["amount_sats"]) for p in payments)
+        residual_sats = max(0, total_payer_debt - total_in_payments)
+
         plan_hash = self._plan_hash(
             plan_version=DISTRIBUTED_SETTLEMENT_PLAN_VERSION,
             period=period,
@@ -679,6 +686,7 @@ class SettlementManager:
             "payments": payments,
             "expected_sent_sats": expected_sent,
             "total_fees_sats": total_fees,
+            "residual_sats": residual_sats,
         }
 
     def _enrich_with_network_metrics(
@@ -720,8 +728,9 @@ class SettlementManager:
         """
         Generate payment list from settlement results.
 
-        Matches members with negative balance (owe money) to members with
-        positive balance (owed money) to create payment list.
+        Delegates to generate_payment_plan() for deterministic matching,
+        then filters by BOLT12 offer availability and converts to
+        SettlementPayment objects.
 
         Args:
             results: List of settlement results
@@ -730,52 +739,25 @@ class SettlementManager:
         Returns:
             List of payments to execute
         """
-        # Calculate dynamic minimum payment threshold
-        member_count = len(results)
-        min_payment = calculate_min_payment(total_fees, member_count)
-
-        # Separate into payers (owe money) and receivers (owed money)
-        payers = [r for r in results if r.balance < -min_payment and r.bolt12_offer]
-        receivers = [r for r in results if r.balance > min_payment and r.bolt12_offer]
-
-        if not payers or not receivers:
+        raw_payments, min_payment = self.generate_payment_plan(results, total_fees)
+        if not raw_payments:
             return []
 
-        # Sort by absolute balance (largest first)
-        payers.sort(key=lambda x: x.balance)  # Most negative first
-        receivers.sort(key=lambda x: x.balance, reverse=True)  # Most positive first
+        # Build offer lookup — both payer and receiver must have offers
+        offer_map = {r.peer_id: r.bolt12_offer for r in results if r.bolt12_offer}
 
         payments = []
-        payer_remaining = {p.peer_id: -p.balance for p in payers}  # Amount they owe
-        receiver_remaining = {r.peer_id: r.balance for r in receivers}  # Amount owed to them
-
-        # Match payers to receivers
-        for payer in payers:
-            if payer_remaining[payer.peer_id] <= 0:
+        for p in raw_payments:
+            from_peer = p["from_peer"]
+            to_peer = p["to_peer"]
+            if from_peer not in offer_map or to_peer not in offer_map:
                 continue
-
-            for receiver in receivers:
-                if receiver_remaining[receiver.peer_id] <= 0:
-                    continue
-
-                # Calculate payment amount
-                amount = min(
-                    payer_remaining[payer.peer_id],
-                    receiver_remaining[receiver.peer_id]
-                )
-
-                if amount < min_payment:
-                    continue
-
-                payments.append(SettlementPayment(
-                    from_peer=payer.peer_id,
-                    to_peer=receiver.peer_id,
-                    amount_sats=amount,
-                    bolt12_offer=receiver.bolt12_offer
-                ))
-
-                payer_remaining[payer.peer_id] -= amount
-                receiver_remaining[receiver.peer_id] -= amount
+            payments.append(SettlementPayment(
+                from_peer=from_peer,
+                to_peer=to_peer,
+                amount_sats=int(p["amount_sats"]),
+                bolt12_offer=offer_map[to_peer],
+            ))
 
         return payments
 
@@ -1229,7 +1211,8 @@ class SettlementManager:
         proposal: Dict[str, Any],
         our_peer_id: str,
         state_manager,
-        rpc
+        rpc,
+        skip_hash_verify: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         Verify a settlement proposal's data hash and vote if it matches.
@@ -1242,6 +1225,8 @@ class SettlementManager:
             our_peer_id: Our node's public key
             state_manager: HiveStateManager with gossiped fee data
             rpc: RPC proxy for signing
+            skip_hash_verify: If True, skip hash re-verification (for proposer's
+                own auto-vote where data was just computed)
 
         Returns:
             Vote dict if vote cast, None if hash mismatch or already voted
@@ -1267,36 +1252,40 @@ class SettlementManager:
             )
             return None
 
-        # Gather our own contribution data and calculate hashes.
-        # We verify both the canonical data hash and the derived deterministic plan hash.
-        our_contributions = self.gather_contributions_from_gossip(state_manager, period)
-        our_plan = self.compute_settlement_plan(period, our_contributions)
-        our_hash = our_plan["data_hash"]
-        our_plan_hash = our_plan["plan_hash"]
+        if not skip_hash_verify:
+            # Gather our own contribution data and calculate hashes.
+            # We verify both the canonical data hash and the derived deterministic plan hash.
+            our_contributions = self.gather_contributions_from_gossip(state_manager, period)
+            our_plan = self.compute_settlement_plan(period, our_contributions)
+            our_hash = our_plan["data_hash"]
+            our_plan_hash = our_plan["plan_hash"]
 
-        # Verify hash matches
-        if our_hash != proposed_hash:
-            self.plugin.log(
-                f"Hash mismatch for proposal {proposal_id[:16]}...: "
-                f"ours={our_hash[:16]}... theirs={proposed_hash[:16]}...",
-                level='warn'
-            )
-            return None
+            # Verify hash matches
+            if our_hash != proposed_hash:
+                self.plugin.log(
+                    f"Hash mismatch for proposal {proposal_id[:16]}...: "
+                    f"ours={our_hash[:16]}... theirs={proposed_hash[:16]}...",
+                    level='warn'
+                )
+                return None
 
-        if not isinstance(proposed_plan_hash, str) or len(proposed_plan_hash) != 64:
-            self.plugin.log(
-                f"Missing/invalid plan_hash for proposal {proposal_id[:16]}...",
-                level='warn'
-            )
-            return None
+            if not isinstance(proposed_plan_hash, str) or len(proposed_plan_hash) != 64:
+                self.plugin.log(
+                    f"Missing/invalid plan_hash for proposal {proposal_id[:16]}...",
+                    level='warn'
+                )
+                return None
 
-        if our_plan_hash != proposed_plan_hash:
-            self.plugin.log(
-                f"Plan hash mismatch for proposal {proposal_id[:16]}...: "
-                f"ours={our_plan_hash[:16]}... theirs={proposed_plan_hash[:16]}...",
-                level='warn'
-            )
-            return None
+            if our_plan_hash != proposed_plan_hash:
+                self.plugin.log(
+                    f"Plan hash mismatch for proposal {proposal_id[:16]}...: "
+                    f"ours={our_plan_hash[:16]}... theirs={proposed_plan_hash[:16]}...",
+                    level='warn'
+                )
+                return None
+
+        # When skipping verification, trust the proposal's hash (proposer auto-vote)
+        data_hash_for_vote = our_hash if not skip_hash_verify else proposed_hash
 
         timestamp = int(time.time())
 
@@ -1305,7 +1294,7 @@ class SettlementManager:
         vote_payload = {
             'proposal_id': proposal_id,
             'voter_peer_id': our_peer_id,
-            'data_hash': our_hash,
+            'data_hash': data_hash_for_vote,
             'timestamp': timestamp,
         }
         signing_payload = get_settlement_ready_signing_payload(vote_payload)
@@ -1321,19 +1310,20 @@ class SettlementManager:
         if not self.db.add_settlement_ready_vote(
             proposal_id=proposal_id,
             voter_peer_id=our_peer_id,
-            data_hash=our_hash,
+            data_hash=data_hash_for_vote,
             signature=signature
         ):
             return None
 
         self.plugin.log(
-            f"Voted on settlement proposal {proposal_id[:16]}... (hash verified)"
+            f"Voted on settlement proposal {proposal_id[:16]}... "
+            f"({'proposer auto-vote' if skip_hash_verify else 'hash verified'})"
         )
 
         return {
             'proposal_id': proposal_id,
             'voter_peer_id': our_peer_id,
-            'data_hash': our_hash,
+            'data_hash': data_hash_for_vote,
             'timestamp': timestamp,
             'signature': signature,
         }
@@ -1375,7 +1365,10 @@ class SettlementManager:
         our_peer_id: str
     ) -> Tuple[int, Optional[str], int]:
         """
-        Calculate our balance in a settlement (positive = owed, negative = owe).
+        Calculate our balance in a settlement using the deterministic plan.
+
+        Uses compute_settlement_plan() to ensure results are consistent
+        with what execute_our_settlement() would actually pay.
 
         Args:
             proposal: Proposal dict
@@ -1384,46 +1377,34 @@ class SettlementManager:
 
         Returns:
             Tuple of (balance_sats, creditor_peer_id or None, min_payment_threshold)
+              balance > 0: we are owed money (net receiver)
+              balance < 0: we owe money (net payer)
         """
-        # Convert to MemberContribution objects
-        member_contributions = [
-            MemberContribution(
-                peer_id=c['peer_id'],
-                capacity_sats=c.get('capacity', 0),
-                forwards_sats=c.get('forward_count', 0) * 100000,  # Estimate
-                fees_earned_sats=c.get('fees_earned', 0),
-                uptime_pct=c.get('uptime', 100),
+        period = proposal.get('period', '') if isinstance(proposal, dict) else str(proposal)
+        plan = self.compute_settlement_plan(period, contributions)
+        min_payment = plan["min_payment_sats"]
+
+        # Determine our net position from the deterministic payment plan
+        expected_sent = int(plan["expected_sent_sats"].get(our_peer_id, 0))
+        expected_received = sum(
+            int(p["amount_sats"]) for p in plan["payments"]
+            if p.get("to_peer") == our_peer_id
+        )
+
+        # Positive = net receiver (owed money), negative = net payer (owe money)
+        balance = expected_received - expected_sent
+
+        # Find who we owe the most to (primary creditor)
+        creditor = None
+        if expected_sent > 0:
+            our_payments = sorted(
+                [p for p in plan["payments"] if p.get("from_peer") == our_peer_id],
+                key=lambda p: -int(p["amount_sats"])
             )
-            for c in contributions
-        ]
+            if our_payments:
+                creditor = our_payments[0]["to_peer"]
 
-        # Calculate fair shares
-        results = self.calculate_fair_shares(member_contributions)
-
-        # Calculate dynamic minimum payment
-        total_fees = sum(c.get('fees_earned', 0) for c in contributions)
-        member_count = len(contributions)
-        min_payment = calculate_min_payment(total_fees, member_count)
-
-        # Find our result
-        our_result = None
-        for result in results:
-            if result.peer_id == our_peer_id:
-                our_result = result
-                break
-
-        if not our_result:
-            return (0, None, min_payment)
-
-        # If we owe money (negative balance), find who to pay
-        if our_result.balance < -min_payment:
-            # Find member with highest positive balance (most owed)
-            creditors = [r for r in results if r.balance > min_payment]
-            if creditors:
-                creditors.sort(key=lambda x: x.balance, reverse=True)
-                return (our_result.balance, creditors[0].peer_id, min_payment)
-
-        return (our_result.balance, None, min_payment)
+        return (balance, creditor, min_payment)
 
     async def execute_our_settlement(
         self,
@@ -1479,6 +1460,21 @@ class SettlementManager:
         for p in our_payments:
             to_peer = p["to_peer"]
             amount = int(p["amount_sats"])
+
+            # Check if we already paid this sub-payment (crash recovery)
+            already_paid = self.db.get_settlement_sub_payment(proposal_id, our_peer_id, to_peer) if self.db else None
+            if already_paid and already_paid.get("status") == "completed":
+                self.plugin.log(
+                    f"SETTLEMENT: Skipping already-completed payment to {to_peer[:16]}... "
+                    f"({amount} sats, proposal {proposal_id[:16]}...)",
+                    level="info"
+                )
+                total_sent += amount
+                ph = already_paid.get("payment_hash", "")
+                if ph:
+                    payment_hashes.append(ph)
+                continue
+
             offer = self.get_offer(to_peer)
             if not offer:
                 self.plugin.log(
@@ -1501,6 +1497,13 @@ class SettlementManager:
                     level="warn"
                 )
                 return None
+
+            # Record successful sub-payment for crash recovery
+            if self.db:
+                self.db.record_settlement_sub_payment(
+                    proposal_id, our_peer_id, to_peer, amount,
+                    pay.payment_hash or "", "completed"
+                )
 
             total_sent += amount
             if pay.payment_hash:
@@ -1595,13 +1598,27 @@ class SettlementManager:
                 )
                 return False
 
-        # Validate that each participant has executed and their reported totals match.
+        # Only require execution from members who have payments to make.
+        # Receivers (positive balance) don't send payments and shouldn't
+        # block settlement completion by being offline.
+        payers = {
+            pid: amount
+            for pid, amount in plan["expected_sent_sats"].items()
+            if amount > 0
+        }
+
+        if not payers:
+            # No payments needed (all balances within min_payment threshold)
+            self.db.update_settlement_proposal_status(proposal_id, 'completed')
+            self.db.mark_period_settled(period, proposal_id, 0)
+            self.plugin.log(
+                f"Settlement {proposal_id[:16]}... completed (no payments needed)"
+            )
+            return True
+
         executions_by_peer = {e.get("executor_peer_id"): e for e in executions}
 
-        for c in contributions:
-            peer_id = c.get("peer_id")
-            if not peer_id:
-                continue
+        for peer_id, expected_amount in payers.items():
             ex = executions_by_peer.get(peer_id)
             if not ex:
                 return False
@@ -1612,26 +1629,20 @@ class SettlementManager:
                 if ex_plan_hash != plan["plan_hash"]:
                     return False
 
-            expected_sent = int(plan["expected_sent_sats"].get(peer_id, 0))
             actual_sent = int(ex.get("amount_paid_sats", 0) or 0)
-            if actual_sent != expected_sent:
+            if actual_sent != expected_amount:
                 return False
 
-        if exec_count >= member_count:
-            # All members have confirmed correctly - mark as complete
-            self.db.update_settlement_proposal_status(proposal_id, 'completed')
+        # All payers have confirmed correctly - mark as complete
+        total_distributed = sum(payers.values())
+        self.db.update_settlement_proposal_status(proposal_id, 'completed')
+        self.db.mark_period_settled(period, proposal_id, total_distributed)
 
-            # Mark period as settled (sum of expected sends is deterministic).
-            total_distributed = sum(int(v) for v in plan["expected_sent_sats"].values())
-            self.db.mark_period_settled(period, proposal_id, total_distributed)
-
-            self.plugin.log(
-                f"Settlement {proposal_id[:16]}... completed: "
-                f"{total_distributed} sats distributed for {period}"
-            )
-            return True
-
-        return False
+        self.plugin.log(
+            f"Settlement {proposal_id[:16]}... completed: "
+            f"{total_distributed} sats distributed for {period}"
+        )
+        return True
 
     def get_distributed_settlement_status(self) -> Dict[str, Any]:
         """

@@ -80,8 +80,6 @@ class HiveDatabase:
 
             # Enable Write-Ahead Logging for better multi-thread concurrency
             self._local.conn.execute("PRAGMA journal_mode=WAL;")
-            # Ensure foreign keys are enforced
-            self._local.conn.execute("PRAGMA foreign_keys=ON;")
             
             self.plugin.log(
                 f"HiveDatabase: Created thread-local connection (thread={threading.current_thread().name})",
@@ -177,10 +175,18 @@ class HiveDatabase:
         
         # Index for quick lookup of active intents by target
         conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_intent_locks_target 
+            CREATE INDEX IF NOT EXISTS idx_intent_locks_target
             ON intent_locks(target, status)
         """)
-        
+
+        # Add reason column for audit trail if upgrading from older schema
+        try:
+            conn.execute(
+                "ALTER TABLE intent_locks ADD COLUMN reason TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # =====================================================================
         # HIVE STATE TABLE
         # =====================================================================
@@ -333,6 +339,10 @@ class HiveDatabase:
                 event_count INTEGER NOT NULL DEFAULT 0
             )
         """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rate_limits_window "
+            "ON contribution_rate_limits(window_start)"
+        )
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS contribution_daily_stats (
@@ -392,9 +402,14 @@ class HiveDatabase:
                 payload TEXT NOT NULL,
                 proposed_at INTEGER NOT NULL,
                 expires_at INTEGER,
-                status TEXT DEFAULT 'pending'
+                status TEXT DEFAULT 'pending',
+                rejection_reason TEXT
             )
         """)
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_pending_actions_status_expires
+            ON pending_actions(status, expires_at)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_pending_actions_type_proposed
+            ON pending_actions(action_type, proposed_at)""")
 
         # =====================================================================
         # PLANNER LOG TABLE (Phase 6)
@@ -765,7 +780,8 @@ class HiveDatabase:
                 failure_hop INTEGER DEFAULT -1,
                 estimated_capacity_sats INTEGER DEFAULT 0,
                 total_fee_ppm INTEGER DEFAULT 0,
-                amount_probed_sats INTEGER DEFAULT 0
+                amount_probed_sats INTEGER DEFAULT 0,
+                UNIQUE(reporter_id, destination, path, timestamp)
             )
         """)
         conn.execute(
@@ -860,7 +876,8 @@ class HiveDatabase:
                 amount_sats INTEGER NOT NULL,
                 channel_id TEXT,
                 payment_hash TEXT,
-                recorded_at INTEGER NOT NULL
+                recorded_at INTEGER NOT NULL,
+                UNIQUE(payment_hash) ON CONFLICT IGNORE
             )
         """)
         conn.execute(
@@ -870,6 +887,10 @@ class HiveDatabase:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pool_revenue_member "
             "ON pool_revenue(member_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pool_revenue_payment_hash "
+            "ON pool_revenue(payment_hash)"
         )
 
         # Pool distributions - settlement records
@@ -1082,6 +1103,20 @@ class HiveDatabase:
             )
         """)
 
+        # Settlement sub-payments - crash recovery for partial execution (S-2 fix)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_sub_payments (
+                proposal_id TEXT NOT NULL,
+                from_peer_id TEXT NOT NULL,
+                to_peer_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                payment_hash TEXT,
+                status TEXT NOT NULL DEFAULT 'completed',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (proposal_id, from_peer_id, to_peer_id)
+            )
+        """)
+
         # Fee reports from hive members - persisted for settlement calculations
         # This stores FEE_REPORT gossip data so it survives restarts
         conn.execute("""
@@ -1105,6 +1140,14 @@ class HiveDatabase:
         try:
             conn.execute(
                 "ALTER TABLE fee_reports ADD COLUMN rebalance_costs_sats INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Add rejection_reason column if upgrading from older schema
+        try:
+            conn.execute(
+                "ALTER TABLE pending_actions ADD COLUMN rejection_reason TEXT"
             )
         except sqlite3.OperationalError:
             pass  # Column already exists
@@ -1170,6 +1213,87 @@ class HiveDatabase:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_proto_outbox_peer
             ON proto_outbox(peer_id, status)
+        """)
+
+        # Pheromone level persistence (routing intelligence)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pheromone_levels (
+                channel_id TEXT PRIMARY KEY,
+                level REAL NOT NULL,
+                fee_ppm INTEGER NOT NULL,
+                last_update REAL NOT NULL
+            )
+        """)
+
+        # Stigmergic marker persistence (routing intelligence)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS stigmergic_markers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                depositor TEXT NOT NULL,
+                source_peer_id TEXT NOT NULL,
+                destination_peer_id TEXT NOT NULL,
+                fee_ppm INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                volume_sats INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                strength REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_markers_route
+            ON stigmergic_markers(source_peer_id, destination_peer_id)
+        """)
+
+        # Defense warning report persistence
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS defense_warning_reports (
+                peer_id TEXT NOT NULL,
+                reporter_id TEXT NOT NULL,
+                threat_type TEXT NOT NULL,
+                severity REAL NOT NULL,
+                timestamp REAL NOT NULL,
+                ttl REAL NOT NULL,
+                evidence_json TEXT,
+                PRIMARY KEY (peer_id, reporter_id)
+            )
+        """)
+
+        # Defense active fee persistence
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS defense_active_fees (
+                peer_id TEXT PRIMARY KEY,
+                multiplier REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                threat_type TEXT NOT NULL,
+                reporter TEXT NOT NULL,
+                report_count INTEGER NOT NULL
+            )
+        """)
+
+        # Remote pheromone persistence (fleet-shared fee intelligence)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS remote_pheromones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id TEXT NOT NULL,
+                reporter_id TEXT NOT NULL,
+                level REAL NOT NULL,
+                fee_ppm INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                weight REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_remote_pheromones_peer
+            ON remote_pheromones(peer_id)
+        """)
+
+        # Fee observation persistence (network fee volatility samples)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fee_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                fee_ppm INTEGER NOT NULL
+            )
         """)
 
         conn.execute("PRAGMA optimize;")
@@ -1296,28 +1420,30 @@ class HiveDatabase:
     # =========================================================================
     
     def create_intent(self, intent_type: str, target: str, initiator: str,
-                      expires_seconds: int = 300) -> int:
+                      expires_seconds: int = 300,
+                      timestamp: Optional[int] = None) -> int:
         """
         Create a new Intent lock.
-        
+
         Args:
             intent_type: 'channel_open', 'rebalance', 'ban_peer'
             target: Target peer_id or identifier
             initiator: Our node pubkey
             expires_seconds: Lock TTL
-            
+            timestamp: Creation timestamp (uses current time if None)
+
         Returns:
             Intent ID
         """
         conn = self._get_connection()
-        now = int(time.time())
+        now = timestamp if timestamp is not None else int(time.time())
         expires = now + expires_seconds
-        
+
         cursor = conn.execute("""
             INSERT INTO intent_locks (intent_type, target, initiator, timestamp, expires_at, status)
             VALUES (?, ?, ?, ?, ?, 'pending')
         """, (intent_type, target, initiator, now, expires))
-        
+
         return cursor.lastrowid
     
     def get_conflicting_intents(self, target: str, intent_type: str) -> List[Dict]:
@@ -1332,24 +1458,49 @@ class HiveDatabase:
         
         return [dict(row) for row in rows]
     
-    def update_intent_status(self, intent_id: int, status: str) -> bool:
-        """Update Intent status: 'pending', 'committed', 'aborted'."""
+    def update_intent_status(self, intent_id: int, status: str, reason: str = None) -> bool:
+        """Update Intent status with optional reason for audit trail."""
         conn = self._get_connection()
-        result = conn.execute(
-            "UPDATE intent_locks SET status = ? WHERE id = ?",
-            (status, intent_id)
-        )
+        if reason:
+            result = conn.execute(
+                "UPDATE intent_locks SET status = ?, reason = ? WHERE id = ?",
+                (status, reason, intent_id)
+            )
+        else:
+            result = conn.execute(
+                "UPDATE intent_locks SET status = ? WHERE id = ?",
+                (status, intent_id)
+            )
         return result.rowcount > 0
     
     def cleanup_expired_intents(self) -> int:
-        """Remove expired Intent locks."""
+        """Soft-delete expired intents, then purge terminal intents after 24h.
+
+        Phase 1: Mark pending expired intents as 'expired' (preserves audit trail).
+        Phase 2: Hard-delete terminal intents (expired/aborted/failed) older than 24h.
+
+        Returns:
+            Total number of intents affected (soft-deleted + purged)
+        """
         conn = self._get_connection()
         now = int(time.time())
-        result = conn.execute(
-            "DELETE FROM intent_locks WHERE expires_at < ?",
+
+        # Phase 1: Soft-delete - mark pending expired intents
+        r1 = conn.execute(
+            "UPDATE intent_locks SET status = 'expired', reason = 'ttl_expired' "
+            "WHERE status = 'pending' AND expires_at < ?",
             (now,)
         )
-        return result.rowcount
+
+        # Phase 2: Purge terminal intents older than 24 hours
+        purge_cutoff = now - 86400
+        r2 = conn.execute(
+            "DELETE FROM intent_locks "
+            "WHERE status IN ('expired', 'aborted', 'failed') AND expires_at < ?",
+            (purge_cutoff,)
+        )
+
+        return r1.rowcount + r2.rowcount
     
     def get_pending_intents_ready(self, hold_seconds: int) -> List[Dict]:
         """
@@ -1391,6 +1542,28 @@ class HiveDatabase:
 
         return [dict(row) for row in rows]
 
+    def recover_stuck_intents(self, max_age_seconds: int = 300) -> int:
+        """
+        Mark intents stuck in 'committed' state as 'failed'.
+
+        Intents that remain in 'committed' for longer than max_age_seconds
+        are assumed to have failed execution and are freed for retry.
+
+        Args:
+            max_age_seconds: Max age in seconds before marking as failed
+
+        Returns:
+            Number of intents recovered
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+        result = conn.execute(
+            "UPDATE intent_locks SET status = 'failed', reason = 'stuck_recovery' "
+            "WHERE status = 'committed' AND timestamp < ?",
+            (cutoff,)
+        )
+        return result.rowcount
+
     def get_intent_by_id(self, intent_id: int) -> Optional[Dict]:
         """Get a specific intent by ID."""
         conn = self._get_connection()
@@ -1408,34 +1581,59 @@ class HiveDatabase:
                           available_sats: int, fee_policy: Dict,
                           topology: List[str], state_hash: str,
                           version: Optional[int] = None) -> None:
-        """Update local cache of a peer's Hive state."""
+        """Update local cache of a peer's Hive state.
+
+        Uses version-guarded writes: only writes if the new version is
+        higher than what's already in the DB, preventing late-arriving
+        writes from overwriting newer state after concurrent updates.
+        """
         conn = self._get_connection()
         now = int(time.time())
 
+        fee_json = json.dumps(fee_policy)
+        topo_json = json.dumps(topology)
+
         if version is not None:
-            # Use the provided version (from state_manager)
+            # Insert if new, or update only if our version is higher
             conn.execute("""
-                INSERT OR REPLACE INTO hive_state
+                INSERT INTO hive_state
                 (peer_id, capacity_sats, available_sats, fee_policy, topology,
                  last_gossip, state_hash, version)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    capacity_sats = excluded.capacity_sats,
+                    available_sats = excluded.available_sats,
+                    fee_policy = excluded.fee_policy,
+                    topology = excluded.topology,
+                    last_gossip = excluded.last_gossip,
+                    state_hash = excluded.state_hash,
+                    version = excluded.version
+                WHERE excluded.version > hive_state.version
             """, (
                 peer_id, capacity_sats, available_sats,
-                json.dumps(fee_policy), json.dumps(topology),
+                fee_json, topo_json,
                 now, state_hash, version
             ))
         else:
             # Auto-increment for backward compatibility
             conn.execute("""
-                INSERT OR REPLACE INTO hive_state
+                INSERT INTO hive_state
                 (peer_id, capacity_sats, available_sats, fee_policy, topology,
                  last_gossip, state_hash, version)
                 VALUES (?, ?, ?, ?, ?, ?, ?,
                         COALESCE((SELECT version FROM hive_state WHERE peer_id = ?), 0) + 1)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    capacity_sats = excluded.capacity_sats,
+                    available_sats = excluded.available_sats,
+                    fee_policy = excluded.fee_policy,
+                    topology = excluded.topology,
+                    last_gossip = excluded.last_gossip,
+                    state_hash = excluded.state_hash,
+                    version = COALESCE((SELECT version FROM hive_state WHERE peer_id = ?), 0) + 1
             """, (
                 peer_id, capacity_sats, available_sats,
-                json.dumps(fee_policy), json.dumps(topology),
-                now, state_hash, peer_id
+                fee_json, topo_json,
+                now, state_hash, peer_id, peer_id
             ))
     
     def get_hive_state(self, peer_id: str) -> Optional[Dict]:
@@ -1458,7 +1656,7 @@ class HiveDatabase:
         """Get cached state for all Hive peers."""
         conn = self._get_connection()
         rows = conn.execute("SELECT * FROM hive_state LIMIT 1000").fetchall()
-        
+
         results = []
         for row in rows:
             result = dict(row)
@@ -1466,7 +1664,12 @@ class HiveDatabase:
             result['topology'] = json.loads(result['topology'] or '[]')
             results.append(result)
         return results
-    
+
+    def delete_hive_state(self, peer_id: str) -> None:
+        """Delete a peer's cached Hive state from the database."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM hive_state WHERE peer_id = ?", (peer_id,))
+
     # =========================================================================
     # CONTRIBUTION TRACKING
     # =========================================================================
@@ -1678,6 +1881,10 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         try:
+            # Clear stale approvals from any previous proposal for this target
+            conn.execute("""
+                DELETE FROM admin_promotion_approvals WHERE target_peer_id = ?
+            """, (target_peer_id,))
             conn.execute("""
                 INSERT OR REPLACE INTO admin_promotions
                 (target_peer_id, proposed_by, proposed_at, status)
@@ -1770,7 +1977,6 @@ class HiveDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
             """, (proposal_id, target_peer_id, proposer_peer_id, reason,
                   proposed_at, expires_at, proposal_type))
-            conn.commit()
             return True
         except Exception:
             return False
@@ -1810,7 +2016,6 @@ class HiveDatabase:
             cursor = conn.execute("""
                 UPDATE ban_proposals SET status = ? WHERE proposal_id = ?
             """, (status, proposal_id))
-            conn.commit()
             return cursor.rowcount > 0
         except Exception:
             return False
@@ -1825,7 +2030,6 @@ class HiveDatabase:
                 (proposal_id, voter_peer_id, vote, voted_at, signature)
                 VALUES (?, ?, ?, ?, ?)
             """, (proposal_id, voter_peer_id, vote, voted_at, signature))
-            conn.commit()
             return True
         except Exception:
             return False
@@ -1856,8 +2060,41 @@ class HiveDatabase:
             SET status = 'expired'
             WHERE status = 'pending' AND expires_at < ?
         """, (now,))
-        conn.commit()
         return cursor.rowcount
+
+    def prune_old_ban_data(self, older_than_days: int = 180) -> int:
+        """
+        Remove old ban proposals and their votes for terminal states.
+
+        Only prunes proposals in terminal states (approved, rejected, expired).
+        Pending proposals are never pruned.
+
+        Args:
+            older_than_days: Remove records older than this many days
+
+        Returns:
+            Number of ban proposals deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (older_than_days * 86400)
+
+        with self.transaction() as tx_conn:
+            # Delete votes for old terminal proposals first (foreign key safety)
+            tx_conn.execute("""
+                DELETE FROM ban_votes WHERE proposal_id IN (
+                    SELECT proposal_id FROM ban_proposals
+                    WHERE status IN ('approved', 'rejected', 'expired')
+                    AND proposed_at < ?
+                )
+            """, (cutoff,))
+
+            # Delete the old terminal proposals
+            cursor = tx_conn.execute("""
+                DELETE FROM ban_proposals
+                WHERE status IN ('approved', 'rejected', 'expired')
+                AND proposed_at < ?
+            """, (cutoff,))
+            return cursor.rowcount
 
     # =========================================================================
     # PEER PRESENCE
@@ -1876,35 +2113,42 @@ class HiveDatabase:
                         window_seconds: int) -> None:
         """
         Update presence using a rolling accumulator.
+
+        Wrapped in a transaction to prevent TOCTOU race between the
+        existence check and the subsequent INSERT/UPDATE.
         """
-        conn = self._get_connection()
-        existing = self.get_presence(peer_id)
-        if not existing:
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM peer_presence WHERE peer_id = ?",
+                (peer_id,)
+            ).fetchone()
+
+            if not existing:
+                conn.execute("""
+                    INSERT INTO peer_presence
+                    (peer_id, last_change_ts, is_online, online_seconds_rolling, window_start_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (peer_id, now_ts, 1 if is_online else 0, 0, now_ts))
+                return
+
+            last_change_ts = existing["last_change_ts"]
+            online_seconds = existing["online_seconds_rolling"]
+            window_start_ts = existing["window_start_ts"]
+            was_online = bool(existing["is_online"])
+
+            if was_online:
+                online_seconds += max(0, now_ts - last_change_ts)
+
+            if now_ts - window_start_ts > window_seconds:
+                window_start_ts = now_ts - window_seconds
+                if online_seconds > window_seconds:
+                    online_seconds = window_seconds
+
             conn.execute("""
-                INSERT INTO peer_presence
-                (peer_id, last_change_ts, is_online, online_seconds_rolling, window_start_ts)
-                VALUES (?, ?, ?, ?, ?)
-            """, (peer_id, now_ts, 1 if is_online else 0, 0, now_ts))
-            return
-
-        last_change_ts = existing["last_change_ts"]
-        online_seconds = existing["online_seconds_rolling"]
-        window_start_ts = existing["window_start_ts"]
-        was_online = bool(existing["is_online"])
-
-        if was_online:
-            online_seconds += max(0, now_ts - last_change_ts)
-
-        if now_ts - window_start_ts > window_seconds:
-            window_start_ts = now_ts - window_seconds
-            if online_seconds > window_seconds:
-                online_seconds = window_seconds
-
-        conn.execute("""
-            UPDATE peer_presence
-            SET last_change_ts = ?, is_online = ?, online_seconds_rolling = ?, window_start_ts = ?
-            WHERE peer_id = ?
-        """, (now_ts, 1 if is_online else 0, online_seconds, window_start_ts, peer_id))
+                UPDATE peer_presence
+                SET last_change_ts = ?, is_online = ?, online_seconds_rolling = ?, window_start_ts = ?
+                WHERE peer_id = ?
+            """, (now_ts, 1 if is_online else 0, online_seconds, window_start_ts, peer_id))
 
     def prune_presence(self, window_seconds: int) -> int:
         """Clamp rolling windows to the configured window length."""
@@ -1926,6 +2170,8 @@ class HiveDatabase:
         """
         Calculate uptime percentage from peer_presence and update hive_members.
 
+        Uses a single JOIN query instead of N+1 individual lookups.
+
         For each member with presence data, calculates:
         uptime_pct = online_seconds_rolling / elapsed_window_time
 
@@ -1938,49 +2184,39 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
 
-        # Get all members
-        members = conn.execute(
-            "SELECT peer_id FROM hive_members"
-        ).fetchall()
+        # Single JOIN query: members with their presence data
+        rows = conn.execute("""
+            SELECT m.peer_id, p.online_seconds_rolling, p.window_start_ts,
+                   p.is_online, p.last_change_ts
+            FROM hive_members m
+            JOIN peer_presence p ON m.peer_id = p.peer_id
+        """).fetchall()
 
         updated = 0
-        for row in members:
-            peer_id = row['peer_id']
-            presence = self.get_presence(peer_id)
+        with self.transaction() as tx_conn:
+            for row in rows:
+                online_seconds = row['online_seconds_rolling']
 
-            if not presence:
-                # No presence data, assume 0% uptime
-                continue
+                # If currently online, add time since last state change
+                if row['is_online']:
+                    online_seconds += max(0, now - row['last_change_ts'])
 
-            online_seconds = presence['online_seconds_rolling']
-            window_start = presence['window_start_ts']
-            is_online = bool(presence['is_online'])
-            last_change = presence['last_change_ts']
+                # Calculate window elapsed time
+                elapsed = max(1, now - row['window_start_ts'])
 
-            # If currently online, add time since last state change
-            if is_online:
-                online_seconds += max(0, now - last_change)
+                # Cap at window size
+                if elapsed > window_seconds:
+                    elapsed = window_seconds
+                if online_seconds > elapsed:
+                    online_seconds = elapsed
 
-            # Calculate window elapsed time
-            elapsed = now - window_start
-            if elapsed <= 0:
-                elapsed = 1  # Avoid division by zero
+                uptime_pct = online_seconds / elapsed
 
-            # Cap at window size
-            if elapsed > window_seconds:
-                elapsed = window_seconds
-            if online_seconds > elapsed:
-                online_seconds = elapsed
-
-            # Calculate percentage (0.0 to 1.0)
-            uptime_pct = online_seconds / elapsed
-
-            # Update hive_members
-            conn.execute(
-                "UPDATE hive_members SET uptime_pct = ? WHERE peer_id = ?",
-                (uptime_pct, peer_id)
-            )
-            updated += 1
+                tx_conn.execute(
+                    "UPDATE hive_members SET uptime_pct = ? WHERE peer_id = ?",
+                    (uptime_pct, row['peer_id'])
+                )
+                updated += 1
 
         return updated
 
@@ -2151,13 +2387,19 @@ class HiveDatabase:
         result['payload'] = json.loads(result['payload'])
         return result
 
-    def update_action_status(self, action_id: int, status: str) -> bool:
+    def update_action_status(self, action_id: int, status: str, reason: str = None) -> bool:
         """Update action status: 'pending', 'approved', 'rejected', 'expired'."""
         conn = self._get_connection()
-        result = conn.execute(
-            "UPDATE pending_actions SET status = ? WHERE id = ?",
-            (status, action_id)
-        )
+        if reason:
+            result = conn.execute(
+                "UPDATE pending_actions SET status = ?, rejection_reason = ? WHERE id = ?",
+                (status, reason, action_id)
+            )
+        else:
+            result = conn.execute(
+                "UPDATE pending_actions SET status = ? WHERE id = ?",
+                (status, action_id)
+            )
         return result.rowcount > 0
     
     def cleanup_expired_actions(self) -> int:
@@ -2189,14 +2431,17 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
 
+        # Escape LIKE metacharacters in target to prevent over-matching
+        escaped = target.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
         # Use LIKE for initial filtering, then parse JSON to confirm
         # This is more efficient than scanning all rows
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE status = 'pending' AND expires_at > ?
-            AND payload LIKE ?
+            AND payload LIKE ? ESCAPE '\\'
             LIMIT ?
-        """, (now, f'%{target}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
+        """, (now, f'%{escaped}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         for row in rows:
             try:
@@ -2229,13 +2474,16 @@ class HiveDatabase:
         now = int(time.time())
         cutoff = now - cooldown_seconds
 
+        # Escape LIKE metacharacters in target to prevent over-matching
+        escaped = target.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
         # Use LIKE for initial filtering, then parse JSON to confirm
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE status = 'rejected' AND proposed_at > ?
-            AND payload LIKE ?
+            AND payload LIKE ? ESCAPE '\\'
             LIMIT ?
-        """, (cutoff, f'%{target}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
+        """, (cutoff, f'%{escaped}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         for row in rows:
             try:
@@ -2265,13 +2513,16 @@ class HiveDatabase:
         now = int(time.time())
         cutoff = now - (days * 86400)
 
+        # Escape LIKE metacharacters in target to prevent over-matching
+        escaped = target.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
         # Use LIKE for initial filtering, then parse JSON to confirm
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE status = 'rejected' AND proposed_at > ?
-            AND payload LIKE ?
+            AND payload LIKE ? ESCAPE '\\'
             LIMIT ?
-        """, (cutoff, f'%{target}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
+        """, (cutoff, f'%{escaped}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         count = 0
         for row in rows:
@@ -2341,6 +2592,26 @@ class HiveDatabase:
 
         return row['cnt'] if row else 0
 
+    def count_outbox_pending(self) -> int:
+        """
+        Count outbox entries ready for sending or retry.
+
+        More efficient than get_outbox_pending() when only a count is needed.
+
+        Returns:
+            Count of pending entries.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        row = conn.execute(
+            """SELECT COUNT(*) as cnt FROM proto_outbox
+               WHERE status IN ('queued', 'sent')
+                 AND next_retry_at <= ?
+                 AND expires_at > ?""",
+            (now, now)
+        ).fetchone()
+        return row['cnt'] if row else 0
+
     def has_recent_action_for_channel(
         self,
         channel_id: str,
@@ -2362,13 +2633,16 @@ class HiveDatabase:
         """
         conn = self._get_connection()
 
+        # Escape LIKE metacharacters in channel_id to prevent over-matching
+        escaped = channel_id.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
         # Use LIKE for initial filtering, then parse to confirm
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE action_type = ? AND proposed_at >= ?
-            AND payload LIKE ?
+            AND payload LIKE ? ESCAPE '\\'
             LIMIT 10
-        """, (action_type, since_timestamp, f'%{channel_id}%')).fetchall()
+        """, (action_type, since_timestamp, f'%{escaped}%')).fetchall()
 
         for row in rows:
             try:
@@ -2400,7 +2674,7 @@ class HiveDatabase:
         cutoff = int(time.time()) - (hours * 3600)
 
         rows = conn.execute("""
-            SELECT id, action_type, payload, proposed_at, status
+            SELECT id, action_type, payload, proposed_at, status, rejection_reason
             FROM pending_actions
             WHERE status = 'rejected'
             AND action_type IN ('channel_open', 'expansion')
@@ -2420,6 +2694,10 @@ class HiveDatabase:
 
         return results
 
+    # Maximum lookback for consecutive rejection counting (7 days).
+    # Prevents ancient rejections from permanently deadlocking the planner.
+    REJECTION_LOOKBACK_HOURS = 168
+
     def count_consecutive_expansion_rejections(self) -> int:
         """
         Count consecutive expansion rejections without any approvals.
@@ -2427,19 +2705,24 @@ class HiveDatabase:
         This detects patterns where ALL expansion proposals are being rejected
         (e.g., due to global liquidity constraints), regardless of target.
 
+        Only counts rejections within REJECTION_LOOKBACK_HOURS (7 days) to
+        prevent ancient rejections from permanently deadlocking the planner.
+
         Returns:
             Number of consecutive rejections since last approval/execution
         """
         conn = self._get_connection()
+        cutoff = int(time.time()) - (self.REJECTION_LOOKBACK_HOURS * 3600)
 
-        # Get the most recent actions, ordered by time
+        # Get the most recent actions within the lookback window, ordered by time
         # Look for the first non-rejection to break the streak
         rows = conn.execute("""
             SELECT status FROM pending_actions
             WHERE action_type IN ('channel_open', 'expansion')
+            AND proposed_at > ?
             ORDER BY proposed_at DESC
             LIMIT ?
-        """, (self.MAX_PENDING_ACTIONS_SCAN,)).fetchall()
+        """, (cutoff, self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         consecutive = 0
         for row in rows:
@@ -2468,35 +2751,37 @@ class HiveDatabase:
         Implements ring-buffer behavior: when MAX_PLANNER_LOG_ROWS is exceeded,
         oldest 10% of entries are pruned to make room.
 
+        Wrapped in a transaction so the COUNT + DELETE + INSERT are atomic.
+
         Args:
             action_type: What the planner did (e.g., 'saturation_check', 'expansion')
             result: Outcome ('success', 'skipped', 'failed', 'proposed')
             target: Target peer related to the action
             details: Additional context as dict
         """
-        conn = self._get_connection()
         now = int(time.time())
         details_json = json.dumps(details) if details else None
 
-        # Check row count and prune if at cap (ring-buffer behavior)
-        row = conn.execute("SELECT COUNT(*) as cnt FROM hive_planner_log").fetchone()
-        if row and row['cnt'] >= self.MAX_PLANNER_LOG_ROWS:
-            # Delete oldest 10% to make room
-            prune_count = self.MAX_PLANNER_LOG_ROWS // 10
-            conn.execute("""
-                DELETE FROM hive_planner_log WHERE id IN (
-                    SELECT id FROM hive_planner_log ORDER BY timestamp ASC LIMIT ?
+        with self.transaction() as conn:
+            # Check row count and prune if at cap (ring-buffer behavior)
+            row = conn.execute("SELECT COUNT(*) as cnt FROM hive_planner_log").fetchone()
+            if row and row['cnt'] >= self.MAX_PLANNER_LOG_ROWS:
+                # Delete oldest 10% to make room
+                prune_count = self.MAX_PLANNER_LOG_ROWS // 10
+                conn.execute("""
+                    DELETE FROM hive_planner_log WHERE id IN (
+                        SELECT id FROM hive_planner_log ORDER BY timestamp ASC LIMIT ?
+                    )
+                """, (prune_count,))
+                self.plugin.log(
+                    f"HiveDatabase: Planner log at cap ({self.MAX_PLANNER_LOG_ROWS}), pruned {prune_count} oldest entries",
+                    level='debug'
                 )
-            """, (prune_count,))
-            self.plugin.log(
-                f"HiveDatabase: Planner log at cap ({self.MAX_PLANNER_LOG_ROWS}), pruned {prune_count} oldest entries",
-                level='debug'
-            )
 
-        conn.execute("""
-            INSERT INTO hive_planner_log (timestamp, action_type, target, result, details)
-            VALUES (?, ?, ?, ?, ?)
-        """, (now, action_type, target, result, details_json))
+            conn.execute("""
+                INSERT INTO hive_planner_log (timestamp, action_type, target, result, details)
+                VALUES (?, ?, ?, ?, ?)
+            """, (now, action_type, target, result, details_json))
 
     def get_planner_logs(self, limit: int = 50) -> List[Dict]:
         """Get recent planner logs."""
@@ -2929,12 +3214,13 @@ class HiveDatabase:
         rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
-    def get_peers_with_events(self, days: int = 90) -> List[str]:
+    def get_peers_with_events(self, days: int = 90, limit: int = 500) -> List[str]:
         """
         Get list of all external peers that have event history.
 
         Args:
             days: Only include peers with events in last N days
+            limit: Maximum number of peers to return (default 500)
 
         Returns:
             List of peer_id strings
@@ -2945,7 +3231,8 @@ class HiveDatabase:
         rows = conn.execute("""
             SELECT DISTINCT peer_id FROM peer_events
             WHERE timestamp > ?
-        """, (cutoff,)).fetchall()
+            LIMIT ?
+        """, (cutoff, limit)).fetchall()
 
         return [row['peer_id'] for row in rows]
 
@@ -2975,6 +3262,29 @@ class HiveDatabase:
     # =========================================================================
     # BUDGET TRACKING
     # =========================================================================
+
+    def prune_budget_tracking(self, older_than_days: int = 90) -> int:
+        """
+        Remove old budget tracking records.
+
+        Args:
+            older_than_days: Delete records older than this (default: 90)
+
+        Returns:
+            Number of records deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (older_than_days * 86400)
+        result = conn.execute(
+            "DELETE FROM budget_tracking WHERE timestamp < ?", (cutoff,)
+        )
+        deleted = result.rowcount
+        if deleted > 0:
+            self.plugin.log(
+                f"HiveDatabase: Pruned {deleted} budget_tracking rows older than {older_than_days}d",
+                level='info'
+            )
+        return deleted
 
     def get_today_date_key(self) -> str:
         """Get today's date key in YYYY-MM-DD format (UTC)."""
@@ -3420,7 +3730,6 @@ class HiveDatabase:
                 (hold_id, round_id, peer_id, amount_sats, created_at, expires_at, status)
                 VALUES (?, ?, ?, ?, ?, ?, 'active')
             """, (hold_id, round_id, peer_id, amount_sats, now, expires_at))
-            conn.commit()
             return True
         except Exception:
             return False
@@ -3429,12 +3738,11 @@ class HiveDatabase:
         """Release a budget hold (round completed/cancelled)."""
         conn = self._get_connection()
         try:
-            conn.execute("""
+            result = conn.execute("""
                 UPDATE budget_holds SET status = 'released'
                 WHERE hold_id = ? AND status = 'active'
             """, (hold_id,))
-            conn.commit()
-            return conn.total_changes > 0
+            return result.rowcount > 0
         except Exception:
             return False
 
@@ -3443,13 +3751,12 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         try:
-            conn.execute("""
+            result = conn.execute("""
                 UPDATE budget_holds
                 SET status = 'consumed', consumed_by = ?, consumed_at = ?
                 WHERE hold_id = ? AND status = 'active'
             """, (consumed_by, now, hold_id))
-            conn.commit()
-            return conn.total_changes > 0
+            return result.rowcount > 0
         except Exception:
             return False
 
@@ -3457,12 +3764,11 @@ class HiveDatabase:
         """Mark a hold as expired."""
         conn = self._get_connection()
         try:
-            conn.execute("""
+            result = conn.execute("""
                 UPDATE budget_holds SET status = 'expired'
                 WHERE hold_id = ? AND status = 'active'
             """, (hold_id,))
-            conn.commit()
-            return conn.total_changes > 0
+            return result.rowcount > 0
         except Exception:
             return False
 
@@ -3512,7 +3818,6 @@ class HiveDatabase:
             UPDATE budget_holds SET status = 'expired'
             WHERE status = 'active' AND expires_at <= ?
         """, (now,))
-        conn.commit()
         return cursor.rowcount
 
     # =========================================================================
@@ -3872,12 +4177,12 @@ class HiveDatabase:
             results.append(result)
         return results
 
-    def get_struggling_members(self, threshold: int = 40) -> List[Dict[str, Any]]:
+    def get_struggling_members(self, threshold: int = 20) -> List[Dict[str, Any]]:
         """
         Get members with health below threshold (NNLB candidates).
 
         Args:
-            threshold: Health score threshold (default 40)
+            threshold: Health score threshold (default 20, relaxed 2026-02-12)
 
         Returns:
             List of health records for struggling members
@@ -3972,6 +4277,49 @@ class HiveDatabase:
             member_id, depleted_count, saturated_count,
             1 if rebalancing_active else 0, peers_json, ts
         ))
+
+    def update_rebalancing_activity(
+        self,
+        member_id: str,
+        rebalancing_active: bool,
+        rebalancing_peers: List[str] = None,
+        timestamp: Optional[int] = None
+    ) -> None:
+        """
+        Targeted update of ONLY rebalancing columns in member_liquidity_state.
+
+        Unlike update_member_liquidity_state() which UPSERTs all columns,
+        this preserves existing depleted/saturated counts. Used by the
+        rebalancer's JobManager which doesn't have depleted/saturated data.
+
+        Args:
+            member_id: Hive member peer ID
+            rebalancing_active: Whether member is currently rebalancing
+            rebalancing_peers: Which peers they're rebalancing through
+            timestamp: When the report was made
+        """
+        import json
+        ts = timestamp or int(time.time())
+        peers_json = json.dumps(rebalancing_peers or [])
+
+        with self.transaction() as conn:
+            # Try targeted UPDATE first (preserves depleted/saturated counts)
+            cursor = conn.execute("""
+                UPDATE member_liquidity_state
+                SET rebalancing_active = ?,
+                    rebalancing_peers = ?,
+                    timestamp = ?
+                WHERE peer_id = ?
+            """, (1 if rebalancing_active else 0, peers_json, ts, member_id))
+
+            if cursor.rowcount == 0:
+                # No prior record — insert with zeroed depleted/saturated counts
+                conn.execute("""
+                    INSERT OR IGNORE INTO member_liquidity_state (
+                        peer_id, depleted_count, saturated_count,
+                        rebalancing_active, rebalancing_peers, timestamp
+                    ) VALUES (?, 0, 0, ?, ?, ?)
+                """, (member_id, 1 if rebalancing_active else 0, peers_json, ts))
 
     def get_member_liquidity_state(
         self,
@@ -4232,7 +4580,7 @@ class HiveDatabase:
         path_str = json.dumps(path)
 
         conn.execute("""
-            INSERT INTO route_probes
+            INSERT OR IGNORE INTO route_probes
             (reporter_id, destination, path, timestamp, success, latency_ms,
              failure_reason, failure_hop, estimated_capacity_sats, total_fee_ppm,
              amount_probed_sats)
@@ -4563,12 +4911,13 @@ class HiveDatabase:
             Row ID of the recorded revenue
         """
         conn = self._get_connection()
+
         cursor = conn.execute("""
-            INSERT INTO pool_revenue
+            INSERT OR IGNORE INTO pool_revenue
             (member_id, amount_sats, channel_id, payment_hash, recorded_at)
             VALUES (?, ?, ?, ?, ?)
         """, (member_id, amount_sats, channel_id, payment_hash, int(time.time())))
-        return cursor.lastrowid
+        return cursor.lastrowid or 0
 
     def get_pool_revenue(
         self,
@@ -4833,6 +5182,60 @@ class HiveDatabase:
             end = start + datetime.timedelta(days=1)
 
         return (int(start.timestamp()), int(end.timestamp()))
+
+    def cleanup_old_pool_revenue(self, days_to_keep: int = 90) -> int:
+        """
+        Remove old pool revenue records to limit database growth.
+
+        Args:
+            days_to_keep: Days of revenue records to retain
+
+        Returns:
+            Number of rows deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days_to_keep * 86400)
+        result = conn.execute(
+            "DELETE FROM pool_revenue WHERE recorded_at < ?", (cutoff,)
+        )
+        return result.rowcount
+
+    def cleanup_old_pool_contributions(self, periods_to_keep: int = 12) -> int:
+        """
+        Remove old pool contribution records, keeping only the most recent periods.
+
+        Args:
+            periods_to_keep: Number of most recent periods to retain
+
+        Returns:
+            Number of rows deleted
+        """
+        conn = self._get_connection()
+        result = conn.execute("""
+            DELETE FROM pool_contributions
+            WHERE period NOT IN (
+                SELECT DISTINCT period FROM pool_contributions
+                ORDER BY period DESC LIMIT ?
+            )
+        """, (periods_to_keep,))
+        return result.rowcount
+
+    def cleanup_old_pool_distributions(self, days_to_keep: int = 365) -> int:
+        """
+        Remove old pool distribution records to limit database growth.
+
+        Args:
+            days_to_keep: Days of distribution records to retain
+
+        Returns:
+            Number of rows deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days_to_keep * 86400)
+        result = conn.execute(
+            "DELETE FROM pool_distributions WHERE settled_at < ?", (cutoff,)
+        )
+        return result.rowcount
 
     # =========================================================================
     # FLOW SAMPLES OPERATIONS (Phase 7.1 - Anticipatory Liquidity)
@@ -5249,6 +5652,15 @@ class HiveDatabase:
     # SPLICE SESSION OPERATIONS (Phase 11)
     # =========================================================================
 
+    # Valid values for splice session fields (kept in sync with protocol.py)
+    _VALID_SPLICE_INITIATORS = {'local', 'remote'}
+    _VALID_SPLICE_TYPES = {'splice_in', 'splice_out'}
+    _VALID_SPLICE_STATUSES = {
+        'pending', 'init_sent', 'init_received', 'updating',
+        'signing', 'completed', 'aborted', 'failed'
+    }
+    _MAX_SPLICE_AMOUNT_SATS = 2_100_000_000_000_000  # 21M BTC in sats
+
     def create_splice_session(
         self,
         session_id: str,
@@ -5274,6 +5686,17 @@ class HiveDatabase:
         Returns:
             True if created successfully
         """
+        # Validate inputs
+        if initiator not in self._VALID_SPLICE_INITIATORS:
+            self.plugin.log(f"Invalid splice initiator: {initiator}", level='warn')
+            return False
+        if splice_type not in self._VALID_SPLICE_TYPES:
+            self.plugin.log(f"Invalid splice type: {splice_type}", level='warn')
+            return False
+        if not isinstance(amount_sats, int) or amount_sats <= 0 or amount_sats > self._MAX_SPLICE_AMOUNT_SATS:
+            self.plugin.log(f"Invalid splice amount: {amount_sats}", level='warn')
+            return False
+
         conn = self._get_connection()
         now = int(time.time())
         timeout_at = now + timeout_seconds
@@ -5375,6 +5798,9 @@ class HiveDatabase:
 
         updates = {"updated_at": now}
         if status is not None:
+            if status not in self._VALID_SPLICE_STATUSES:
+                self.plugin.log(f"Invalid splice status: {status}", level='warn')
+                return False
             updates["status"] = status
             if status in ('completed', 'aborted', 'failed'):
                 updates["completed_at"] = now
@@ -5839,6 +6265,35 @@ class HiveDatabase:
         """, (proposal_id, executor_peer_id)).fetchone()
         return row is not None
 
+    def record_settlement_sub_payment(
+        self, proposal_id: str, from_peer_id: str, to_peer_id: str,
+        amount_sats: int, payment_hash: str, status: str
+    ) -> bool:
+        """Record a completed sub-payment for crash recovery (S-2 fix)."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO settlement_sub_payments
+                (proposal_id, from_peer_id, to_peer_id, amount_sats,
+                 payment_hash, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (proposal_id, from_peer_id, to_peer_id, amount_sats,
+                  payment_hash, status, int(time.time())))
+            return True
+        except Exception:
+            return False
+
+    def get_settlement_sub_payment(
+        self, proposal_id: str, from_peer_id: str, to_peer_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get a specific sub-payment record for crash recovery."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM settlement_sub_payments
+            WHERE proposal_id = ? AND from_peer_id = ? AND to_peer_id = ?
+        """, (proposal_id, from_peer_id, to_peer_id)).fetchone()
+        return dict(row) if row else None
+
     def is_period_settled(self, period: str) -> bool:
         """Check if a period has already been settled."""
         conn = self._get_connection()
@@ -5911,45 +6366,85 @@ class HiveDatabase:
         """
         Remove old settlement data (proposals, votes, executions).
 
+        Wrapped in a transaction so all three DELETEs succeed or fail together,
+        preventing orphaned votes/executions if interrupted mid-prune.
+
         Args:
             older_than_days: Remove data older than this many days
 
         Returns:
             Total number of rows deleted
         """
-        conn = self._get_connection()
         cutoff = int(time.time()) - (older_than_days * 86400)
         total = 0
 
-        # Get old proposal IDs first
-        old_proposals = conn.execute("""
-            SELECT proposal_id FROM settlement_proposals
-            WHERE proposed_at < ?
-        """, (cutoff,)).fetchall()
+        with self.transaction() as conn:
+            # Get old proposal IDs first
+            old_proposals = conn.execute("""
+                SELECT proposal_id FROM settlement_proposals
+                WHERE proposed_at < ?
+            """, (cutoff,)).fetchall()
 
-        old_ids = [row[0] for row in old_proposals]
+            old_ids = [row[0] for row in old_proposals]
 
-        if old_ids:
-            placeholders = ",".join("?" * len(old_ids))
+            if old_ids:
+                placeholders = ",".join("?" * len(old_ids))
 
-            # Delete executions
+                # Delete executions
+                result = conn.execute(
+                    f"DELETE FROM settlement_executions WHERE proposal_id IN ({placeholders})",
+                    old_ids
+                )
+                total += result.rowcount
+
+                # Delete votes
+                result = conn.execute(
+                    f"DELETE FROM settlement_ready_votes WHERE proposal_id IN ({placeholders})",
+                    old_ids
+                )
+                total += result.rowcount
+
+                # Delete proposals
+                result = conn.execute(
+                    f"DELETE FROM settlement_proposals WHERE proposal_id IN ({placeholders})",
+                    old_ids
+                )
+                total += result.rowcount
+
+        return total
+
+    def prune_old_settlement_periods(self, older_than_days: int = 365) -> int:
+        """
+        Remove old fee_reports and pool data older than specified days.
+
+        Prunes fee_reports, pool_contributions, pool_revenue, and
+        pool_distributions that are older than the cutoff.
+
+        Args:
+            older_than_days: Remove data older than this many days
+
+        Returns:
+            Total number of rows deleted
+        """
+        cutoff = int(time.time()) - (older_than_days * 86400)
+        total = 0
+
+        with self.transaction() as conn:
+            # Prune old fee reports by period_end timestamp
             result = conn.execute(
-                f"DELETE FROM settlement_executions WHERE proposal_id IN ({placeholders})",
-                old_ids
+                "DELETE FROM fee_reports WHERE period_end < ?", (cutoff,)
             )
             total += result.rowcount
 
-            # Delete votes
+            # Prune old pool revenue
             result = conn.execute(
-                f"DELETE FROM settlement_ready_votes WHERE proposal_id IN ({placeholders})",
-                old_ids
+                "DELETE FROM pool_revenue WHERE recorded_at < ?", (cutoff,)
             )
             total += result.rowcount
 
-            # Delete proposals
+            # Prune old pool distributions
             result = conn.execute(
-                f"DELETE FROM settlement_proposals WHERE proposal_id IN ({placeholders})",
-                old_ids
+                "DELETE FROM pool_distributions WHERE settled_at < ?", (cutoff,)
             )
             total += result.rowcount
 
@@ -6193,6 +6688,32 @@ class HiveDatabase:
         )
         return result.rowcount > 0
 
+    def update_outbox_retry(self, msg_id: str, peer_id: str,
+                            next_retry_at: int) -> bool:
+        """
+        Schedule next retry for a failed send WITHOUT incrementing retry_count.
+
+        Used when send_fn fails (peer unreachable) — the message was never
+        transmitted, so retry budget should not be consumed.
+
+        Args:
+            msg_id: Message identifier
+            peer_id: Target peer pubkey
+            next_retry_at: Unix timestamp for next retry attempt
+
+        Returns:
+            True if updated, False otherwise.
+        """
+        conn = self._get_connection()
+        result = conn.execute(
+            """UPDATE proto_outbox
+               SET next_retry_at = ?
+               WHERE msg_id = ? AND peer_id = ?
+                 AND status IN ('queued', 'sent')""",
+            (next_retry_at, msg_id, peer_id)
+        )
+        return result.rowcount > 0
+
     def ack_outbox(self, msg_id: str, peer_id: str) -> bool:
         """
         Mark an outbox entry as acknowledged.
@@ -6248,14 +6769,16 @@ class HiveDatabase:
             return result.rowcount
         except Exception:
             # Fallback: match using LIKE pattern for older SQLite
-            pattern = f'"{match_field}":"{match_value}"'
+            # Escape LIKE metacharacters in match_value to prevent over-matching
+            safe_value = match_value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+            pattern = f'"{match_field}":"{safe_value}"'
             try:
                 result = conn.execute(
                     """UPDATE proto_outbox
                        SET status = 'acked', acked_at = ?
                        WHERE peer_id = ? AND msg_type = ?
                          AND status IN ('queued', 'sent')
-                         AND payload_json LIKE ?""",
+                         AND payload_json LIKE ? ESCAPE '\\'""",
                     (now, peer_id, msg_type, f'%{pattern}%')
                 )
                 return result.rowcount
@@ -6341,3 +6864,190 @@ class HiveDatabase:
             (peer_id,)
         ).fetchone()
         return row['cnt'] if row else 0
+
+    # =========================================================================
+    # ROUTING INTELLIGENCE PERSISTENCE
+    # =========================================================================
+
+    def save_pheromone_levels(self, levels: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save pheromone levels (full-table replace).
+
+        Args:
+            levels: List of dicts with channel_id, level, fee_ppm, last_update
+
+        Returns:
+            Number of rows written.
+        """
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM pheromone_levels")
+            for row in levels:
+                conn.execute(
+                    """INSERT INTO pheromone_levels (channel_id, level, fee_ppm, last_update)
+                       VALUES (?, ?, ?, ?)""",
+                    (row['channel_id'], row['level'], row['fee_ppm'], row['last_update'])
+                )
+        return len(levels)
+
+    def load_pheromone_levels(self) -> List[Dict[str, Any]]:
+        """Load all persisted pheromone levels."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM pheromone_levels").fetchall()
+        return [dict(r) for r in rows]
+
+    def save_stigmergic_markers(self, markers: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save stigmergic markers (full-table replace).
+
+        Args:
+            markers: List of dicts with depositor, source_peer_id,
+                     destination_peer_id, fee_ppm, success, volume_sats,
+                     timestamp, strength
+
+        Returns:
+            Number of rows written.
+        """
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM stigmergic_markers")
+            for row in markers:
+                conn.execute(
+                    """INSERT INTO stigmergic_markers
+                       (depositor, source_peer_id, destination_peer_id,
+                        fee_ppm, success, volume_sats, timestamp, strength)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (row['depositor'], row['source_peer_id'],
+                     row['destination_peer_id'], row['fee_ppm'],
+                     1 if row['success'] else 0, row['volume_sats'],
+                     row['timestamp'], row['strength'])
+                )
+        return len(markers)
+
+    def load_stigmergic_markers(self) -> List[Dict[str, Any]]:
+        """Load all persisted stigmergic markers."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM stigmergic_markers").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_pheromone_count(self) -> int:
+        """Get count of persisted pheromone levels."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT COUNT(*) as cnt FROM pheromone_levels").fetchone()
+        return row['cnt'] if row else 0
+
+    def get_latest_marker_timestamp(self) -> Optional[float]:
+        """Get the most recent marker timestamp, or None if empty."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT MAX(timestamp) as latest FROM stigmergic_markers"
+        ).fetchone()
+        return row['latest'] if row and row['latest'] is not None else None
+
+    def save_defense_state(self, reports: List[Dict[str, Any]],
+                           active_fees: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save defense warning reports and active fees (full-table replace).
+
+        Args:
+            reports: List of dicts with peer_id, reporter_id, threat_type,
+                     severity, timestamp, ttl, evidence_json
+            active_fees: List of dicts with peer_id, multiplier, expires_at,
+                         threat_type, reporter, report_count
+
+        Returns:
+            Total number of rows written across both tables.
+        """
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM defense_warning_reports")
+            conn.execute("DELETE FROM defense_active_fees")
+            for row in reports:
+                conn.execute(
+                    """INSERT INTO defense_warning_reports
+                       (peer_id, reporter_id, threat_type, severity, timestamp, ttl, evidence_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (row['peer_id'], row['reporter_id'], row['threat_type'],
+                     row['severity'], row['timestamp'], row['ttl'],
+                     row.get('evidence_json', '{}'))
+                )
+            for row in active_fees:
+                conn.execute(
+                    """INSERT INTO defense_active_fees
+                       (peer_id, multiplier, expires_at, threat_type, reporter, report_count)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (row['peer_id'], row['multiplier'], row['expires_at'],
+                     row['threat_type'], row['reporter'], row['report_count'])
+                )
+        return len(reports) + len(active_fees)
+
+    def load_defense_state(self) -> Dict[str, Any]:
+        """
+        Load persisted defense warning reports and active fees.
+
+        Returns:
+            Dict with 'reports' and 'active_fees' lists.
+        """
+        conn = self._get_connection()
+        report_rows = conn.execute(
+            "SELECT * FROM defense_warning_reports"
+        ).fetchall()
+        fee_rows = conn.execute(
+            "SELECT * FROM defense_active_fees"
+        ).fetchall()
+        return {
+            'reports': [dict(r) for r in report_rows],
+            'active_fees': [dict(r) for r in fee_rows],
+        }
+
+    def save_remote_pheromones(self, pheromones: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save remote pheromones (full-table replace).
+
+        Args:
+            pheromones: List of dicts with peer_id, reporter_id, level,
+                        fee_ppm, timestamp, weight
+
+        Returns:
+            Number of rows written.
+        """
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM remote_pheromones")
+            for row in pheromones:
+                conn.execute(
+                    """INSERT INTO remote_pheromones
+                       (peer_id, reporter_id, level, fee_ppm, timestamp, weight)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (row['peer_id'], row['reporter_id'], row['level'],
+                     row['fee_ppm'], row['timestamp'], row['weight'])
+                )
+        return len(pheromones)
+
+    def load_remote_pheromones(self) -> List[Dict[str, Any]]:
+        """Load all persisted remote pheromones."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM remote_pheromones").fetchall()
+        return [dict(r) for r in rows]
+
+    def save_fee_observations(self, observations: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save fee observations (full-table replace).
+
+        Args:
+            observations: List of dicts with timestamp, fee_ppm
+
+        Returns:
+            Number of rows written.
+        """
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM fee_observations")
+            for row in observations:
+                conn.execute(
+                    """INSERT INTO fee_observations (timestamp, fee_ppm)
+                       VALUES (?, ?)""",
+                    (row['timestamp'], row['fee_ppm'])
+                )
+        return len(observations)
+
+    def load_fee_observations(self) -> List[Dict[str, Any]]:
+        """Load all persisted fee observations."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM fee_observations").fetchall()
+        return [dict(r) for r in rows]
