@@ -894,6 +894,10 @@ Node operators discover advisors by querying the Archon network for `HiveAdvisor
 
 ## Integration with Existing Hive Protocol
 
+### Settlement Integration
+
+Remote fleet management generates settlement obligations — the managed node may owe advisors performance bonuses, and advisors may owe nodes for resources consumed during management actions. The [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md) defines how these obligations are tracked, netted, and settled trustlessly. Management receipts (signed by both parties per this spec) serve as the proof substrate for settlement computation.
+
 ### Enrollment via Hive PKI
 
 The existing hive PKI handshake is extended to include management credential exchange:
@@ -990,6 +994,7 @@ Schema proposals that grant new permissions require higher quorum thresholds.
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md)
+- [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)

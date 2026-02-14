@@ -631,7 +631,9 @@ This separation is a significant advantage over Lightning-based escrow, where ro
 
 ## General Applicability
 
-While this spec is motivated by Lightning fleet management, the escrow ticket pattern is universal. Any scenario with these properties is a candidate:
+While this spec is motivated by Lightning fleet management, the escrow ticket pattern is universal. The [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md) applies this escrow mechanism to eight distinct settlement types — routing revenue sharing, rebalancing costs, liquidity leases, splice settlements, pheromone markets, intelligence trading, and penalty enforcement — demonstrating the breadth of the pattern.
+
+Any scenario with these properties is a candidate:
 
 1. **Task delegator** wants to pay **task executor** contingent on completion
 2. A **verifier** (the node, in fleet management) can objectively determine success
@@ -765,6 +767,7 @@ The three roles (Delegator, Executor, Verifier) may collapse — e.g., the Deleg
 - [Cashu NUT-14: Hashed Timelock Contracts](https://github.com/cashubtc/nuts/blob/main/14.md)
 - [Cashu Protocol](https://cashu.space/)
 - [DID+L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
+- [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)

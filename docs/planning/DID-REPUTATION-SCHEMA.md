@@ -163,7 +163,9 @@ Profile identifiers follow the pattern `<namespace>:<type>`:
 | `avg_fee_ppm` | number | ppm | Average fee rate charged during period. (optional) |
 | `capacity_sats` | integer | sats | Total channel capacity during period. (optional) |
 
-**Example evidence:** Probe results, forwarding statistics, gossip uptime measurements.
+**Example evidence:** Probe results, forwarding statistics, gossip uptime measurements, settlement receipts from the [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md).
+
+The `hive:node` profile is central to the hive settlements protocol — bond amounts, slash history, and settlement dispute outcomes are recorded as metrics in this profile, and the aggregated reputation score determines [credit and trust tiers](./DID-HIVE-SETTLEMENTS.md#credit-and-trust-tiers) for settlement terms.
 
 **Outcome interpretation:**
 - `renew` — Peer maintains or opens channels with this node
@@ -480,6 +482,7 @@ When verifying a `DIDReputationCredential`:
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [DID+L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
+- [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 
 ---
