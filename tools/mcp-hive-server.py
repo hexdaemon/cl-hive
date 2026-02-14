@@ -1780,6 +1780,55 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
+            name="revenue_fee_anchor",
+            description="""Manage advisor fee anchors — soft fee targets that blend into the optimizer with decaying weight.
+
+Unlike revenue_set_fee (which hard-overrides), anchors preserve Thompson Sampling / Hill Climbing state.
+Weight decays linearly to zero over the TTL. Applied AFTER hive coordination, BEFORE defense multiplier.
+
+Actions: set, list, get, clear, clear-all.
+Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Action: set, list, get, clear, clear-all",
+                        "enum": ["set", "list", "get", "clear", "clear-all"]
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID (SCID format). Required for set/get/clear."
+                    },
+                    "target_fee_ppm": {
+                        "type": "integer",
+                        "description": "Target fee in ppm. Required for set."
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Advisor confidence 0.0-1.0 (default 1.0)"
+                    },
+                    "base_weight": {
+                        "type": "number",
+                        "description": "Anchor blend weight 0.0-1.0 (default 0.7)"
+                    },
+                    "ttl_hours": {
+                        "type": "integer",
+                        "description": "Time-to-live in hours (default 24, max 168)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the advisor is setting this anchor"
+                    }
+                },
+                "required": ["node", "action"]
+            }
+        ),
+        Tool(
             name="revenue_rebalance",
             description="Trigger a manual rebalance between channels with profit/budget constraints.",
             inputSchema={
@@ -7270,6 +7319,46 @@ async def handle_revenue_set_fee(args: Dict) -> Dict:
         params["force"] = True
 
     return await node.call("revenue-set-fee", params)
+
+
+async def handle_revenue_fee_anchor(args: Dict) -> Dict:
+    """Manage advisor fee anchors (soft fee targets with decaying weight)."""
+    node_name = args.get("node")
+    action = args.get("action")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if not action:
+        return {"error": "action is required (set, list, get, clear, clear-all)"}
+
+    params = {"action": action}
+
+    if action == "set":
+        channel_id = args.get("channel_id")
+        target_fee_ppm = args.get("target_fee_ppm")
+        if not channel_id:
+            return {"error": "channel_id is required for set"}
+        if target_fee_ppm is None:
+            return {"error": "target_fee_ppm is required for set"}
+        params["channel_id"] = channel_id
+        params["target_fee_ppm"] = target_fee_ppm
+        if args.get("confidence") is not None:
+            params["confidence"] = args["confidence"]
+        if args.get("base_weight") is not None:
+            params["base_weight"] = args["base_weight"]
+        if args.get("ttl_hours") is not None:
+            params["ttl_hours"] = args["ttl_hours"]
+        if args.get("reason"):
+            params["reason"] = args["reason"]
+    elif action in ("get", "clear"):
+        channel_id = args.get("channel_id")
+        if not channel_id:
+            return {"error": f"channel_id is required for {action}"}
+        params["channel_id"] = channel_id
+
+    return await node.call("revenue-fee-anchor", params)
 
 
 async def handle_revenue_rebalance(args: Dict) -> Dict:
@@ -13200,6 +13289,7 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_portfolio_correlations": handle_revenue_portfolio_correlations,
     "revenue_policy": handle_revenue_policy,
     "revenue_set_fee": handle_revenue_set_fee,
+    "revenue_fee_anchor": handle_revenue_fee_anchor,
     "revenue_rebalance": handle_revenue_rebalance,
     "revenue_report": handle_revenue_report,
     "revenue_config": handle_revenue_config,
