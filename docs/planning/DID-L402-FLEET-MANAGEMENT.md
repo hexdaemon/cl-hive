@@ -469,6 +469,8 @@ Receipts are stored locally and can be published to the Archon network for verif
 
 ## Reputation System
 
+> **Note:** The reputation system described here implements the **`hive:advisor` profile** of the general [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md). That spec defines a universal `DIDReputationCredential` format for any DID holder — this section describes the Lightning fleet-specific application.
+
 ### Agent Reputation
 
 An agent's reputation is built from verifiable, cryptographic evidence:
@@ -478,23 +480,42 @@ An agent's reputation is built from verifiable, cryptographic evidence:
 3. **Client Credentials** — Operators issuing "this agent managed my node from X to Y with Z% revenue improvement"
 4. **Tenure** — Duration of continuous management relationships
 
+The `HiveAdvisorReputationCredential` is a `DIDReputationCredential` with `domain: "hive:advisor"`:
+
 ```json
 {
-  "type": "HiveAdvisorReputationCredential",
+  "@context": [
+    "https://www.w3.org/2018/credentials/v1",
+    "https://archon.technology/schemas/reputation/v1"
+  ],
+  "type": ["VerifiableCredential", "DIDReputationCredential"],
   "issuer": "did:cid:<node_operator>",
   "credentialSubject": {
-    "advisor": "did:cid:<agent_did>",
-    "period": { "start": "2026-02-14", "end": "2026-03-14" },
+    "id": "did:cid:<agent_did>",
+    "domain": "hive:advisor",
+    "period": {
+      "start": "2026-02-14T00:00:00Z",
+      "end": "2026-03-14T00:00:00Z"
+    },
     "metrics": {
       "revenue_delta_pct": 340,
       "actions_taken": 87,
       "uptime_pct": 99.2,
       "channels_managed": 19
     },
-    "recommendation": "renew"
+    "outcome": "renew",
+    "evidence": [
+      {
+        "type": "SignedReceipt",
+        "id": "did:cid:<receipt_credential_did>",
+        "description": "87 signed management receipts from managed node"
+      }
+    ]
   }
 }
 ```
+
+See [DID Reputation Schema — `hive:advisor` Profile](./DID-REPUTATION-SCHEMA.md#profile-hiveadvisor) for the full metric definitions and aggregation rules.
 
 ### Discovering Advisors
 
@@ -624,6 +645,7 @@ Schema proposals that grant new permissions require higher quorum thresholds.
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 - [CLN Custom Messages](https://docs.corelightning.org/reference/lightning-sendcustommsg)
+- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
 
 ---
 
